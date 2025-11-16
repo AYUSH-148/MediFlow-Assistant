@@ -48,22 +48,19 @@ Upload PDFs or images → extract key medical information → ask questions → 
 
 Create a `.env.local` file:
 
-GEMINI_API_KEY=
-PINECONE_API_KEY=
-HF_TOKEN=
+- GEMINI_API_KEY=
+- PINECONE_API_KEY=
+- HF_TOKEN=
 
 ---
 ## 🧪 Sample Questions for Testing
 
 - What is the diagnosis in this report?
 
-- Explain the Troponin-I value.
-
 - Why was the patient prescribed Aspirin?
 
 - Summarize the report in simple words.
 
-- Are the lab values normal for this patient?
 
 ---
 ## ⭐ Support
