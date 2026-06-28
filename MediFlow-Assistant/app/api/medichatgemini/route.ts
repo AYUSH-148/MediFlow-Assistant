@@ -1,7 +1,8 @@
-import { queryPineconeVectorStore } from "@/utils";
+import { queryPineconeVectorStore, pinecone } from "@/utils";
 import { getCachedResponse, cacheResponse } from "@/lib/cache";
-import { redactUserQuestion, getVault, rehydrateText } from "@/lib/pii-redaction";
+import { redactUserQuestion, getVault, rehydrateText, queryNeo4jRelationships } from "@/lib/pii-redaction";
 import { Pinecone } from "@pinecone-database/pinecone";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 // import { Message, OpenAIStream, StreamData, StreamingTextResponse } from "ai";
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { generateText, Message, StreamData, streamText } from "ai";
@@ -10,20 +11,19 @@ import { generateText, Message, StreamData, streamText } from "ai";
 export const maxDuration = 60;
 // export const runtime = 'edge';
 
-const pinecone = new Pinecone({
-    apiKey: process.env.PINECONE_API_KEY ?? "",
-});
-
 const google = createGoogleGenerativeAI({
     baseURL: 'https://generativelanguage.googleapis.com/v1beta',
     apiKey: process.env.GEMINI_API_KEY
 });
-
-
 const model = google('models/gemini-2.5-flash', {
     safetySettings: [
         { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' }
     ],
+});
+
+const geminiExtractor = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+const extractorModel = geminiExtractor.getGenerativeModel({
+    model: 'gemini-2.5-flash',
 });
 
 export async function POST(req: Request, res: Response) {
@@ -89,6 +89,27 @@ export async function POST(req: Request, res: Response) {
 
     const retrievals = await queryPineconeVectorStore(pinecone, 'medic',  "diagnosis2", query);
 
+    // ==================== GRAPH QUERYING ====================
+    console.log("🔗 Querying Neo4j for entity relationships...");
+    let graphData = "";
+    try {
+        const entities = await extractEntitiesFromQuestion(redactedQuestion);
+        if (entities.length > 0) {
+            const relationships = await queryNeo4jRelationships(entities);
+            if (relationships && relationships.length > 0) {
+                graphData = `Entity Relationships: ${JSON.stringify(relationships)}\n`;
+                console.log("✅ Found relationships in graph");
+            } else {
+                console.log("❌ No relationships found in graph");
+            }
+        } else {
+            console.log("⚠️ No entities extracted for graph query");
+        }
+    } catch (error) {
+        console.error("Failed to query Neo4j:", error);
+        // Continue without graph data
+    }
+
     const finalPrompt = `Here is a summary of a patient's clinical report, and a user query. Some generic clinical findings are also provided that may or may not be relevant for the report.
   Go through the clinical report and answer the user query.
   Ensure the response is factually accurate, and demonstrates a thorough understanding of the query topic and the clinical report.
@@ -104,6 +125,10 @@ export async function POST(req: Request, res: Response) {
   \n\n**Generic Clinical findings:**
   \n\n${retrievals}.
   \n\n**end of generic clinical findings**
+
+  \n\n**Entity Relationships from Knowledge Graph:**
+  \n\n${graphData}
+  \n\n**end of entity relationships**
 
   \n\nProvide thorough justification for your answer.
   \n\n**Answer:**
@@ -179,5 +204,34 @@ export async function POST(req: Request, res: Response) {
     }
 
     return originalStream;
+}
+
+// Extract entities from user question using Gemini for semantic understanding
+async function extractEntitiesFromQuestion(question: string): Promise<string[]> {
+    const prompt = `Extract the medical entities (drugs, conditions, symptoms) from the following user question.\nReturn ONLY a JSON array of strings representing the entities. Do not include markdown formatting.\n\nUser Question: "${question}"\n`;
+
+    try {
+        const generatedContent = await extractorModel.generateContent([prompt]);
+        const rawText = generatedContent.response.candidates?.[0].content.parts?.[0].text;
+        if (!rawText) {
+            throw new Error('No response text from Gemini entity extraction');
+        }
+
+        const parsed = JSON.parse(rawText.trim());
+        if (Array.isArray(parsed)) {
+            return parsed.map((entity) => String(entity).trim()).filter((entity) => entity.length > 0);
+        }
+        throw new Error('Gemini entity extraction returned unexpected format');
+    } catch (error) {
+        console.error('Gemini entity extraction failed, falling back to heuristic extraction:', error);
+        // Fallback to the original heuristic extraction
+        const words = question.split(/\s+/);
+        const entities = words.filter((word) =>
+            word.length > 2 &&
+            word[0] === word[0].toUpperCase() &&
+            !['What', 'How', 'Why', 'When', 'Where', 'Who', 'Is', 'Are', 'Does'].includes(word)
+        );
+        return entities.slice(0, 2);
+    }
 }
 

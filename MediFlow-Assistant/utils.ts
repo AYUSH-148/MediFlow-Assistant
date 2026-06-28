@@ -4,6 +4,12 @@ import { Pinecone } from "@pinecone-database/pinecone";
 import { InferenceClient } from '@huggingface/inference';
 
 const hf = new InferenceClient(process.env.HF_TOKEN)
+
+// Centralized Pinecone client
+export const pinecone = new Pinecone({
+  apiKey: process.env.PINECONE_API_KEY ?? "",
+});
+
 export async function queryPineconeVectorStore(
   client: Pinecone,
   indexName: string,

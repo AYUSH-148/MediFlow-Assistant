@@ -1,10 +1,36 @@
 import { Redis } from "@upstash/redis";
+import neo4j from "neo4j-driver";
 
 // Use the same Redis instance for both caching and vault
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL!,
   token: process.env.UPSTASH_REDIS_REST_TOKEN!,
 });
+
+// Neo4j driver setup
+// Example URI for AuraDB: "neo4j+s://<your-database-id>.databases.neo4j.io"
+const neo4jUri = process.env.NEO4J_URI ?? "";
+const neo4jUser = process.env.NEO4J_USER ?? "";
+const neo4jPassword = process.env.NEO4J_PASSWORD ?? "";
+
+if (!neo4jUri || !neo4jUser || !neo4jPassword) {
+  throw new Error("NEO4J_URI, NEO4J_USER, and NEO4J_PASSWORD must all be set in the environment.");
+}
+
+const neo4jDriver = neo4j.driver(
+  neo4jUri,
+  neo4j.auth.basic(neo4jUser, neo4jPassword)
+);
+
+export async function verifyNeo4jConnectivity(): Promise<void> {
+  try {
+    await neo4jDriver.verifyConnectivity();
+    console.log("✅ Neo4j connectivity verified.");
+  } catch (error) {
+    console.error("❌ Neo4j connectivity check failed:", error);
+    throw error;
+  }
+}
 
 // PII Entity types we want to detect and redact
 const PII_PATTERNS = {
@@ -153,7 +179,7 @@ export function rehydrateText(text: string, vault: TokenVault): string {
 
   // Replace each token with its original value
   Object.entries(vault).forEach(([token, originalValue]) => {
-    rehydratedText = rehydratedText.replace(new RegExp(token, 'g'), originalValue);
+    rehydratedText = rehydratedText.replace(new RegExp(token, "g"), originalValue);
   });
 
   return rehydratedText;
@@ -187,5 +213,84 @@ export async function getVaultStats(vaultId: string) {
   } catch (error) {
     console.error("Error getting vault stats:", error);
     return null;
+  }
+}
+
+/**
+ * Store extracted triples in Neo4j
+ */
+export async function storeTriplesInNeo4j(triples: { subject: string; predicate: string; object: string }[]) {
+  const session = neo4jDriver.session();
+  try {
+    for (const { subject, predicate, object } of triples) {
+      await session.run(
+        `MERGE (a:Entity {name: $subject})
+         MERGE (b:Entity {name: $object})
+         MERGE (a)-[:RELATIONSHIP {type: $predicate}]->(b)`,
+        { subject, predicate, object }
+      );
+    }
+  } finally {
+    await session.close();
+  }
+}
+
+/**
+ * Serialize Neo4j path objects into clean JSON for Gemini consumption
+ */
+function serializeNeo4jPath(path: any): any {
+  // Handle single-segment paths (most common case)
+  if (path.segments && path.segments.length > 0) {
+    const segment = path.segments[0];
+    return {
+      start: segment.start.properties.name,
+      end: segment.end.properties.name,
+      relationship: segment.relationship.properties.type,
+    };
+  }
+  
+  // Fallback for other path structures
+  return {
+    start: path.start?.properties?.name || "Unknown",
+    end: path.end?.properties?.name || "Unknown",
+    relationship: path.relationship?.properties?.type || "Unknown",
+  };
+}
+
+/**
+ * Query Neo4j for the immediate neighborhood of each extracted entity
+ */
+export async function queryNeo4jRelationships(entities: string[]) {
+  const session = neo4jDriver.session();
+  try {
+    const relationships: Array<{ source: string; relationship: string; target: string }> = [];
+
+    for (const entity of entities) {
+      const result = await session.run(
+        `MATCH (a:Entity {name: $entity_name})-[r]-(b:Entity)
+         RETURN a.name AS source, type(r) AS relationship, b.name AS target
+         LIMIT 10`,
+        { entity_name: entity }
+      );
+
+      for (const record of result.records) {
+        relationships.push({
+          source: record.get("source"),
+          relationship: record.get("relationship"),
+          target: record.get("target"),
+        });
+      }
+    }
+
+    // Deduplicate similar triples
+    return relationships.filter((item, index, self) =>
+      index === self.findIndex((other) =>
+        other.source === item.source &&
+        other.relationship === item.relationship &&
+        other.target === item.target
+      )
+    );
+  } finally {
+    await session.close();
   }
 }
