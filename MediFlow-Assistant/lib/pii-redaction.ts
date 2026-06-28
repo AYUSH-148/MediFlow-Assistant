@@ -7,28 +7,44 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN!,
 });
 
-// Neo4j driver setup
-// Example URI for AuraDB: "neo4j+s://<your-database-id>.databases.neo4j.io"
-const neo4jUri = process.env.NEO4J_URI ?? "";
-const neo4jUser = process.env.NEO4J_USER ?? "";
-const neo4jPassword = process.env.NEO4J_PASSWORD ?? "";
+// Neo4j driver setup is initialized lazily so builds can succeed even when
+// these credentials are not present in the current environment.
+let neo4jDriver: any = null;
 
-if (!neo4jUri || !neo4jUser || !neo4jPassword) {
-  throw new Error("NEO4J_URI, NEO4J_USER, and NEO4J_PASSWORD must all be set in the environment.");
+function getNeo4jDriver() {
+  if (neo4jDriver) return neo4jDriver;
+
+  const neo4jUri = process.env.NEO4J_URI ?? "";
+  const neo4jUser = process.env.NEO4J_USER ?? "";
+  const neo4jPassword = process.env.NEO4J_PASSWORD ?? "";
+
+  if (!neo4jUri || !neo4jUser || !neo4jPassword) {
+    console.warn("Neo4j credentials are not configured. Graph features will be skipped.");
+    return null;
+  }
+
+  neo4jDriver = neo4j.driver(
+    neo4jUri,
+    neo4j.auth.basic(neo4jUser, neo4jPassword)
+  );
+
+  return neo4jDriver;
 }
 
-const neo4jDriver = neo4j.driver(
-  neo4jUri,
-  neo4j.auth.basic(neo4jUser, neo4jPassword)
-);
+export async function verifyNeo4jConnectivity(): Promise<boolean> {
+  const driver = getNeo4jDriver();
+  if (!driver) {
+    console.warn("Neo4j connectivity skipped because credentials are not configured.");
+    return false;
+  }
 
-export async function verifyNeo4jConnectivity(): Promise<void> {
   try {
-    await neo4jDriver.verifyConnectivity();
+    await driver.verifyConnectivity();
     console.log("✅ Neo4j connectivity verified.");
+    return true;
   } catch (error) {
     console.error("❌ Neo4j connectivity check failed:", error);
-    throw error;
+    return false;
   }
 }
 
@@ -220,7 +236,13 @@ export async function getVaultStats(vaultId: string) {
  * Store extracted triples in Neo4j
  */
 export async function storeTriplesInNeo4j(triples: { subject: string; predicate: string; object: string }[]) {
-  const session = neo4jDriver.session();
+  const driver = getNeo4jDriver();
+  if (!driver) {
+    console.warn("Neo4j is not configured. Skipping triple storage.");
+    return;
+  }
+
+  const session = driver.session();
   try {
     for (const { subject, predicate, object } of triples) {
       await session.run(
@@ -261,7 +283,12 @@ function serializeNeo4jPath(path: any): any {
  * Query Neo4j for the immediate neighborhood of each extracted entity
  */
 export async function queryNeo4jRelationships(entities: string[]) {
-  const session = neo4jDriver.session();
+  const driver = getNeo4jDriver();
+  if (!driver) {
+    return [];
+  }
+
+  const session = driver.session();
   try {
     const relationships: Array<{ source: string; relationship: string; target: string }> = [];
 
