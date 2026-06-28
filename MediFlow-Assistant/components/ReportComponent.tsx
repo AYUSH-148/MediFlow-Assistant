@@ -8,7 +8,7 @@ import SocialMediaLinks from './social-links'
 import { useToast } from "@/components/ui/use-toast"
 
 type Props = {
-    onReportConfirmation: (data: string) => void
+    onReportConfirmation: (data: { redactedSummary: string; vaultId: string }) => void
 }
 const ReportComponent = ({ onReportConfirmation }: Props) => {
     const { toast } = useToast()
@@ -16,6 +16,8 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
     const [base64Data, setBase64Data] = useState('')
     const [isLoading, setIsLoading] = useState(false);
     const [reportData, setReportData] = useState("");
+    const [vaultId, setVaultId] = useState("");
+    const [piiCount, setPiiCount] = useState(0);
     function handleReportSelection(event: ChangeEvent<HTMLInputElement>): void {
 
         // Step 1: Check if there are files in the event target
@@ -135,9 +137,15 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
         });
 
         if (response.ok) {
-            const reportText = await response.text();
-            console.log(reportText);
-            setReportData(reportText);
+            const data = await response.json();
+            console.log("Extracted report data:", data);
+            setReportData(data.redactedSummary);
+            setVaultId(data.vaultId);
+            setPiiCount(data.piiCount);
+
+            toast({
+                description: `Report processed! ${data.piiCount} PII entities redacted.`,
+            });
         }
 
         setIsLoading(false);
@@ -173,7 +181,14 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
                     variant="destructive"
                     className="bg-[#D90013]"
                     onClick={() => {
-                        onReportConfirmation(reportData);
+                        if (!reportData || !vaultId) {
+                            toast({
+                                variant: 'destructive',
+                                description: "Please upload and process a report first!",
+                            });
+                            return;
+                        }
+                        onReportConfirmation({ redactedSummary: reportData, vaultId });
                     }}
                 >
                     2. Looks Good

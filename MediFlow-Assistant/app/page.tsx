@@ -25,11 +25,11 @@ import ChatComponent from "@/components/chatcomponent";
 const Home = () => {
   const { toast } = useToast()
 
-  const [reportData, setreportData] = useState("");
-  const onReportConfirmation = (data: string) => {
+  const [reportData, setreportData] = useState<{ redactedSummary: string; vaultId: string } | undefined>(undefined);
+  const onReportConfirmation = (data: { redactedSummary: string; vaultId: string }) => {
     setreportData(data);
     toast({
-      description: "Updated!"
+      description: "Report processed with PII protection!"
     });
   }
 

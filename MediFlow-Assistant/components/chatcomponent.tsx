@@ -9,7 +9,10 @@ import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from './
 import Markdown from './markdown';
 
 type Props = {
-  reportData?: string
+  reportData?: {
+    redactedSummary: string;
+    vaultId: string;
+  }
 }
 
 const ChatComponent = ({ reportData }: Props) => {
@@ -45,7 +48,8 @@ const ChatComponent = ({ reportData }: Props) => {
           event.preventDefault();
           handleSubmit(event, {
             data: {
-              reportData: reportData as string,
+              reportData: reportData?.redactedSummary as string,
+              vaultId: reportData?.vaultId as string,
             },
           });
         }}
