@@ -10,6 +10,24 @@ export const pinecone = new Pinecone({
   apiKey: process.env.PINECONE_API_KEY ?? "",
 });
 
+export async function generateEmbedding(text: string): Promise<number[]> {
+  const apiOutput = await hf.featureExtraction({
+    model: "mixedbread-ai/mxbai-embed-large-v1",
+    inputs: text,
+  });
+  return Array.from(apiOutput as any);
+}
+
+export async function upsertVectors(
+  client: Pinecone,
+  indexName: string,
+  vectors: { id: string; values: number[]; metadata?: Record<string, any> }[],
+  namespace?: string
+) {
+  const index = client.Index(indexName) as any;
+  await index.upsert({ vectors, namespace });
+}
+
 export async function queryPineconeVectorStore(
   client: Pinecone,
   indexName: string,

@@ -46,6 +46,12 @@ NEO4J_USER=
 NEO4J_PASSWORD=
 ```
 
+## Vault retention and TTL
+
+- `VAULT_TTL_SECONDS` (optional): controls how long PII vaults are kept in Redis, in seconds. By default the application uses a 14-day TTL (1209600 seconds). Increase this value if you want vaults to persist longer.
+- Vaults are used to re-hydrate redacted PII tokens in generated summaries. If a vault expires, re-hydration will not occur and clients should re-run document extraction.
+- For production deployments, consider your data retention and compliance requirements before extending the vault TTL.
+
 ## Getting started
 
 Install dependencies:
