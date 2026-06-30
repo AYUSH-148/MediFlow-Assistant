@@ -1,5 +1,6 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import { redactPII, storeVault, storeTriplesInNeo4j } from "@/lib/pii-redaction";
+import { redactPII, redactTriples, storeVault, storeTriplesInNeo4j } from "@/lib/pii-redaction";
+import { generateEmbedding, upsertVectors, pinecone } from "@/utils";
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 const model = genAI.getGenerativeModel({
     model: "gemini-2.5-flash",
@@ -56,12 +57,31 @@ export async function POST(req: Request, res: Response) {
     // Store the vault in Redis for later re-hydration
     await storeVault(redactionResult.vaultId, redactionResult.vault);
 
+    // Store redacted content in Pinecone for semantic retrieval
+    try {
+        const embedding = await generateEmbedding(redactionResult.redactedText);
+        await upsertVectors(pinecone, 'medic', [
+            {
+                id: redactionResult.vaultId,
+                values: embedding,
+                metadata: {
+                    chunk: redactionResult.redactedText,
+                    piiCount: Object.keys(redactionResult.vault).length,
+                },
+            },
+        ], 'diagnosis2');
+        console.log('✅ Stored redacted summary in Pinecone');
+    } catch (error) {
+        console.error('Failed to store redacted summary in Pinecone:', error);
+    }
+
     // ==================== STORE TRIPLES IN NEO4J ====================
     if (triples && Array.isArray(triples)) {
-        console.log(`📈 Storing ${triples.length} triples in Neo4j...`);
+        const redactedTriples = redactTriples(triples, redactionResult.vault);
+        console.log(`📈 Storing ${redactedTriples.length} redacted triples in Neo4j...`);
         try {
-            await storeTriplesInNeo4j(triples);
-            console.log("✅ Triples stored successfully");
+            await storeTriplesInNeo4j(redactedTriples);
+            console.log("✅ Redacted triples stored successfully");
         } catch (error) {
             console.error("Failed to store triples in Neo4j:", error);
             // Continue without failing the request

@@ -167,9 +167,11 @@ export async function POST(req: Request, res: Response) {
                     while (true) {
                         const { done, value } = await reader.read();
                         if (done) break;
-                        chunks.push(value);
-                        controller.enqueue(value);
+                        if (value) {
+                            chunks.push(value);
+                        }
                     }
+
                     // Combine chunks into full response
                     const combined = new Uint8Array(chunks.reduce((acc, chunk) => acc + chunk.length, 0));
                     let offset = 0;
@@ -184,14 +186,15 @@ export async function POST(req: Request, res: Response) {
 
                     // Re-hydrate the response with original PII
                     const vault = await getVault(vaultId);
+                    const finalText = vault ? rehydrateText(responseText, vault) : responseText;
                     if (vault) {
-                        const rehydratedResponse = rehydrateText(responseText, vault);
                         console.log("🔄 Re-hydrated response with original PII");
-
-                        // Replace the streamed content with re-hydrated version
-                        // Note: This is a simplified approach - in production you'd want to re-stream
-                        controller.enqueue(new TextEncoder().encode(rehydratedResponse));
                     }
+
+                    controller.enqueue(new TextEncoder().encode(finalText));
+                } catch (error) {
+                    console.error("Error rehydrating response:", error);
+                    controller.enqueue(new TextEncoder().encode("An error occurred while generating the response."));
                 } finally {
                     controller.close();
                 }

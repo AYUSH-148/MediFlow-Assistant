@@ -137,7 +137,10 @@ export function redactPII(text: string): RedactionResult {
 /**
  * Store the token vault in Redis with TTL
  */
-export async function storeVault(vaultId: string, vault: TokenVault, ttlSeconds: number = 86400): Promise<void> {
+// Default vault TTL: 14 days (in seconds) unless overridden by VAULT_TTL_SECONDS
+const DEFAULT_VAULT_TTL = parseInt(process.env.VAULT_TTL_SECONDS || "1209600", 10);
+
+export async function storeVault(vaultId: string, vault: TokenVault, ttlSeconds: number = DEFAULT_VAULT_TTL): Promise<void> {
   try {
     await redis.setex(`vault:${vaultId}`, ttlSeconds, JSON.stringify(vault));
     console.log(`Stored vault ${vaultId} with ${Object.keys(vault).length} tokens`);
@@ -190,6 +193,10 @@ export function redactUserQuestion(question: string): string {
 /**
  * Re-hydrate text by replacing tokens with original values from vault
  */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&");
+}
+
 export function rehydrateText(text: string, vault: TokenVault): string {
   let rehydratedText = text;
 
@@ -199,6 +206,26 @@ export function rehydrateText(text: string, vault: TokenVault): string {
   });
 
   return rehydratedText;
+}
+
+export function redactTextWithVault(text: string, vault: TokenVault): string {
+  return Object.entries(vault)
+    .sort((a, b) => b[1].length - a[1].length)
+    .reduce((currentText, [token, originalValue]) => {
+      if (!originalValue) return currentText;
+      return currentText.replace(new RegExp(escapeRegExp(originalValue), "g"), token);
+    }, text);
+}
+
+export function redactTriples(
+  triples: { subject: string; predicate: string; object: string }[],
+  vault: TokenVault
+) {
+  return triples.map(({ subject, predicate, object }) => ({
+    subject: redactTextWithVault(subject, vault),
+    predicate: redactTextWithVault(predicate, vault),
+    object: redactTextWithVault(object, vault),
+  }));
 }
 
 /**
