@@ -1,6 +1,6 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import { redactPII, redactTriples, storeVault, storeTriplesInNeo4j } from "@/lib/pii-redaction";
-import { generateEmbedding, upsertVectors, pinecone } from "@/utils";
+import { redactPII, redactTriples, storeVault, storeTriplesInNeo4j, getVault } from "@/lib/pii-redaction";
+import { generateDocumentId, generateEmbedding, upsertVectors, pinecone } from "@/utils";
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 const model = genAI.getGenerativeModel({
     model: "gemini-2.5-flash",
@@ -52,27 +52,35 @@ export async function POST(req: Request, res: Response) {
     const redactionResult = redactPII(rawSummary);
 
     console.log(`📊 Redacted ${Object.keys(redactionResult.vault).length} PII entities`);
-    console.log("Vault ID:", redactionResult.vaultId);
+    const documentId = generateDocumentId(redactionResult.redactedText);
+    console.log("Document ID:", documentId);
 
-    // Store the vault in Redis for later re-hydration
-    await storeVault(redactionResult.vaultId, redactionResult.vault);
+    const existingVault = await getVault(documentId);
+    if (existingVault) {
+        console.log(`✅ Document already exists: ${documentId}. Refreshing TTL and skipping duplicate storage.`);
+        await storeVault(documentId, existingVault);
+    } else {
+        // Store the vault in Redis for later re-hydration
+        await storeVault(documentId, redactionResult.vault);
 
-    // Store redacted content in Pinecone for semantic retrieval
-    try {
-        const embedding = await generateEmbedding(redactionResult.redactedText);
-        await upsertVectors(pinecone, 'medic', [
-            {
-                id: redactionResult.vaultId,
-                values: embedding,
-                metadata: {
-                    chunk: redactionResult.redactedText,
-                    piiCount: Object.keys(redactionResult.vault).length,
+        // Store redacted content in Pinecone for semantic retrieval
+        try {
+            const embedding = await generateEmbedding(redactionResult.redactedText);
+            await upsertVectors(pinecone, 'medic', [
+                {
+                    id: documentId,
+                    values: embedding,
+                    metadata: {
+                        documentId,
+                        chunk: redactionResult.redactedText,
+                        piiCount: Object.keys(redactionResult.vault).length,
+                    },
                 },
-            },
-        ], 'diagnosis2');
-        console.log('✅ Stored redacted summary in Pinecone');
-    } catch (error) {
-        console.error('Failed to store redacted summary in Pinecone:', error);
+            ], 'diagnosis2');
+            console.log('✅ Stored redacted summary in Pinecone');
+        } catch (error) {
+            console.error('Failed to store redacted summary in Pinecone:', error);
+        }
     }
 
     // ==================== STORE TRIPLES IN NEO4J ====================
@@ -91,7 +99,7 @@ export async function POST(req: Request, res: Response) {
     // Return both redacted summary and vault ID
     const response = {
         redactedSummary: redactionResult.redactedText,
-        vaultId: redactionResult.vaultId,
+        vaultId: documentId,
         piiCount: Object.keys(redactionResult.vault).length,
         triplesStored: triples ? triples.length : 0,
     };

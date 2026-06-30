@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { Pinecone } from "@pinecone-database/pinecone";
 // import { FeatureExtractionPipeline, pipeline } from "@xenova/transformers";
 // import { modelname, namespace, topK } from "./app/config";
@@ -28,11 +29,16 @@ export async function upsertVectors(
   await index.upsert({ vectors, namespace });
 }
 
+export function generateDocumentId(content: string): string {
+  return createHash("sha256").update(content).digest("hex");
+}
+
 export async function queryPineconeVectorStore(
   client: Pinecone,
   indexName: string,
   namespace: string,
-  query: string
+  query: string,
+  filter?: Record<string, any>
 ): Promise<string> {
   const apiOutput = await hf.featureExtraction({
     model: "mixedbread-ai/mxbai-embed-large-v1",
@@ -48,7 +54,8 @@ export async function queryPineconeVectorStore(
     vector: queryEmbedding as any,
     includeMetadata: true,
     // includeValues: true,
-    includeValues: false
+    includeValues: false,
+    filter,
   });
 
   console.log(queryResponse);
