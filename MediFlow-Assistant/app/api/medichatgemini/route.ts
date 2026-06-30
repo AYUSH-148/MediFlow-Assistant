@@ -1,4 +1,4 @@
-import { queryPineconeVectorStore, pinecone } from "@/utils";
+import { generateDocumentId, queryPineconeVectorStore, pinecone, upsertConversationMemory } from "@/utils";
 import { getCachedResponse, cacheResponse } from "@/lib/cache";
 import { redactUserQuestion, getVault, rehydrateText, queryNeo4jRelationships } from "@/lib/pii-redaction";
 import { Pinecone } from "@pinecone-database/pinecone";
@@ -26,15 +26,36 @@ const extractorModel = geminiExtractor.getGenerativeModel({
     model: 'gemini-2.5-flash',
 });
 
+function getMessageText(content: Message["content"]): string {
+    const rawContent = content as unknown;
+
+    if (typeof rawContent === "string") return rawContent;
+    if (Array.isArray(rawContent)) {
+        return rawContent
+            .map((part) => {
+                if (typeof part === "string") return part;
+                if (typeof part === "object" && part !== null && "text" in part) {
+                    return String((part as { text?: unknown }).text ?? "");
+                }
+                return "";
+            })
+            .join(" ");
+    }
+
+    return "";
+}
+
 export async function POST(req: Request, res: Response) {
     const reqBody = await req.json();
     console.log(reqBody);
 
     const messages: Message[] = reqBody.messages;
-    const userQuestion = `${messages[messages.length - 1].content}`;
+    const latestMessage = messages[messages.length - 1];
+    const userQuestion = getMessageText(latestMessage?.content ?? "");
 
     const reportData: string = reqBody.data.reportData;
     const vaultId: string = reqBody.data.vaultId; // Get vault ID from request
+    const reportFilter = vaultId ? { documentId: { $eq: vaultId } } : undefined;
 
     // ==================== PII REDACTION ====================
     console.log("🔒 Applying PII redaction to user question...");
@@ -92,7 +113,22 @@ export async function POST(req: Request, res: Response) {
         'medic',
         "diagnosis2",
         query,
-        { documentId: { $eq: vaultId } }
+        reportFilter
+    );
+
+    const recentConversationHistory = messages.length > 1
+        ? messages
+            .slice(-4)
+            .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${getMessageText(message.content)}`)
+            .join("\n")
+        : "No prior conversation history";
+
+    const chatHistoryRetrievals = await queryPineconeVectorStore(
+        pinecone,
+        'medic',
+        "conversation-history",
+        `Find relevant prior conversation context for this follow-up question.\n\nCurrent question: ${redactedQuestion}\n\nRecent chat history:\n${recentConversationHistory}`,
+        reportFilter
     );
 
     // ==================== GRAPH QUERYING ====================
@@ -131,6 +167,14 @@ export async function POST(req: Request, res: Response) {
   \n\n**Generic Clinical findings:**
   \n\n${retrievals}.
   \n\n**end of generic clinical findings**
+
+  \n\n**Relevant conversation memory:**
+  \n\n${chatHistoryRetrievals}
+  \n\n**end of relevant conversation memory**
+
+  \n\n**Recent conversation history from this session:**
+  \n\n${recentConversationHistory}
+  \n\n**end of recent conversation history**
 
   \n\n**Entity Relationships from Knowledge Graph:**
   \n\n${graphData}
@@ -189,6 +233,19 @@ export async function POST(req: Request, res: Response) {
 
                     // Store full response for caching
                     fullResponse = responseText;
+
+                    if (vaultId && fullResponse) {
+                        const memoryText = `User question: ${redactedQuestion}\nAssistant answer: ${fullResponse}`;
+                        await upsertConversationMemory(
+                            pinecone,
+                            "medic",
+                            {
+                                id: generateDocumentId(`${vaultId}:${redactedQuestion}:${fullResponse}`),
+                                documentId: vaultId,
+                                text: memoryText,
+                            }
+                        );
+                    }
 
                     // Re-hydrate the response with original PII
                     const vault = await getVault(vaultId);

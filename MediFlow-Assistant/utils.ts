@@ -29,6 +29,43 @@ export async function upsertVectors(
   await index.upsert({ vectors, namespace });
 }
 
+export async function upsertConversationMemory(
+  client: Pinecone,
+  indexName: string,
+  {
+    id,
+    documentId,
+    text,
+  }: {
+    id: string;
+    documentId: string;
+    text: string;
+  }
+) {
+  try {
+    const embedding = await generateEmbedding(text);
+    await upsertVectors(
+      client,
+      indexName,
+      [
+        {
+          id,
+          values: embedding,
+          metadata: {
+            documentId,
+            chunk: text,
+            type: "chat-memory",
+            source: "conversation",
+          },
+        },
+      ],
+      "conversation-history"
+    );
+  } catch (error) {
+    console.error("Failed to upsert conversation memory:", error);
+  }
+}
+
 export function generateDocumentId(content: string): string {
   return createHash("sha256").update(content).digest("hex");
 }
