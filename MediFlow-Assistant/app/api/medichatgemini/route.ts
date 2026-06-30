@@ -87,7 +87,13 @@ export async function POST(req: Request, res: Response) {
     console.log("❌ Cache MISS. Running full inference pipeline...");
     const query = `Represent this for searching relevant passages: patient medical report says: \n${reportData}. \n\n${redactedQuestion}`;
 
-    const retrievals = await queryPineconeVectorStore(pinecone, 'medic',  "diagnosis2", query);
+    const retrievals = await queryPineconeVectorStore(
+        pinecone,
+        'medic',
+        "diagnosis2",
+        query,
+        { documentId: { $eq: vaultId } }
+    );
 
     // ==================== GRAPH QUERYING ====================
     console.log("🔗 Querying Neo4j for entity relationships...");
