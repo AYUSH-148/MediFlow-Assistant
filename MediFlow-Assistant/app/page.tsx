@@ -36,9 +36,12 @@ const Home = () => {
   return (
     <div className="grid h-screen w-full">
       <div className="flex flex-col">
-        <header className="sticky top-0 z-10 flex h-[57px] bg-background items-center gap-1 border-b px-4">
+        <header className="sticky top-0 z-10 flex h-[57px] bg-background items-center gap-2 border-b px-4">
+          <div className="flex h-8 w-8 items-center justify-center rounded-md bg-[#D90013] text-white">
+            <Bot className="h-4.5 w-4.5" />
+          </div>
           <h1 className="flex flex-row text-2xl font-semibold text-[#D90013]">
-            MediFlow 
+            MediFlow
           </h1>
           <div className="w-full flex flex-row justify-end gap-2">
             <ModeToggle />

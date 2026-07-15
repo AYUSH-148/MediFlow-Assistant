@@ -34,7 +34,7 @@ const Messages = ({ messages, isLoading }: Props) => {
   return (
     <div className='flex flex-col gap-4'>
       {messages.map((m, index)=>{
-        return <MessageBox key={index} role={m.role} content={m.content} />
+        return <MessageBox key={index} role={m.role} content={m.content} createdAt={m.createdAt} />
       })}
     </div>
   )

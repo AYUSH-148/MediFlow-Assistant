@@ -31,10 +31,13 @@ export async function POST(req: Request, res: Response) {
     console.log(generatedContent);
     const rawResponse = generatedContent.response.candidates![0].content.parts[0].text;
 
+    // Gemini often wraps JSON in a markdown code fence (```json ... ```); strip it before parsing.
+    const cleanedResponse = rawResponse?.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
+
     // Parse the JSON response
     let parsedResponse;
     try {
-        parsedResponse = JSON.parse(rawResponse!);
+        parsedResponse = JSON.parse(cleanedResponse!);
     } catch (error) {
         console.error("Failed to parse Gemini response as JSON:", error);
         return new Response(JSON.stringify({ error: "Invalid response format from Gemini" }), {
