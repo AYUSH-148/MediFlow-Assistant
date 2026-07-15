@@ -283,7 +283,8 @@ async function extractEntitiesFromQuestion(question: string): Promise<string[]> 
             throw new Error('No response text from Gemini entity extraction');
         }
 
-        const parsed = JSON.parse(rawText.trim());
+        const cleanedText = rawText.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
+        const parsed = JSON.parse(cleanedText);
         if (Array.isArray(parsed)) {
             return parsed.map((entity) => String(entity).trim()).filter((entity) => entity.length > 0);
         }
