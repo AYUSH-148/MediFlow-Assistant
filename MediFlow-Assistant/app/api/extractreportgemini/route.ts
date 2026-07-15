@@ -59,13 +59,12 @@ export async function POST(req: Request, res: Response) {
     console.log("Document ID:", documentId);
 
     const existingVault = await getVault(documentId);
-    let vaultStored: boolean;
     if (existingVault) {
         console.log(`✅ Document already exists: ${documentId}. Refreshing TTL and skipping duplicate storage.`);
-        vaultStored = await storeVault(documentId, existingVault);
+        await storeVault(documentId, existingVault);
     } else {
         // Store the vault in Redis for later re-hydration
-        vaultStored = await storeVault(documentId, redactionResult.vault);
+        await storeVault(documentId, redactionResult.vault);
 
         // Store redacted content in Pinecone for semantic retrieval
         try {
@@ -106,12 +105,7 @@ export async function POST(req: Request, res: Response) {
         vaultId: documentId,
         piiCount: Object.keys(redactionResult.vault).length,
         triplesStored: triples ? triples.length : 0,
-        vaultStored,
     };
-
-    if (!vaultStored) {
-        console.warn("⚠️ Vault could not be persisted to Redis; PII re-hydration will be unavailable for this document.");
-    }
 
     console.log("✅ Report processed with PII redaction and GraphRAG storage");
     return new Response(JSON.stringify(response), {
