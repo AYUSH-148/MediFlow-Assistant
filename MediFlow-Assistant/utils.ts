@@ -26,7 +26,8 @@ export async function upsertVectors(
   namespace?: string
 ) {
   const index = client.Index(indexName) as any;
-  await index.upsert({ vectors, namespace });
+  const target = namespace ? index.namespace(namespace) : index;
+  await target.upsert(vectors);
 }
 
 export async function upsertConversationMemory(

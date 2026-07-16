@@ -135,18 +135,18 @@ export function redactPII(text: string): RedactionResult {
 }
 
 /**
- * Store the token vault in Redis with TTL
+ * Store the token vault in Redis with TTL.
+ * Best-effort: if Redis is unreachable, log and continue rather than failing the caller,
+ * since the redacted report has already been produced without it.
  */
-// Default vault TTL: 14 days (in seconds) unless overridden by VAULT_TTL_SECONDS
-const DEFAULT_VAULT_TTL = parseInt(process.env.VAULT_TTL_SECONDS || "1209600", 10);
-
-export async function storeVault(vaultId: string, vault: TokenVault, ttlSeconds: number = DEFAULT_VAULT_TTL): Promise<void> {
+export async function storeVault(vaultId: string, vault: TokenVault, ttlSeconds: number = 86400): Promise<boolean> {
   try {
     await redis.setex(`vault:${vaultId}`, ttlSeconds, JSON.stringify(vault));
     console.log(`Stored vault ${vaultId} with ${Object.keys(vault).length} tokens`);
+    return true;
   } catch (error) {
     console.error("Error storing vault:", error);
-    throw error;
+    return false;
   }
 }
 
@@ -191,12 +191,33 @@ export function redactUserQuestion(question: string): string {
 }
 
 /**
- * Re-hydrate text by replacing tokens with original values from vault
+ * Redact entity triples using an existing vault: any subject/predicate/object
+ * that contains a value already present in the vault is replaced with its token.
  */
-function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&");
+export function redactTriples(
+  triples: { subject: string; predicate: string; object: string }[],
+  vault: TokenVault
+): { subject: string; predicate: string; object: string }[] {
+  const applyVault = (text: string): string => {
+    let result = text;
+    for (const [token, originalValue] of Object.entries(vault)) {
+      if (originalValue) {
+        result = result.split(originalValue).join(token);
+      }
+    }
+    return result;
+  };
+
+  return triples.map(({ subject, predicate, object }) => ({
+    subject: applyVault(subject),
+    predicate: applyVault(predicate),
+    object: applyVault(object),
+  }));
 }
 
+/**
+ * Re-hydrate text by replacing tokens with original values from vault
+ */
 export function rehydrateText(text: string, vault: TokenVault): string {
   let rehydratedText = text;
 
@@ -206,26 +227,6 @@ export function rehydrateText(text: string, vault: TokenVault): string {
   });
 
   return rehydratedText;
-}
-
-export function redactTextWithVault(text: string, vault: TokenVault): string {
-  return Object.entries(vault)
-    .sort((a, b) => b[1].length - a[1].length)
-    .reduce((currentText, [token, originalValue]) => {
-      if (!originalValue) return currentText;
-      return currentText.replace(new RegExp(escapeRegExp(originalValue), "g"), token);
-    }, text);
-}
-
-export function redactTriples(
-  triples: { subject: string; predicate: string; object: string }[],
-  vault: TokenVault
-) {
-  return triples.map(({ subject, predicate, object }) => ({
-    subject: redactTextWithVault(subject, vault),
-    predicate: redactTextWithVault(predicate, vault),
-    object: redactTextWithVault(object, vault),
-  }));
 }
 
 /**
