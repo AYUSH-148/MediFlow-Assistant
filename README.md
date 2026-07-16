@@ -68,6 +68,7 @@ This makes the retrieval more robust when the question uses different wording th
 | AI Model | Google Gemini |
 | Vector Search | Pinecone |
 | Knowledge Graph | Neo4j |
+| Keyword Search | BM25 (TF-IDF) |
 | Cache / Vault | Upstash Redis |
 | Runtime | Vercel Serverless |
 
