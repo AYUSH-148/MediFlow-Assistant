@@ -260,10 +260,24 @@ export async function getVaultStats(vaultId: string) {
   }
 }
 
+// Matches vault tokens like [NAME_1] or [PHONE_2]. These are only unique within the
+// document they were redacted from - redactPII() restarts the counter at 1 for every
+// document, so "[NAME_1]" from one patient's report is a different person than
+// "[NAME_1]" from another's.
+const VAULT_TOKEN_PATTERN = /^\[[A-Z]+_\d+\]$/;
+
 /**
- * Store extracted triples in Neo4j
+ * Store extracted triples in Neo4j.
+ *
+ * `documentId` scopes vault-token entities (e.g. "[NAME_1]") to the document they came
+ * from, so the same token reused across different patients' reports doesn't merge into
+ * one shared node. Generic medical terms (e.g. "Aspirin") are left unscoped so the graph
+ * still shares that knowledge across documents.
  */
-export async function storeTriplesInNeo4j(triples: { subject: string; predicate: string; object: string }[]) {
+export async function storeTriplesInNeo4j(
+  triples: { subject: string; predicate: string; object: string }[],
+  documentId?: string
+) {
   const driver = getNeo4jDriver();
   if (!driver) {
     console.warn("Neo4j is not configured. Skipping triple storage.");
@@ -273,11 +287,18 @@ export async function storeTriplesInNeo4j(triples: { subject: string; predicate:
   const session = driver.session();
   try {
     for (const { subject, predicate, object } of triples) {
+      const subjectMerge = documentId && VAULT_TOKEN_PATTERN.test(subject)
+        ? `MERGE (a:Entity {name: $subject, documentId: $documentId})`
+        : `MERGE (a:Entity {name: $subject})`;
+      const objectMerge = documentId && VAULT_TOKEN_PATTERN.test(object)
+        ? `MERGE (b:Entity {name: $object, documentId: $documentId})`
+        : `MERGE (b:Entity {name: $object})`;
+
       await session.run(
-        `MERGE (a:Entity {name: $subject})
-         MERGE (b:Entity {name: $object})
+        `${subjectMerge}
+         ${objectMerge}
          MERGE (a)-[:RELATIONSHIP {type: $predicate}]->(b)`,
-        { subject, predicate, object }
+        { subject, predicate, object, documentId }
       );
     }
   } finally {
@@ -308,9 +329,14 @@ function serializeNeo4jPath(path: any): any {
 }
 
 /**
- * Query Neo4j for the immediate neighborhood of each extracted entity
+ * Query Neo4j for the immediate neighborhood of each extracted entity.
+ *
+ * `documentId` scopes the lookup when `entity` is a vault token (e.g. "[NAME_1]"), so it
+ * only matches the node created for that specific document instead of every document
+ * that happened to produce the same token. Generic medical terms are matched unscoped,
+ * same as in storeTriplesInNeo4j.
  */
-export async function queryNeo4jRelationships(entities: string[]) {
+export async function queryNeo4jRelationships(entities: string[], documentId?: string) {
   const driver = getNeo4jDriver();
   if (!driver) {
     return [];
@@ -321,11 +347,15 @@ export async function queryNeo4jRelationships(entities: string[]) {
     const relationships: Array<{ source: string; relationship: string; target: string }> = [];
 
     for (const entity of entities) {
+      const matchClause = documentId && VAULT_TOKEN_PATTERN.test(entity)
+        ? `MATCH (a:Entity {name: $entity_name, documentId: $documentId})-[r]-(b:Entity)`
+        : `MATCH (a:Entity {name: $entity_name})-[r]-(b:Entity)`;
+
       const result = await session.run(
-        `MATCH (a:Entity {name: $entity_name})-[r]-(b:Entity)
-         RETURN a.name AS source, type(r) AS relationship, b.name AS target
+        `${matchClause}
+         RETURN a.name AS source, r.type AS relationship, b.name AS target
          LIMIT 10`,
-        { entity_name: entity }
+        { entity_name: entity, documentId }
       );
 
       for (const record of result.records) {
