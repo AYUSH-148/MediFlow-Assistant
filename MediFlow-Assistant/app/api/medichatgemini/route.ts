@@ -2,10 +2,10 @@ import { generateDocumentId, queryPineconeVectorStore, pinecone, upsertConversat
 import { getCachedResponse, cacheResponse } from "@/lib/cache";
 import { redactUserQuestion, getVault, rehydrateText, queryNeo4jRelationships } from "@/lib/pii-redaction";
 import { Pinecone } from "@pinecone-database/pinecone";
-import { GoogleGenerativeAI } from "@google/generative-ai";
 // import { Message, OpenAIStream, StreamData, StreamingTextResponse } from "ai";
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
-import { generateText, Message, StreamData, streamText } from "ai";
+import { Message, StreamData, streamText, tool } from "ai";
+import { z } from "zod";
 
 // Allow streaming responses up to 30 seconds
 export const maxDuration = 60;
@@ -21,10 +21,30 @@ const model = google('models/gemini-2.5-flash', {
     ],
 });
 
-const geminiExtractor = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-const extractorModel = geminiExtractor.getGenerativeModel({
-    model: 'gemini-2.5-flash',
-});
+// The main model calls this itself, mid-generation, instead of the route
+// pre-fetching graph context for a fixed set of entities before every answer.
+// Built per-request (not at module scope) so it can scope vault-token lookups
+// (e.g. "[NAME_1]") to this specific document's vaultId.
+function createQueryKnowledgeGraphTool(documentId?: string) {
+    return tool({
+        description:
+            "Look up the known relationships for a single medical entity (a drug, condition, symptom, or treatment) " +
+            "in the patient's knowledge graph. Call this when the report or user question references an entity whose " +
+            "relationships (e.g. what it treats, interacts with, or is caused by) would help answer the question. " +
+            "If a result surfaces another entity worth exploring (e.g. an interacting drug), call this tool again with " +
+            "that entity name to follow the chain.",
+        parameters: z.object({
+            entity: z.string().describe("The exact medical entity name to look up, e.g. \"Aspirin\" or \"Hypertension\"."),
+        }),
+        execute: async ({ entity }) => {
+            const relationships = await queryNeo4jRelationships([entity], documentId);
+            if (!relationships || relationships.length === 0) {
+                return { entity, relationships: [], message: `No known relationships found for "${entity}".` };
+            }
+            return { entity, relationships };
+        },
+    });
+}
 
 function getMessageText(content: Message["content"]): string {
     const rawContent = content as unknown;
@@ -131,27 +151,6 @@ export async function POST(req: Request, res: Response) {
         reportFilter
     );
 
-    // ==================== GRAPH QUERYING ====================
-    console.log("🔗 Querying Neo4j for entity relationships...");
-    let graphData = "";
-    try {
-        const entities = await extractEntitiesFromQuestion(redactedQuestion);
-        if (entities.length > 0) {
-            const relationships = await queryNeo4jRelationships(entities);
-            if (relationships && relationships.length > 0) {
-                graphData = `Entity Relationships: ${JSON.stringify(relationships)}\n`;
-                console.log("✅ Found relationships in graph");
-            } else {
-                console.log("❌ No relationships found in graph");
-            }
-        } else {
-            console.log("⚠️ No entities extracted for graph query");
-        }
-    } catch (error) {
-        console.error("Failed to query Neo4j:", error);
-        // Continue without graph data
-    }
-
     const finalPrompt = `Here is a summary of a patient's clinical report, and a user query. Some generic clinical findings are also provided that may or may not be relevant for the report.
   Go through the clinical report and answer the user query.
   Ensure the response is factually accurate, and demonstrates a thorough understanding of the query topic and the clinical report.
@@ -176,9 +175,7 @@ export async function POST(req: Request, res: Response) {
   \n\n${recentConversationHistory}
   \n\n**end of recent conversation history**
 
-  \n\n**Entity Relationships from Knowledge Graph:**
-  \n\n${graphData}
-  \n\n**end of entity relationships**
+  \n\nYou also have a queryKnowledgeGraph tool that looks up known relationships for a medical entity in the patient's knowledge graph. Call it when an entity mentioned in the report or query would benefit from that context, and call it again with a new entity if a result reveals something else worth following (e.g. an interacting drug). Skip it entirely if the question doesn't need graph context.
 
   \n\nProvide thorough justification for your answer.
   \n\n**Answer:**
@@ -189,16 +186,16 @@ export async function POST(req: Request, res: Response) {
         cacheHit: false,
     });
 
-    let fullResponse = "";
-
     const result = await streamText({
         model: model,
         prompt: finalPrompt,
-        onFinish() {
+        tools: { queryKnowledgeGraph: createQueryKnowledgeGraphTool(vaultId) },
+        maxSteps: 5,
+        onFinish(event) {
             data.close();
-            // Cache the response after generation completes (cache redacted version)
-            if (fullResponse) {
-                cacheResponse(redactedQuestion, fullResponse, reportData);
+            // Cache the response after generation completes (cache redacted version, no tool-call noise)
+            if (event.text) {
+                cacheResponse(redactedQuestion, event.text, reportData);
             }
         }
     });
@@ -231,16 +228,16 @@ export async function POST(req: Request, res: Response) {
                     }
                     const responseText = new TextDecoder().decode(combined);
 
-                    // Store full response for caching
-                    fullResponse = responseText;
+                    // Use the clean generated text (no data-stream framing or tool-call payloads) for memory
+                    const cleanAnswerText = await result.text;
 
-                    if (vaultId && fullResponse) {
-                        const memoryText = `User question: ${redactedQuestion}\nAssistant answer: ${fullResponse}`;
+                    if (vaultId && cleanAnswerText) {
+                        const memoryText = `User question: ${redactedQuestion}\nAssistant answer: ${cleanAnswerText}`;
                         await upsertConversationMemory(
                             pinecone,
                             "medic",
                             {
-                                id: generateDocumentId(`${vaultId}:${redactedQuestion}:${fullResponse}`),
+                                id: generateDocumentId(`${vaultId}:${redactedQuestion}:${cleanAnswerText}`),
                                 documentId: vaultId,
                                 text: memoryText,
                             }
@@ -271,34 +268,3 @@ export async function POST(req: Request, res: Response) {
 
     return originalStream;
 }
-
-// Extract entities from user question using Gemini for semantic understanding
-async function extractEntitiesFromQuestion(question: string): Promise<string[]> {
-    const prompt = `Extract the medical entities (drugs, conditions, symptoms) from the following user question.\nReturn ONLY a JSON array of strings representing the entities. Do not include markdown formatting.\n\nUser Question: "${question}"\n`;
-
-    try {
-        const generatedContent = await extractorModel.generateContent([prompt]);
-        const rawText = generatedContent.response.candidates?.[0].content.parts?.[0].text;
-        if (!rawText) {
-            throw new Error('No response text from Gemini entity extraction');
-        }
-
-        const cleanedText = rawText.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
-        const parsed = JSON.parse(cleanedText);
-        if (Array.isArray(parsed)) {
-            return parsed.map((entity) => String(entity).trim()).filter((entity) => entity.length > 0);
-        }
-        throw new Error('Gemini entity extraction returned unexpected format');
-    } catch (error) {
-        console.error('Gemini entity extraction failed, falling back to heuristic extraction:', error);
-        // Fallback to the original heuristic extraction
-        const words = question.split(/\s+/);
-        const entities = words.filter((word) =>
-            word.length > 2 &&
-            word[0] === word[0].toUpperCase() &&
-            !['What', 'How', 'Why', 'When', 'Where', 'Who', 'Is', 'Are', 'Does'].includes(word)
-        );
-        return entities.slice(0, 2);
-    }
-}
-

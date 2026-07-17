@@ -91,7 +91,7 @@ export async function POST(req: Request, res: Response) {
         const redactedTriples = redactTriples(triples, redactionResult.vault);
         console.log(`📈 Storing ${redactedTriples.length} redacted triples in Neo4j...`);
         try {
-            await storeTriplesInNeo4j(redactedTriples);
+            await storeTriplesInNeo4j(redactedTriples, documentId);
             console.log("✅ Redacted triples stored successfully");
         } catch (error) {
             console.error("Failed to store triples in Neo4j:", error);
