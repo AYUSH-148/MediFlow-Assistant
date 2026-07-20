@@ -1,7 +1,5 @@
 import { createHash } from "crypto";
 import { Pinecone } from "@pinecone-database/pinecone";
-// import { FeatureExtractionPipeline, pipeline } from "@xenova/transformers";
-// import { modelname, namespace, topK } from "./app/config";
 import { InferenceClient } from '@huggingface/inference';
 
 const hf = new InferenceClient(process.env.HF_TOKEN)
@@ -108,40 +106,30 @@ async function getKeywordCorpus(
   client: Pinecone,
   indexName: string,
   namespace: string,
+  queryEmbedding: number[],
+  filter?: Record<string, any>,
   maxDocuments: number = 500
 ): Promise<Array<{ id: string; text: string }>> {
   const index = client.Index(indexName) as any;
   const namespaceIndex = index.namespace(namespace);
-  const documents: Array<{ id: string; text: string }> = [];
-  let paginationToken: string | undefined;
 
-  while (documents.length < maxDocuments) {
-    const response = await namespaceIndex.listPaginated({
-      limit: 100,
-      paginationToken,
-    });
-    const ids = (response.vectors ?? []).map((item: any) => String(item.id ?? "")).filter(Boolean);
+  // Reuses the same filter as the vector search (e.g. documentId scoping). Previously
+  // this listed the ENTIRE namespace unfiltered, so the keyword-search half of the
+  // hybrid retrieval could pull in another document's chunks regardless of which
+  // document the vector search was scoped to - RRF fusion then blended them into the
+  // final context. Pinecone's list API has no metadata filter, so a filtered query()
+  // (topK standing in for "give me everything under this filter") replaces it here.
+  const response = await namespaceIndex.query({
+    topK: maxDocuments,
+    vector: queryEmbedding,
+    includeMetadata: true,
+    includeValues: false,
+    filter,
+  });
 
-    if (ids.length === 0) {
-      break;
-    }
-
-    const fetched = await namespaceIndex.fetch(ids as any);
-    for (const id of ids) {
-      const record = fetched.records?.[id];
-      const text = String(record?.metadata?.chunk ?? "");
-      if (text.trim()) {
-        documents.push({ id, text });
-      }
-    }
-
-    if (!response.pagination?.next) {
-      break;
-    }
-    paginationToken = response.pagination.next;
-  }
-
-  return documents;
+  return ((response.matches ?? []) as Array<any>)
+    .map((match) => ({ id: String(match.id ?? ""), text: String(match.metadata?.chunk ?? "") }))
+    .filter((doc) => doc.id && doc.text.trim().length > 0);
 }
 
 function rankWithTfIdf(query: string, documents: { id: string; text: string }[]) {
@@ -269,7 +257,7 @@ export async function queryPineconeVectorStore(
     }))
     .filter((match) => match.text.trim().length > 0);
 
-  const keywordCorpus = await getKeywordCorpus(client, indexName, namespace);
+  const keywordCorpus = await getKeywordCorpus(client, indexName, namespace, queryEmbedding as number[], filter);
   const keywordResults = rankWithTfIdf(query, keywordCorpus);
   const fusedResults = fuseResultsWithRrf(vectorResults, keywordResults, 10);
 

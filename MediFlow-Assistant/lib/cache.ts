@@ -96,29 +96,27 @@ export async function getCachedResponse(
       return null;
     }
 
+    // Fetch all cached entries for this report in a single round trip
+    const cachedEntries = await redis.mget<CacheEntry[]>(...keys);
+
     // Check each cached entry for similarity
-    for (const key of keys) {
-      try {
-        const cachedData = await redis.get<CacheEntry>(key);
-        
-        if (!cachedData || !cachedData.embedding) {
-          continue;
-        }
+    for (let i = 0; i < keys.length; i++) {
+      const cachedData = cachedEntries[i];
 
-        const similarity = cosineSimilarity(
-          currentEmbedding,
-          cachedData.embedding
-        );
-
-        if (similarity >= similarityThreshold) {
-          console.log(
-            `Cache HIT! Similarity: ${similarity.toFixed(4)}, Key: ${key}`
-          );
-          return cachedData.answer;
-        }
-      } catch (error) {
-        console.error(`Error checking cache entry ${key}:`, error);
+      if (!cachedData || !cachedData.embedding) {
         continue;
+      }
+
+      const similarity = cosineSimilarity(
+        currentEmbedding,
+        cachedData.embedding
+      );
+
+      if (similarity >= similarityThreshold) {
+        console.log(
+          `Cache HIT! Similarity: ${similarity.toFixed(4)}, Key: ${keys[i]}`
+        );
+        return cachedData.answer;
       }
     }
 
