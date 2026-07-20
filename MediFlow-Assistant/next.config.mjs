@@ -6,7 +6,7 @@ const nextConfig = {
     
     // Indicate that these packages should not be bundled by webpack
     experimental: {
-        serverComponentsExternalPackages: ['sharp', 'onnxruntime-node'],
+        serverComponentsExternalPackages: ['sharp', 'onnxruntime-node', 'pdf-parse', 'pdfjs-dist'],
     },
 };
 

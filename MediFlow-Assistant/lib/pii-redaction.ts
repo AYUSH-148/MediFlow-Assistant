@@ -48,29 +48,45 @@ export async function verifyNeo4jConnectivity(): Promise<boolean> {
   }
 }
 
-// PII Entity types we want to detect and redact
-const PII_PATTERNS = {
-  // Names (basic pattern - can be enhanced with NLP)
-  NAME: /\b[A-Z][a-z]+ [A-Z][a-z]+\b/g,
-
-  // Phone numbers (various formats)
-  PHONE: /(\+?\d{1,3}[-.\s]?)?\(?(\d{3})\)?[-.\s]?(\d{3})[-.\s]?(\d{4})\b/g,
-
+// PII detection rules. Each rule has a type (used for the token label) and a regex.
+// When a regex has a capturing group, only group 1 is treated as PII and redacted
+// (e.g. the name after a "Patient:" label), leaving the surrounding context intact.
+//
+// These patterns are intentionally precise. The pipeline now redacts the ENTIRE
+// document before chunking (not just a short summary), so broad patterns like the
+// old NAME (any two capitalized words) or ADDRESS (a number followed by anything,
+// spanning newlines) would tokenize large amounts of legitimate clinical data and
+// wreck retrieval. Unambiguous PII (email, phone, SSN, MRN) stays aggressively matched;
+// contextual PII (name, DOB, address) is anchored to labels or structural cues.
+// NOTE: inter-token whitespace uses [ \t] (never \s), because \s matches newlines and a
+// multi-word capture like a name would greedily swallow the start of the next line
+// (e.g. "John Doe\nDOB"), producing a vault value that no longer matches the real name
+// elsewhere and leaving it un-redacted.
+const PII_RULES: Array<{ type: string; regex: RegExp }> = [
   // Email addresses
-  EMAIL: /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g,
+  { type: "EMAIL", regex: /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g },
 
-  // Social Security Numbers (US format)
-  SSN: /\b\d{3}[-]?\d{2}[-]?\d{4}\b/g,
+  // Phone / fax numbers (various formats)
+  { type: "PHONE", regex: /(?:\+?\d{1,3}[-.\t ]?)?\(?\d{3}\)?[-.\t ]?\d{3}[-.\t ]?\d{4}\b/g },
 
-  // Dates of birth (various formats)
-  DOB: /\b\d{1,2}[-\/]\d{1,2}[-\/]\d{2,4}\b/g,
+  // US Social Security Numbers (require dashes to avoid matching plain 9-digit IDs)
+  { type: "SSN", regex: /\b\d{3}-\d{2}-\d{4}\b/g },
 
-  // Medical Record Numbers (common patterns)
-  MRN: /\b(MRN|Medical Record|Patient ID)[:\s]*[A-Z0-9-]+\b/gi,
+  // Medical Record Number / Patient ID (label-anchored; capture the identifier)
+  { type: "MRN", regex: /\b(?:MRN|Medical Record(?:[ \t]*(?:No\.?|Number|#))?|Patient[ \t]*ID)[ \t]*[:#\-]?[ \t]*([A-Z0-9][A-Z0-9-]{3,})/gi },
 
-  // Addresses (basic street address pattern)
-  ADDRESS: /\b\d+\s+[A-Za-z0-9\s,.-]+\b/g,
-};
+  // Date of birth (label-anchored; capture only the date so other clinical dates survive)
+  { type: "DOB", regex: /\b(?:DOB|D\.O\.B\.?|Date of Birth|Birth[ \t]*Date)[ \t]*[:\-]?[ \t]*(\d{1,2}[-\/.]\d{1,2}[-\/.]\d{2,4})/gi },
+
+  // Patient / provider name (label-anchored; capture the name only)
+  { type: "NAME", regex: /\b(?:Patient(?:'s)?(?:[ \t]+Name)?|Name|Physician|Provider|Doctor|Referring[ \t]+Physician|Ordering[ \t]+Physician|Attending(?:[ \t]+Physician)?)[ \t]*[:\-][ \t]*([A-Z][A-Za-z'’.\-]+(?:[ \t]+[A-Z][A-Za-z'’.\-]+){1,2})/g },
+
+  // Titled name without a label (Dr./Mr./Mrs./Ms./Prof.; capture the name, drop the title)
+  { type: "NAME", regex: /\b(?:Mr|Mrs|Ms|Miss|Dr|Prof)\.?[ \t]+([A-Z][a-z]+(?:[ \t]+[A-Z][a-z]+){0,2})\b/g },
+
+  // Street address on a single line, anchored by a street-type suffix (never crosses newlines)
+  { type: "ADDRESS", regex: /\b\d{1,6}[ \t]+[A-Za-z0-9.\- ]{2,40}?[ \t]+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Way|Place|Pl|Terrace|Ter|Circle|Cir|Suite|Ste|Apt|Unit)\b\.?/gi },
+];
 
 interface TokenVault {
   [token: string]: string; // token -> original value
@@ -83,13 +99,6 @@ interface RedactionResult {
 }
 
 /**
- * Generate a unique token for PII replacement
- */
-function generateToken(type: string, index: number): string {
-  return `[${type}_${index}]`;
-}
-
-/**
  * Create a unique vault ID for this redaction session
  */
 function generateVaultId(): string {
@@ -97,40 +106,65 @@ function generateVaultId(): string {
 }
 
 /**
- * Detect and redact PII from text using regex patterns
- * Returns redacted text and a vault mapping tokens to original values
+ * Redact PII across one or more texts using a SINGLE shared vault.
+ *
+ * This is the primitive the rest of the module builds on. It runs in two phases so
+ * that token assignment is consistent everywhere:
+ *   1. Discover every distinct PII value across all texts and assign it one token
+ *      (deduped by value, so the same person/number always maps to the same token,
+ *      even across chunks and the summary).
+ *   2. Replace each discovered value with its token in every text, longest value
+ *      first so shorter values can't partially clobber a longer one.
  */
-export function redactPII(text: string): RedactionResult {
-  let redactedText = text;
+export function redactDocument(texts: string[]): { redactedTexts: string[]; vault: TokenVault } {
   const vault: TokenVault = {};
-  const vaultId = generateVaultId();
+  const valueToToken = new Map<string, string>();
+  const typeCounters: Record<string, number> = {};
 
-  // Process each PII pattern
-  Object.entries(PII_PATTERNS).forEach(([type, pattern]) => {
-    let match;
-    let index = 1;
+  for (const text of texts) {
+    for (const { type, regex } of PII_RULES) {
+      regex.lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = regex.exec(text)) !== null) {
+        // Guard against zero-length matches causing an infinite loop.
+        if (match.index === regex.lastIndex) regex.lastIndex++;
 
-    // Reset lastIndex for global regex
-    pattern.lastIndex = 0;
+        const value = (match[1] ?? match[0]).trim();
+        if (!value) continue;
 
-    while ((match = pattern.exec(text)) !== null) {
-      const originalValue = match[0];
-      const token = generateToken(type, index);
-
-      // Replace in redacted text
-      redactedText = redactedText.replace(originalValue, token);
-
-      // Store in vault
-      vault[token] = originalValue;
-
-      index++;
+        if (!valueToToken.has(value)) {
+          const next = (typeCounters[type] ?? 0) + 1;
+          typeCounters[type] = next;
+          const token = `[${type}_${next}]`;
+          valueToToken.set(value, token);
+          vault[token] = value;
+        }
+      }
     }
+  }
+
+  const orderedValues = Array.from(valueToToken.keys()).sort((a, b) => b.length - a.length);
+  const redactedTexts = texts.map((text) => {
+    let out = text;
+    for (const value of orderedValues) {
+      out = out.split(value).join(valueToToken.get(value)!);
+    }
+    return out;
   });
 
+  return { redactedTexts, vault };
+}
+
+/**
+ * Detect and redact PII from a single text.
+ * Returns redacted text and a vault mapping tokens to original values.
+ */
+export function redactPII(text: string): RedactionResult {
+  const { redactedTexts, vault } = redactDocument([text]);
   return {
-    redactedText,
+    redactedText: redactedTexts[0],
     vault,
-    vaultId,
+    vaultId: generateVaultId(),
   };
 }
 
@@ -155,10 +189,13 @@ export async function storeVault(vaultId: string, vault: TokenVault, ttlSeconds:
  */
 export async function getVault(vaultId: string): Promise<TokenVault | null> {
   try {
-    const vaultData = await redis.get<string>(`vault:${vaultId}`);
+    // Upstash Redis auto-deserializes stored JSON: get() returns an object here even
+    // though storeVault() wrote a JSON string. Handle both so we never JSON.parse an
+    // object (which throws and silently disables PII rehydration).
+    const vaultData = await redis.get<TokenVault | string>(`vault:${vaultId}`);
     if (!vaultData) return null;
 
-    return JSON.parse(vaultData);
+    return typeof vaultData === "string" ? (JSON.parse(vaultData) as TokenVault) : vaultData;
   } catch (error) {
     console.error("Error retrieving vault:", error);
     return null;
@@ -169,25 +206,11 @@ export async function getVault(vaultId: string): Promise<TokenVault | null> {
  * Redact user question using the same patterns (no vault needed for questions)
  */
 export function redactUserQuestion(question: string): string {
-  let redactedQuestion = question;
-
-  // Apply the same patterns but don't store tokens (since we're not saving this)
-  Object.entries(PII_PATTERNS).forEach(([type, pattern]) => {
-    let match;
-    let index = 1;
-
-    pattern.lastIndex = 0;
-
-    while ((match = pattern.exec(question)) !== null) {
-      const originalValue = match[0];
-      const token = generateToken(type, index);
-
-      redactedQuestion = redactedQuestion.replace(originalValue, token);
-      index++;
-    }
-  });
-
-  return redactedQuestion;
+  // Reuse the shared redactor; the vault it builds is discarded because questions
+  // are never rehydrated (only the report/answer are). Token numbering here is
+  // independent of the document vault, which is fine: this only keeps PII out of
+  // the semantic cache, retrieval query, and LLM prompt.
+  return redactDocument([question]).redactedTexts[0];
 }
 
 /**
@@ -221,9 +244,11 @@ export function redactTriples(
 export function rehydrateText(text: string, vault: TokenVault): string {
   let rehydratedText = text;
 
-  // Replace each token with its original value
+  // Use literal split/join rather than new RegExp(token): tokens like "[NAME_1]"
+  // contain regex-special characters ([, ]) that would otherwise be interpreted as
+  // a character class and corrupt the output.
   Object.entries(vault).forEach(([token, originalValue]) => {
-    rehydratedText = rehydratedText.replace(new RegExp(token, "g"), originalValue);
+    rehydratedText = rehydratedText.split(token).join(originalValue);
   });
 
   return rehydratedText;
