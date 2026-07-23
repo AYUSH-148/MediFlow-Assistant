@@ -2,7 +2,7 @@ import React from 'react'
 import { Textarea } from './ui/textarea'
 import { useChat } from 'ai/react';
 import { Button } from './ui/button';
-import { CornerDownLeft, Loader2, MessageCircle, TextSearch } from 'lucide-react';
+import { CornerDownLeft, Loader2, MessageCircle, TextSearch, UploadCloud } from 'lucide-react';
 import { Badge } from './ui/badge';
 import Messages from './messages';
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from './ui/accordion';
@@ -13,31 +13,61 @@ type Props = {
     redactedSummary: string;
     vaultId: string;
   }
+  onOpenReport?: () => void
 }
 
-const ChatComponent = ({ reportData }: Props) => {
+const ChatComponent = ({ reportData, onOpenReport }: Props) => {
   const { messages, input, handleInputChange, handleSubmit, isLoading, data } =
     useChat({
       api: "api/medichatgemini",
     });
   return (
     <div className="h-full bg-muted/50 relative flex flex-col min-h-0 rounded-xl p-4 gap-4">
-      <Badge variant={'outline'}
-        className={`absolute right-3 top-1.5 ${reportData && "bg-[#00B612] text-white border-transparent"}`}
-      >
-        {reportData ? "✓ Report Added" : "No Report Added"}
-
-      </Badge>
+      {reportData ? (
+        <Badge
+          variant={'outline'}
+          className="absolute right-3 top-1.5 bg-[#00B612] text-white border-transparent"
+        >
+          ✓ Report Added
+        </Badge>
+      ) : (
+        // On mobile the status badge doubles as a tappable shortcut to the upload drawer,
+        // since the report panel is hidden below md. On desktop it stays a plain indicator.
+        <button
+          type="button"
+          onClick={onOpenReport}
+          className="absolute right-3 top-1.5 md:pointer-events-none"
+          aria-label="Add a report"
+        >
+          <Badge variant={'outline'} className="gap-1 cursor-pointer md:cursor-default">
+            <UploadCloud className="h-3 w-3 md:hidden" />
+            <span className="md:hidden">Add report</span>
+            <span className="hidden md:inline">No Report Added</span>
+          </Badge>
+        </button>
+      )}
       <div className="flex-1 min-h-0 overflow-y-auto">
         {messages.length === 0 ? (
-          <div className="flex h-full flex-col items-center justify-center gap-2 text-center text-muted-foreground">
+          <div className="flex h-full flex-col items-center justify-center gap-3 px-4 text-center text-muted-foreground">
             <MessageCircle className="h-8 w-8" />
             <p className="text-sm font-medium">Start the conversation</p>
             <p className="max-w-xs text-xs">
               {reportData
                 ? "Ask a question about the uploaded report, or anything else on your mind."
-                : "Upload a report on the left for tailored answers, or just ask a general question."}
+                : "Upload a medical report for tailored, private answers — or just ask a general question below."}
             </p>
+            {!reportData && (
+              // Prominent CTA so mobile users know a report can be added; hidden on md+
+              // where the upload panel is already visible beside the chat.
+              <Button
+                type="button"
+                onClick={onOpenReport}
+                className="mt-1 gap-1.5 bg-[#D90013] hover:bg-[#D90013]/90 md:hidden"
+              >
+                <UploadCloud className="h-4 w-4" />
+                Upload a report
+              </Button>
+            )}
           </div>
         ) : (
           <Messages messages={messages} isLoading={isLoading} />
