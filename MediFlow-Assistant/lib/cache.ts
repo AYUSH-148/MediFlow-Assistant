@@ -55,10 +55,12 @@ function getCacheKeyPrefix(reportHash: string): string {
 /**
  * Generate a hash for the report data (simple hash)
  */
-function generateReportHash(reportData: string): string {
+function generateReportHash(reportData?: string): string {
+  // No report uploaded → chats share one namespace instead of crashing on undefined.
+  const source = reportData ?? "";
   let hash = 0;
-  for (let i = 0; i < reportData.length; i++) {
-    const char = reportData.charCodeAt(i);
+  for (let i = 0; i < source.length; i++) {
+    const char = source.charCodeAt(i);
     hash = (hash << 5) - hash + char;
     hash = hash & hash; // Convert to 32bit integer
   }

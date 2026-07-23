@@ -73,8 +73,9 @@ export async function POST(req: Request, res: Response) {
     const latestMessage = messages[messages.length - 1];
     const userQuestion = getMessageText(latestMessage?.content ?? "");
 
-    const reportData: string = reqBody.data.reportData;
-    const vaultId: string = reqBody.data.vaultId; // Get vault ID from request
+    // data is {} when the user chats without uploading a report.
+    const reportData: string = reqBody.data?.reportData ?? "";
+    const vaultId: string = reqBody.data?.vaultId ?? ""; // Get vault ID from request
     const reportFilter = vaultId ? { documentId: { $eq: vaultId } } : undefined;
 
     // ==================== PII REDACTION ====================
