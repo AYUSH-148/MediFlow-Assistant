@@ -58,18 +58,19 @@ const Home = () => {
             </Drawer>
           </div>
         </header>
-        <main className="grid flex-1 gap-4 overflow-auto p-4
+        <main className="grid flex-1 min-h-0 gap-4 overflow-hidden p-4
+        grid-rows-[minmax(0,1fr)]
         md:grid-cols-2
         lg:grid-cols-3"
         >
           <div
-            className="hidden md:flex flex-col"
+            className="hidden md:flex flex-col min-h-0 overflow-y-auto"
           >
             <ReportComponent onReportConfirmation={onReportConfirmation} />
             {/* <SideComponent onReportConfirmation={onReportConfirmation} /> */}
           </div>
           <div
-            className="lg:col-span-2"
+            className="lg:col-span-2 min-h-0"
           >
             <ChatComponent reportData={reportData} />
           </div>
