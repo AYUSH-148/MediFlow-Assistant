@@ -21,14 +21,14 @@ const ChatComponent = ({ reportData }: Props) => {
       api: "api/medichatgemini",
     });
   return (
-    <div className="h-full bg-muted/50 relative flex flex-col min-h-[50vh] rounded-xl p-4 gap-4">
+    <div className="h-full bg-muted/50 relative flex flex-col min-h-0 rounded-xl p-4 gap-4">
       <Badge variant={'outline'}
         className={`absolute right-3 top-1.5 ${reportData && "bg-[#00B612] text-white border-transparent"}`}
       >
         {reportData ? "✓ Report Added" : "No Report Added"}
 
       </Badge>
-      <div className="flex-1 overflow-y-auto">
+      <div className="flex-1 min-h-0 overflow-y-auto">
         {messages.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-center text-muted-foreground">
             <MessageCircle className="h-8 w-8" />
@@ -70,6 +70,15 @@ const ChatComponent = ({ reportData }: Props) => {
         <Textarea
           value={input}
           onChange={handleInputChange}
+          onKeyDown={(event) => {
+            // Enter submits; Shift+Enter inserts a newline.
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
+              if (!isLoading && input.trim()) {
+                event.currentTarget.form?.requestSubmit();
+              }
+            }
+          }}
           placeholder="Type your query here..."
           className="min-h-12 resize-none border-0 p-3 shadow-none focus-visible:ring-0"
         />

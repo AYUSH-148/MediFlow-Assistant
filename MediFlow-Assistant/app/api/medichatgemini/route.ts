@@ -4,7 +4,7 @@ import { redactUserQuestion, getVault, rehydrateText, queryNeo4jRelationships } 
 import { Pinecone } from "@pinecone-database/pinecone";
 // import { Message, OpenAIStream, StreamData, StreamingTextResponse } from "ai";
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
-import { Message, StreamData, streamText, tool } from "ai";
+import { Message, StreamData, streamText, tool, formatStreamPart } from "ai";
 import { z } from "zod";
 
 // Allow streaming responses up to 30 seconds
@@ -90,8 +90,6 @@ export async function POST(req: Request, res: Response) {
     console.log("🔍 Checking semantic cache for similar questions...");
     const cachedAnswer = await getCachedResponse(redactedQuestion, reportData, 0.95);
 
-    const data = new StreamData();
-
     if (cachedAnswer) {
         // Cache HIT - return cached response (but re-hydrate it first)
         console.log("✅ Cache HIT! Re-hydrating cached response");
@@ -100,24 +98,42 @@ export async function POST(req: Request, res: Response) {
         const vault = await getVault(vaultId);
         const rehydratedAnswer = vault ? rehydrateText(cachedAnswer, vault) : cachedAnswer;
 
-        data.append({
-            retrievals: "[CACHED_RESPONSE]",
-            cacheHit: true,
-        });
-        data.close();
-
-        // Return re-hydrated cached response as stream
+        // Emit using the AI SDK data-stream protocol so useChat (default
+        // streamProtocol: "data") can parse it — the same framing the
+        // cache-MISS path produces via toDataStreamResponse(). Returning raw
+        // text here means the client silently drops the response.
         const encoder = new TextEncoder();
         return new Response(
             new ReadableStream({
                 start(controller) {
-                    controller.enqueue(encoder.encode(rehydratedAnswer));
+                    // Data annotation (code "2") — mirrors the miss-path data.append()
+                    controller.enqueue(
+                        encoder.encode(
+                            formatStreamPart("data", [
+                                { retrievals: "[CACHED_RESPONSE]", cacheHit: true },
+                            ])
+                        )
+                    );
+                    // Text part (code "0")
+                    controller.enqueue(
+                        encoder.encode(formatStreamPart("text", rehydratedAnswer))
+                    );
+                    // Finish message (code "d") so the client cleanly ends the turn
+                    controller.enqueue(
+                        encoder.encode(
+                            formatStreamPart("finish_message", {
+                                finishReason: "stop",
+                                usage: { promptTokens: 0, completionTokens: 0 },
+                            })
+                        )
+                    );
                     controller.close();
                 },
             }),
             {
                 headers: {
                     "Content-Type": "text/plain; charset=utf-8",
+                    "X-Vercel-AI-Data-Stream": "v1",
                     "X-Cache": "HIT",
                 },
             }
@@ -126,6 +142,7 @@ export async function POST(req: Request, res: Response) {
 
     // Cache MISS - run normal flow
     console.log("❌ Cache MISS. Running full inference pipeline...");
+    const data = new StreamData();
     const query = `Represent this for searching relevant passages: patient medical report says: \n${reportData}. \n\n${redactedQuestion}`;
 
     const retrievals = await queryPineconeVectorStore(
