@@ -16,8 +16,15 @@ const google = createGoogleGenerativeAI({
     apiKey: process.env.GEMINI_API_KEY
 });
 const model = google('models/gemini-2.5-flash', {
+    // A medical assistant routinely discusses conditions, treatments, and "cures".
+    // Leaving the other categories at their defaults let Gemini block such prompts
+    // and return an empty candidate (no text), which surfaced as blank answers.
+    // Disable blocking across all categories for this clinical use case.
     safetySettings: [
-        { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' }
+        { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
+        { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+        { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+        { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
     ],
 });
 
@@ -210,6 +217,11 @@ export async function POST(req: Request, res: Response) {
         tools: { queryKnowledgeGraph: createQueryKnowledgeGraphTool(vaultId) },
         maxSteps: 5,
         onFinish(event) {
+            // Surface why a generation produced no text (safety block, tool-only step, etc.).
+            console.log(
+                `🏁 Generation finished: finishReason=${event.finishReason} ` +
+                `textLength=${event.text?.length ?? 0} toolCalls=${event.toolCalls?.length ?? 0}`
+            );
             data.close();
             // Cache the response after generation completes (cache redacted version, no tool-call noise)
             if (event.text) {
@@ -262,9 +274,32 @@ export async function POST(req: Request, res: Response) {
                         );
                     }
 
+                    // If the model produced no text (safety block, tool-only turn, etc.) the
+                    // data stream has no text part and the UI renders an empty bubble. Inject a
+                    // fallback text part just before the stream's finish markers so the user sees
+                    // a helpful message instead of a blank response.
+                    let streamPayload = responseText;
+                    if (!cleanAnswerText || !cleanAnswerText.trim()) {
+                        console.warn("⚠️ Model returned empty text; injecting fallback message.");
+                        const fallback =
+                            "I couldn't generate an answer for that one. Please try rephrasing your " +
+                            "question, or ask about a specific finding in the report (a medication, " +
+                            "biomarker, or diagnosis).";
+                        const fallbackPart = `0:${JSON.stringify(fallback)}`;
+                        const lines = responseText.split("\n");
+                        // Text parts must precede the finish-step (e:) / finish-message (d:) parts.
+                        const finishIdx = lines.findIndex((l) => l.startsWith("d:") || l.startsWith("e:"));
+                        if (finishIdx === -1) {
+                            streamPayload = `${fallbackPart}\n${responseText}`;
+                        } else {
+                            lines.splice(finishIdx, 0, fallbackPart);
+                            streamPayload = lines.join("\n");
+                        }
+                    }
+
                     // Re-hydrate the response with original PII
                     const vault = await getVault(vaultId);
-                    const finalText = vault ? rehydrateText(responseText, vault) : responseText;
+                    const finalText = vault ? rehydrateText(streamPayload, vault) : streamPayload;
                     if (vault) {
                         console.log("🔄 Re-hydrated response with original PII");
                     }

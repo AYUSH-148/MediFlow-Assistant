@@ -84,8 +84,13 @@ const PII_RULES: Array<{ type: string; regex: RegExp }> = [
   // Titled name without a label (Dr./Mr./Mrs./Ms./Prof.; capture the name, drop the title)
   { type: "NAME", regex: /\b(?:Mr|Mrs|Ms|Miss|Dr|Prof)\.?[ \t]+([A-Z][a-z]+(?:[ \t]+[A-Z][a-z]+){0,2})\b/g },
 
-  // Street address on a single line, anchored by a street-type suffix (never crosses newlines)
-  { type: "ADDRESS", regex: /\b\d{1,6}[ \t]+[A-Za-z0-9.\- ]{2,40}?[ \t]+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Way|Place|Pl|Terrace|Ter|Circle|Cir|Suite|Ste|Apt|Unit)\b\.?/gi },
+  // Street address on a single line: a house number, one to four Title-cased street-name
+  // words, then a street-type suffix. Case-SENSITIVE (no /i) and Title-case-anchored on
+  // purpose: the abbreviated suffixes (St, Dr, Rd, Ln, Ct, Pl…) collide with common
+  // ALL-CAPS clinical terms otherwise — e.g. the old case-insensitive rule matched "St"
+  // inside "ST-segment" and swallowed "Stage 2 … ST" into one ADDRESS token. The trailing
+  // (?![-A-Za-z]) also rejects hyphenated continuations like "St-segment".
+  { type: "ADDRESS", regex: /\b\d{1,6}[ \t]+(?:[A-Z][A-Za-z0-9.\-]*[ \t]+){1,4}(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Way|Place|Pl|Terrace|Ter|Circle|Cir|Suite|Ste|Apt|Unit)\.?(?![-A-Za-z])/g },
 ];
 
 interface TokenVault {
