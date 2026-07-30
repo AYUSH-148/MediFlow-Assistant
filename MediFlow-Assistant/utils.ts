@@ -1,21 +1,11 @@
 import { createHash } from "crypto";
 import { Pinecone } from "@pinecone-database/pinecone";
-import { InferenceClient } from '@huggingface/inference';
-
-const hf = new InferenceClient(process.env.HF_TOKEN)
+import { generateEmbedding } from "@/lib/embeddings";
 
 // Centralized Pinecone client
 export const pinecone = new Pinecone({
   apiKey: process.env.PINECONE_API_KEY ?? "",
 });
-
-export async function generateEmbedding(text: string): Promise<number[]> {
-  const apiOutput = await hf.featureExtraction({
-    model: "mixedbread-ai/mxbai-embed-large-v1",
-    inputs: text,
-  });
-  return Array.from(apiOutput as any);
-}
 
 export async function upsertVectors(
   client: Pinecone,
@@ -233,16 +223,13 @@ export async function queryPineconeVectorStore(
   query: string,
   filter?: Record<string, any>
 ): Promise<string> {
-  const apiOutput = await hf.featureExtraction({
-    model: "mixedbread-ai/mxbai-embed-large-v1",
-    inputs: query,
-  });
-
-  const queryEmbedding = Array.from(apiOutput as any);
+  // One embedding call serves both halves of the hybrid search below: it is passed
+  // into getKeywordCorpus rather than recomputed there.
+  const queryEmbedding = await generateEmbedding(query);
   const index = client.Index(indexName);
   const queryResponse = await index.namespace(namespace).query({
     topK: 12,
-    vector: queryEmbedding as any,
+    vector: queryEmbedding,
     includeMetadata: true,
     includeValues: false,
     filter,
@@ -257,7 +244,7 @@ export async function queryPineconeVectorStore(
     }))
     .filter((match) => match.text.trim().length > 0);
 
-  const keywordCorpus = await getKeywordCorpus(client, indexName, namespace, queryEmbedding as number[], filter);
+  const keywordCorpus = await getKeywordCorpus(client, indexName, namespace, queryEmbedding, filter);
   const keywordResults = rankWithTfIdf(query, keywordCorpus);
   const fusedResults = fuseResultsWithRrf(vectorResults, keywordResults, 10);
 

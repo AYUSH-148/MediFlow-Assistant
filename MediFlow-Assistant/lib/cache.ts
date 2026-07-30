@@ -1,12 +1,10 @@
 import { Redis } from "@upstash/redis";
-import { InferenceClient } from "@huggingface/inference";
+import { generateEmbedding } from "@/lib/embeddings";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL!,
   token: process.env.UPSTASH_REDIS_REST_TOKEN!,
 });
-
-const hf = new InferenceClient(process.env.HF_TOKEN);
 
 /**
  * Calculate cosine similarity between two vectors
@@ -27,22 +25,6 @@ function cosineSimilarity(vecA: number[], vecB: number[]): number {
 
   if (normA === 0 || normB === 0) return 0;
   return dotProduct / (normA * normB);
-}
-
-/**
- * Generate embedding for a given text using HuggingFace
- */
-async function generateEmbedding(text: string): Promise<number[]> {
-  try {
-    const embedding = await hf.featureExtraction({
-      model: "mixedbread-ai/mxbai-embed-large-v1",
-      inputs: text,
-    });
-    return Array.from(embedding as any);
-  } catch (error) {
-    console.error("Error generating embedding:", error);
-    throw error;
-  }
 }
 
 /**

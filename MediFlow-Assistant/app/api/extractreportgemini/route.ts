@@ -2,7 +2,8 @@ import { GoogleGenerativeAI, type GenerateContentResponse } from "@google/genera
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { redactDocument, redactTriples, storeVault, storeTriplesInNeo4j, getVault } from "@/lib/pii-redaction";
 import { GEMINI_MODEL_ID, GOOGLE_SDK_SAFETY_SETTINGS } from "@/lib/gemini";
-import { generateDocumentId, generateEmbedding, upsertVectors, pinecone } from "@/utils";
+import { generateEmbeddings } from "@/lib/embeddings";
+import { generateDocumentId, upsertVectors, pinecone } from "@/utils";
 
 export const maxDuration = 60;
 
@@ -14,12 +15,11 @@ const model = genAI.getGenerativeModel({
 
 type Triple = { subject: string; predicate: string; object: string };
 
-// Chunk sizing is tuned for the embedding model (mxbai-embed-large-v1, 512-token limit).
-// ~1200 chars ≈ well under 512 tokens for dense clinical text, with overlap to preserve
-// context across boundaries.
+// Chunk sizing is tuned for the embedding model in @/lib/embeddings
+// (mxbai-embed-large-v1, 512-token limit). ~1200 chars ≈ well under 512 tokens for
+// dense clinical text, with overlap to preserve context across boundaries.
 const CHUNK_SIZE = 1200;
 const CHUNK_OVERLAP = 150;
-const EMBED_BATCH_SIZE = 8;
 
 // A PDF is treated as "born-digital" (has a real text layer) only if extraction yields
 // enough text. Scanned/photographed PDFs return little or no text and fall back to Gemini OCR.
@@ -161,16 +161,6 @@ async function transcribeAndAnalyze(
   };
 }
 
-async function embedInBatches(chunks: string[]): Promise<number[][]> {
-  const embeddings: number[][] = [];
-  for (let i = 0; i < chunks.length; i += EMBED_BATCH_SIZE) {
-    const batch = chunks.slice(i, i + EMBED_BATCH_SIZE);
-    const batchEmbeddings = await Promise.all(batch.map((chunk) => generateEmbedding(chunk)));
-    embeddings.push(...batchEmbeddings);
-  }
-  return embeddings;
-}
-
 export async function POST(req: Request) {
   const { base64 } = await req.json();
   const { mimeType, buffer } = parseDataUrl(base64);
@@ -248,7 +238,7 @@ export async function POST(req: Request) {
       chunkCount = chunks.length;
       console.log(`✂️ Split document into ${chunkCount} chunks`);
 
-      const embeddings = await embedInBatches(chunks);
+      const embeddings = await generateEmbeddings(chunks);
       const vectors = chunks.map((chunk, i) => ({
         id: `${documentId}-chunk-${i}`,
         values: embeddings[i],
