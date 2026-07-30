@@ -62,6 +62,42 @@ export async function verifyNeo4jConnectivity(): Promise<boolean> {
 // multi-word capture like a name would greedily swallow the start of the next line
 // (e.g. "John Doe\nDOB"), producing a vault value that no longer matches the real name
 // elsewhere and leaving it un-redacted.
+// Words that must never be absorbed into a captured name: neighbouring field labels and
+// common filler. Without this guard the name capture runs past the end of the name and
+// into the next column of the header - "Patient: Rahul Mehta   MRN: 884213" yielded the
+// name "Rahul Mehta MRN", which is then what lands in the vault. The plain name, as it
+// appears in the model's summary, no longer matches that value, so it survives redaction
+// and reaches the client.
+const NON_NAME_WORDS = [
+  "MRN", "DOB", "ID", "SSN", "SEX", "GENDER", "AGE", "TEL", "FAX", "PHONE", "MOBILE",
+  "EMAIL", "DATE", "TIME", "ADDRESS", "NUMBER", "NO", "REF", "VISIT", "ACCESSION",
+  "PATIENT", "REPORT", "LAB", "LABORATORY", "TEST", "TESTS", "RESULT", "RESULTS",
+  "SPECIMEN", "COLLECTED", "RECEIVED", "REFERENCE", "RANGE", "IMPRESSION",
+  "HAS", "HAD", "WITH", "AND", "THE", "FOR", "NOT", "ON", "OFF", "IS", "WAS", "ARE",
+  "OF", "TO", "IN", "AT", "BY",
+];
+
+// Report headers spell these either ALL-CAPS or Title-case, so block both forms.
+const NOT_NAME_WORD = `(?!(?:${NON_NAME_WORDS.flatMap((w) => [
+  w,
+  w[0] + w.slice(1).toLowerCase(),
+]).join("|")})\\b)`;
+
+// Name labels, each accepted ALL-CAPS or Title-case. Longest first so "Patient Name"
+// is preferred over a bare "Patient".
+const NAME_LABELS = [
+  "Patient's Name", "Patient Name", "Referring Physician", "Ordering Physician",
+  "Attending Physician", "Patient", "Name", "Physician", "Provider", "Doctor",
+  "Attending", "Dr",
+]
+  .map((label) =>
+    label
+      .split(" ")
+      .map((w) => `(?:${w.toUpperCase()}|${w[0].toUpperCase()}${w.slice(1).toLowerCase()})`)
+      .join("[ \\t]+")
+  )
+  .join("|");
+
 const PII_RULES: Array<{ type: string; regex: RegExp }> = [
   // Email addresses
   { type: "EMAIL", regex: /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g },
@@ -78,8 +114,32 @@ const PII_RULES: Array<{ type: string; regex: RegExp }> = [
   // Date of birth (label-anchored; capture only the date so other clinical dates survive)
   { type: "DOB", regex: /\b(?:DOB|D\.O\.B\.?|Date of Birth|Birth[ \t]*Date)[ \t]*[:\-]?[ \t]*(\d{1,2}[-\/.]\d{1,2}[-\/.]\d{2,4})/gi },
 
-  // Patient / provider name (label-anchored; capture the name only)
-  { type: "NAME", regex: /\b(?:Patient(?:'s)?(?:[ \t]+Name)?|Name|Physician|Provider|Doctor|Referring[ \t]+Physician|Ordering[ \t]+Physician|Attending(?:[ \t]+Physician)?)[ \t]*[:\-][ \t]*([A-Z][A-Za-z'’.\-]+(?:[ \t]+[A-Z][A-Za-z'’.\-]+){1,2})/g },
+  // Patient / provider name, label-anchored with an explicit separator; captures the
+  // name only. One or two extra words are allowed (so a single-word name is caught),
+  // each gated by NOT_NAME_WORD, and the inter-word gap is capped at two spaces so the
+  // capture cannot jump the wide whitespace gap between header columns.
+  {
+    type: "NAME",
+    regex: new RegExp(
+      `\\b(?:${NAME_LABELS})[ \\t]*[:\\-][ \\t]*` +
+        `(${NOT_NAME_WORD}[A-Z][A-Za-z'’.\\-]+(?:[ \\t]{1,2}${NOT_NAME_WORD}[A-Z][A-Za-z'’.\\-]+){0,2})`,
+      "g"
+    ),
+  },
+
+  // Same, but with no separator and an ALL-CAPS name - which is how OCR of a scanned or
+  // photographed header usually reads ("PATIENT RAHUL MEHTA"). Two or three ALL-CAPS
+  // words are required here: without a separator to anchor on, a single word would let
+  // ordinary prose through, whereas a phrase like "PATIENT HAS ANEMIA" is rejected
+  // because "HAS" is excluded and that breaks the required run.
+  {
+    type: "NAME",
+    regex: new RegExp(
+      `\\b(?:${NAME_LABELS})[ \\t]+` +
+        `(${NOT_NAME_WORD}[A-Z][A-Z'’.\\-]+(?:[ \\t]{1,2}${NOT_NAME_WORD}[A-Z][A-Z'’.\\-]+){1,2})`,
+      "g"
+    ),
+  },
 
   // Titled name without a label (Dr./Mr./Mrs./Ms./Prof.; capture the name, drop the title)
   { type: "NAME", regex: /\b(?:Mr|Mrs|Ms|Miss|Dr|Prof)\.?[ \t]+([A-Z][a-z]+(?:[ \t]+[A-Z][a-z]+){0,2})\b/g },
@@ -92,6 +152,11 @@ const PII_RULES: Array<{ type: string; regex: RegExp }> = [
   // (?![-A-Za-z]) also rejects hyphenated continuations like "St-segment".
   { type: "ADDRESS", regex: /\b\d{1,6}[ \t]+(?:[A-Z][A-Za-z0-9.\-]*[ \t]+){1,4}(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Way|Place|Pl|Terrace|Ter|Circle|Cir|Suite|Ste|Apt|Unit)\.?(?![-A-Za-z])/g },
 ];
+
+// Values discovered by the rules above are substituted as literals, not as patterns.
+function escapeRegExp(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 interface TokenVault {
   [token: string]: string; // token -> original value
@@ -148,11 +213,19 @@ export function redactDocument(texts: string[]): { redactedTexts: string[]; vaul
     }
   }
 
+  // Replacement is case-INSENSITIVE and tolerant of whitespace width. A scanned report
+  // transcribes as "PATIENT RAHUL MEHTA" while the model's summary refers to "Rahul
+  // Mehta"; an exact replace leaves that second spelling in place, so the name reaches
+  // the browser and the response cache even though it is sitting in the vault. The
+  // values here are specific (names, emails, phone/MRN digits), so matching them
+  // loosely does not endanger surrounding clinical text.
   const orderedValues = Array.from(valueToToken.keys()).sort((a, b) => b.length - a.length);
   const redactedTexts = texts.map((text) => {
     let out = text;
     for (const value of orderedValues) {
-      out = out.split(value).join(valueToToken.get(value)!);
+      const token = valueToToken.get(value)!;
+      const pattern = escapeRegExp(value).replace(/[ \t]+/g, "[ \\t]+");
+      out = out.replace(new RegExp(pattern, "gi"), () => token);
     }
     return out;
   });
