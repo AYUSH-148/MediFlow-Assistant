@@ -179,29 +179,52 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
         }
         setIsLoading(true);
 
-        const response = await fetch("api/extractreportgemini", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-                base64: base64Data,
-            }),
-        });
-
-        if (response.ok) {
-            const data = await response.json();
-            setReportData(data.redactedSummary);
-            setVaultId(data.vaultId);
-            setPiiCount(data.piiCount);
-
-            toast({
-                description: `Report processed! ${data.piiCount} PII entities redacted.`,
+        try {
+            const response = await fetch("api/extractreportgemini", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    base64: base64Data,
+                }),
             });
+
+            if (response.ok) {
+                const data = await response.json();
+                setReportData(data.redactedSummary);
+                setVaultId(data.vaultId);
+                setPiiCount(data.piiCount);
+
+                toast({
+                    description: `Report processed! ${data.piiCount} PII entities redacted.`,
+                });
+            } else {
+                // Without this the spinner just stops and nothing happens, so an unreadable
+                // report looked identical to a report that produced no findings.
+                const message = await response
+                    .json()
+                    .then((body) => body?.error)
+                    .catch(() => null);
+
+                toast({
+                    variant: 'destructive',
+                    description: message ?? "Couldn't process this report. Please try again.",
+                });
+            }
+        } catch (error) {
+            // A dropped connection or a gateway timeout on a slow report rejects the fetch
+            // outright. Report it instead of leaving the spinner up with no explanation.
+            console.error("Report extraction request failed:", error);
+            toast({
+                variant: 'destructive',
+                description: "Couldn't reach the server. Check your connection and try again.",
+            });
+        } finally {
+            // In a finally block so no path - success, error response, or thrown fetch -
+            // can leave the upload stuck behind a permanent spinner.
+            setIsLoading(false);
         }
-
-        setIsLoading(false);
-
     }
 
     return (

@@ -1,12 +1,16 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenerativeAI, type GenerateContentResponse } from "@google/generative-ai";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { redactDocument, redactTriples, storeVault, storeTriplesInNeo4j, getVault } from "@/lib/pii-redaction";
+import { GEMINI_MODEL_ID, GOOGLE_SDK_SAFETY_SETTINGS } from "@/lib/gemini";
 import { generateDocumentId, generateEmbedding, upsertVectors, pinecone } from "@/utils";
 
 export const maxDuration = 60;
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+const model = genAI.getGenerativeModel({
+  model: GEMINI_MODEL_ID,
+  safetySettings: GOOGLE_SDK_SAFETY_SETTINGS,
+});
 
 type Triple = { subject: string; predicate: string; object: string };
 
@@ -68,10 +72,43 @@ function fileToGenerativePart(imageData: string) {
   };
 }
 
+// Raised when Gemini gives us nothing usable to work with. Carries a developer-facing
+// detail; the route turns it into a 422 with a human-readable message.
+class ExtractionFailedError extends Error {
+  constructor(public readonly detail: string) {
+    super(detail);
+    this.name = "ExtractionFailedError";
+  }
+}
+
+// A blocked or truncated generation comes back as a response with no text rather than
+// as an error, so reading straight through to JSON.parse crashed on `undefined` and
+// surfaced to the user as an opaque 500. Fail explicitly instead.
+function extractResponseText(response: GenerateContentResponse): string {
+  const blockReason = response.promptFeedback?.blockReason;
+  if (blockReason) {
+    throw new ExtractionFailedError(`Gemini blocked the prompt (blockReason=${blockReason})`);
+  }
+
+  const candidate = response.candidates?.[0];
+  const text = candidate?.content?.parts?.[0]?.text?.trim();
+  if (!text) {
+    throw new ExtractionFailedError(
+      `Gemini returned no text (finishReason=${candidate?.finishReason ?? "none"})`
+    );
+  }
+
+  return text;
+}
+
 // Gemini often wraps JSON in a ```json ... ``` fence; strip it before parsing.
-function parseGeminiJson(raw: string | undefined): any {
-  const cleaned = raw?.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
-  return JSON.parse(cleaned!);
+function parseGeminiJson(raw: string): any {
+  const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    throw new ExtractionFailedError("Gemini response was not valid JSON");
+  }
 }
 
 // pdf-parse inserts a "-- N of M --" marker between pages. Left in, it can survive as
@@ -108,7 +145,7 @@ async function extractPdfTextLayer(buffer: Buffer): Promise<string | null> {
 
 async function analyzeText(fullText: string): Promise<{ summary: string; triples: Triple[] }> {
   const generated = await model.generateContent(TEXT_ANALYSIS_PROMPT + fullText);
-  const parsed = parseGeminiJson(generated.response.candidates?.[0]?.content?.parts?.[0]?.text);
+  const parsed = parseGeminiJson(extractResponseText(generated.response));
   return { summary: parsed.summary ?? "", triples: Array.isArray(parsed.triples) ? parsed.triples : [] };
 }
 
@@ -116,7 +153,7 @@ async function transcribeAndAnalyze(
   base64: string
 ): Promise<{ fullText: string; summary: string; triples: Triple[] }> {
   const generated = await model.generateContent([VISION_PROMPT, fileToGenerativePart(base64)]);
-  const parsed = parseGeminiJson(generated.response.candidates?.[0]?.content?.parts?.[0]?.text);
+  const parsed = parseGeminiJson(extractResponseText(generated.response));
   return {
     fullText: parsed.transcription ?? parsed.summary ?? "",
     summary: parsed.summary ?? "",
@@ -143,19 +180,34 @@ export async function POST(req: Request) {
   let summary: string;
   let triples: Triple[];
 
-  if (mimeType === "application/pdf") {
-    const textLayer = await extractPdfTextLayer(buffer);
-    if (textLayer) {
-      console.log("📄 Using PDF text layer for extraction");
-      fullText = textLayer;
-      ({ summary, triples } = await analyzeText(fullText));
+  try {
+    if (mimeType === "application/pdf") {
+      const textLayer = await extractPdfTextLayer(buffer);
+      if (textLayer) {
+        console.log("📄 Using PDF text layer for extraction");
+        fullText = textLayer;
+        ({ summary, triples } = await analyzeText(fullText));
+      } else {
+        console.log("🖼️ PDF has no usable text layer, falling back to Gemini OCR");
+        ({ fullText, summary, triples } = await transcribeAndAnalyze(base64));
+      }
     } else {
-      console.log("🖼️ PDF has no usable text layer, falling back to Gemini OCR");
+      console.log("🖼️ Image input, using Gemini OCR");
       ({ fullText, summary, triples } = await transcribeAndAnalyze(base64));
     }
-  } else {
-    console.log("🖼️ Image input, using Gemini OCR");
-    ({ fullText, summary, triples } = await transcribeAndAnalyze(base64));
+  } catch (error) {
+    if (error instanceof ExtractionFailedError) {
+      console.error("❌ Extraction failed:", error.detail);
+      return new Response(
+        JSON.stringify({
+          error:
+            "We couldn't read this document. Try a clearer scan, or a different report.",
+          detail: error.detail,
+        }),
+        { status: 422, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    throw error;
   }
 
   if (!fullText.trim()) {

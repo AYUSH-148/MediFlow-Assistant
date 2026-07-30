@@ -1,6 +1,7 @@
 import { generateDocumentId, queryPineconeVectorStore, pinecone, upsertConversationMemory } from "@/utils";
 import { getCachedResponse, cacheResponse } from "@/lib/cache";
 import { redactUserQuestion, getVault, rehydrateText, queryNeo4jRelationships } from "@/lib/pii-redaction";
+import { GEMINI_MODEL_ID, GEMINI_SAFETY_SETTINGS } from "@/lib/gemini";
 import { Pinecone } from "@pinecone-database/pinecone";
 // import { Message, OpenAIStream, StreamData, StreamingTextResponse } from "ai";
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
@@ -15,17 +16,10 @@ const google = createGoogleGenerativeAI({
     baseURL: 'https://generativelanguage.googleapis.com/v1beta',
     apiKey: process.env.GEMINI_API_KEY
 });
-const model = google('models/gemini-2.5-flash', {
-    // A medical assistant routinely discusses conditions, treatments, and "cures".
-    // Leaving the other categories at their defaults let Gemini block such prompts
-    // and return an empty candidate (no text), which surfaced as blank answers.
-    // Disable blocking across all categories for this clinical use case.
-    safetySettings: [
-        { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
-        { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
-        { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
-        { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
-    ],
+// Model id and safety settings are shared with the ingest route via @/lib/gemini so
+// the two SDKs can't drift apart again.
+const model = google(GEMINI_MODEL_ID, {
+    safetySettings: GEMINI_SAFETY_SETTINGS,
 });
 
 // The main model calls this itself, mid-generation, instead of the route
