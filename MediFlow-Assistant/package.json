@@ -12,7 +12,6 @@
     "@ai-sdk/google": "^0.0.55",
     "@fortawesome/free-brands-svg-icons": "^6.5.2",
     "@fortawesome/react-fontawesome": "^0.2.0",
-    "@google/generative-ai": "^0.16.0",
     "@huggingface/inference": "^4.13.3",
     "@langchain/core": "^1.2.3",
     "@langchain/textsplitters": "^1.0.1",

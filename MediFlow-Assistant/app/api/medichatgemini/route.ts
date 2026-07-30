@@ -1,10 +1,9 @@
 import { generateDocumentId, queryPineconeVectorStore, pinecone, upsertConversationMemory } from "@/utils";
 import { getCachedResponse, cacheResponse } from "@/lib/cache";
 import { redactUserQuestion, getVault, rehydrateText, queryNeo4jRelationships } from "@/lib/pii-redaction";
-import { GEMINI_MODEL_ID, GEMINI_SAFETY_SETTINGS } from "@/lib/gemini";
+import { geminiModel } from "@/lib/gemini";
 import { Pinecone } from "@pinecone-database/pinecone";
 // import { Message, OpenAIStream, StreamData, StreamingTextResponse } from "ai";
-import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { Message, StreamData, streamText, tool, formatStreamPart } from "ai";
 import { z } from "zod";
 
@@ -12,15 +11,6 @@ import { z } from "zod";
 export const maxDuration = 60;
 // export const runtime = 'edge';
 
-const google = createGoogleGenerativeAI({
-    baseURL: 'https://generativelanguage.googleapis.com/v1beta',
-    apiKey: process.env.GEMINI_API_KEY
-});
-// Model id and safety settings are shared with the ingest route via @/lib/gemini so
-// the two SDKs can't drift apart again.
-const model = google(GEMINI_MODEL_ID, {
-    safetySettings: GEMINI_SAFETY_SETTINGS,
-});
 
 // The main model calls this itself, mid-generation, instead of the route
 // pre-fetching graph context for a fixed set of entities before every answer.
@@ -206,7 +196,7 @@ export async function POST(req: Request, res: Response) {
     });
 
     const result = await streamText({
-        model: model,
+        model: geminiModel,
         prompt: finalPrompt,
         tools: { queryKnowledgeGraph: createQueryKnowledgeGraphTool(vaultId) },
         maxSteps: 5,

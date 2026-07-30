@@ -1,19 +1,43 @@
-import { GoogleGenerativeAI, type GenerateContentResponse } from "@google/generative-ai";
+import { generateObject, NoObjectGeneratedError, TypeValidationError } from "ai";
+import { z } from "zod";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { redactDocument, redactTriples, storeVault, storeTriplesInNeo4j, getVault } from "@/lib/pii-redaction";
-import { GEMINI_MODEL_ID, GOOGLE_SDK_SAFETY_SETTINGS } from "@/lib/gemini";
+import { geminiModel } from "@/lib/gemini";
 import { generateEmbeddings } from "@/lib/embeddings";
 import { generateDocumentId, upsertVectors, pinecone } from "@/utils";
 
 export const maxDuration = 60;
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-const model = genAI.getGenerativeModel({
-  model: GEMINI_MODEL_ID,
-  safetySettings: GOOGLE_SDK_SAFETY_SETTINGS,
+// The shape is enforced by Gemini's structured-output mode rather than described in
+// the prompt and parsed by hand, so a malformed or renamed field fails loudly here
+// instead of silently becoming an empty summary downstream.
+const TRIPLE_SCHEMA = z.object({
+  subject: z.string().describe("The source medical entity, e.g. a drug or condition"),
+  predicate: z.string().describe("The relationship, e.g. treats, causes, interacts with"),
+  object: z.string().describe("The target medical entity"),
 });
 
-type Triple = { subject: string; predicate: string; object: string };
+const TEXT_ANALYSIS_SCHEMA = z.object({
+  summary: z.string().describe("Summary of the report's abnormal biomarkers, with values"),
+  triples: z.array(TRIPLE_SCHEMA).describe("Entity relationships found in the report"),
+});
+
+// The newline instruction is load-bearing, not cosmetic. Gemini's structured-output
+// mode returns string fields with the line breaks stripped, which runs the report's
+// lines together ("...RAHUL MEHTAMRN 884213PHONE..."). The PII rules in
+// @/lib/pii-redaction are label-anchored and mostly \b-delimited, so a run-together
+// transcription defeats them and identifiers survive into the vault-less output.
+// Asking for the line structure explicitly restores it.
+const VISION_ANALYSIS_SCHEMA = TEXT_ANALYSIS_SCHEMA.extend({
+  transcription: z
+    .string()
+    .describe(
+      "Full verbatim text of the report, including identifiers. Preserve the report's " +
+        "original line structure using \\n newline characters between lines."
+    ),
+});
+
+type Triple = z.infer<typeof TRIPLE_SCHEMA>;
 
 // Chunk sizing is tuned for the embedding model in @/lib/embeddings
 // (mxbai-embed-large-v1, 512-token limit). ~1200 chars ≈ well under 512 tokens for
@@ -26,16 +50,12 @@ const CHUNK_OVERLAP = 150;
 const MIN_TEXT_LAYER_CHARS = 100;
 const MIN_CHARS_PER_PAGE = 20;
 
+// The prompts no longer describe the JSON shape or ask for "JSON only" - the schema
+// above does that, and repeating it in the prompt just invites the two to disagree.
 const TEXT_ANALYSIS_PROMPT = `Below is the extracted text of a clinical report.
 Go over it and identify biomarkers that show slight or large abnormalities, then summarize in about 100 words (you may exceed this for multi-page reports). Include numerical values, key details, and the report title.
 
-Additionally, extract entity relationships as triples in the format {"subject": "Entity A", "predicate": "relationship", "object": "Entity B"}. Focus on medical entities like drugs, conditions, symptoms, and treatments.
-
-Respond ONLY with JSON in this exact shape:
-{
-  "summary": "Your summary text here",
-  "triples": [{"subject": "...", "predicate": "...", "object": "..."}]
-}
+Additionally, extract entity relationships as triples. Focus on medical entities like drugs, conditions, symptoms, and treatments.
 
 ## Clinical report text:
 `;
@@ -44,16 +64,7 @@ const VISION_PROMPT = `Attached is a clinical report (image or scanned PDF).
 
 1. Transcribe ALL text content from the report verbatim, including any patient names, dates, contact information, medical record numbers, and other identifying details exactly as they appear. This raw transcription is required for downstream security redaction.
 2. Identify biomarkers that show slight or large abnormalities and summarize in about 100 words (you may exceed this for multi-page reports). Include numerical values, key details, and the report title.
-3. Extract entity relationships as triples in the format {"subject": "Entity A", "predicate": "relationship", "object": "Entity B"}. Focus on medical entities like drugs, conditions, symptoms, and treatments.
-
-Respond ONLY with JSON in this exact shape:
-{
-  "transcription": "Full verbatim text of the report",
-  "summary": "Your summary text here",
-  "triples": [{"subject": "...", "predicate": "...", "object": "..."}]
-}
-
-## Response:`;
+3. Extract entity relationships as triples. Focus on medical entities like drugs, conditions, symptoms, and treatments.`;
 
 function parseDataUrl(dataUrl: string): { mimeType: string; buffer: Buffer } {
   const commaIndex = dataUrl.indexOf(",");
@@ -61,15 +72,6 @@ function parseDataUrl(dataUrl: string): { mimeType: string; buffer: Buffer } {
   const b64 = dataUrl.substring(commaIndex + 1);
   const mimeType = meta.substring(meta.indexOf(":") + 1, meta.indexOf(";"));
   return { mimeType, buffer: Buffer.from(b64, "base64") };
-}
-
-function fileToGenerativePart(imageData: string) {
-  return {
-    inlineData: {
-      data: imageData.split(",")[1],
-      mimeType: imageData.substring(imageData.indexOf(":") + 1, imageData.lastIndexOf(";")),
-    },
-  };
 }
 
 // Raised when Gemini gives us nothing usable to work with. Carries a developer-facing
@@ -81,34 +83,18 @@ class ExtractionFailedError extends Error {
   }
 }
 
-// A blocked or truncated generation comes back as a response with no text rather than
-// as an error, so reading straight through to JSON.parse crashed on `undefined` and
-// surfaced to the user as an opaque 500. Fail explicitly instead.
-function extractResponseText(response: GenerateContentResponse): string {
-  const blockReason = response.promptFeedback?.blockReason;
-  if (blockReason) {
-    throw new ExtractionFailedError(`Gemini blocked the prompt (blockReason=${blockReason})`);
+// generateObject throws when the model produces nothing parseable or something that
+// doesn't match the schema - a safety block, a truncated response, or a hallucinated
+// shape. Those are all "this document couldn't be read" and belong in a 422. Anything
+// else (network, auth, quota) is a real server fault and rethrows as a 500.
+function asExtractionFailure(error: unknown): never {
+  if (NoObjectGeneratedError.isInstance(error)) {
+    throw new ExtractionFailedError(`Gemini returned no usable object: ${error.message}`);
   }
-
-  const candidate = response.candidates?.[0];
-  const text = candidate?.content?.parts?.[0]?.text?.trim();
-  if (!text) {
-    throw new ExtractionFailedError(
-      `Gemini returned no text (finishReason=${candidate?.finishReason ?? "none"})`
-    );
+  if (TypeValidationError.isInstance(error)) {
+    throw new ExtractionFailedError(`Gemini output did not match the schema: ${error.message}`);
   }
-
-  return text;
-}
-
-// Gemini often wraps JSON in a ```json ... ``` fence; strip it before parsing.
-function parseGeminiJson(raw: string): any {
-  const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    throw new ExtractionFailedError("Gemini response was not valid JSON");
-  }
+  throw error;
 }
 
 // pdf-parse inserts a "-- N of M --" marker between pages. Left in, it can survive as
@@ -144,21 +130,50 @@ async function extractPdfTextLayer(buffer: Buffer): Promise<string | null> {
 }
 
 async function analyzeText(fullText: string): Promise<{ summary: string; triples: Triple[] }> {
-  const generated = await model.generateContent(TEXT_ANALYSIS_PROMPT + fullText);
-  const parsed = parseGeminiJson(extractResponseText(generated.response));
-  return { summary: parsed.summary ?? "", triples: Array.isArray(parsed.triples) ? parsed.triples : [] };
+  try {
+    const { object } = await generateObject({
+      model: geminiModel,
+      schema: TEXT_ANALYSIS_SCHEMA,
+      prompt: TEXT_ANALYSIS_PROMPT + fullText,
+    });
+    return object;
+  } catch (error) {
+    asExtractionFailure(error);
+  }
 }
 
+// Images go as an image part; a scanned PDF goes as a file part with its mime type -
+// Gemini reads the PDF itself in that case, which is the no-text-layer fallback.
 async function transcribeAndAnalyze(
-  base64: string
+  mimeType: string,
+  buffer: Buffer
 ): Promise<{ fullText: string; summary: string; triples: Triple[] }> {
-  const generated = await model.generateContent([VISION_PROMPT, fileToGenerativePart(base64)]);
-  const parsed = parseGeminiJson(extractResponseText(generated.response));
-  return {
-    fullText: parsed.transcription ?? parsed.summary ?? "",
-    summary: parsed.summary ?? "",
-    triples: Array.isArray(parsed.triples) ? parsed.triples : [],
-  };
+  try {
+    const { object } = await generateObject({
+      model: geminiModel,
+      schema: VISION_ANALYSIS_SCHEMA,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: VISION_PROMPT },
+            mimeType === "application/pdf"
+              ? { type: "file", data: buffer, mimeType }
+              : { type: "image", image: buffer, mimeType },
+          ],
+        },
+      ],
+    });
+    return {
+      // Transcription drives redaction and chunking; the summary is a usable fallback
+      // if the model returns an empty transcription for an unreadable scan.
+      fullText: object.transcription || object.summary,
+      summary: object.summary,
+      triples: object.triples,
+    };
+  } catch (error) {
+    asExtractionFailure(error);
+  }
 }
 
 export async function POST(req: Request) {
@@ -179,11 +194,11 @@ export async function POST(req: Request) {
         ({ summary, triples } = await analyzeText(fullText));
       } else {
         console.log("🖼️ PDF has no usable text layer, falling back to Gemini OCR");
-        ({ fullText, summary, triples } = await transcribeAndAnalyze(base64));
+        ({ fullText, summary, triples } = await transcribeAndAnalyze(mimeType, buffer));
       }
     } else {
       console.log("🖼️ Image input, using Gemini OCR");
-      ({ fullText, summary, triples } = await transcribeAndAnalyze(base64));
+      ({ fullText, summary, triples } = await transcribeAndAnalyze(mimeType, buffer));
     }
   } catch (error) {
     if (error instanceof ExtractionFailedError) {
