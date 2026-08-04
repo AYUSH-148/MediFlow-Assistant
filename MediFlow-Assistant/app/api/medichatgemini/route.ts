@@ -1,5 +1,10 @@
 import { generateDocumentId, queryPineconeVectorStore, pinecone, upsertConversationMemory } from "@/utils";
-import { getCachedResponse, cacheResponse } from "@/lib/cache";
+import {
+    getCachedResponse,
+    cacheResponse,
+    hasConversationMemory,
+    markConversationMemory,
+} from "@/lib/cache";
 import { redactUserQuestion, getVault, rehydrateText, queryNeo4jRelationships } from "@/lib/pii-redaction";
 import { geminiModel } from "@/lib/gemini";
 import { Pinecone } from "@pinecone-database/pinecone";
@@ -137,14 +142,8 @@ export async function POST(req: Request, res: Response) {
     const data = new StreamData();
     const query = `Represent this for searching relevant passages: patient medical report says: \n${reportData}. \n\n${redactedQuestion}`;
 
-    const retrievals = await queryPineconeVectorStore(
-        pinecone,
-        'medic',
-        "diagnosis2",
-        query,
-        reportFilter
-    );
-
+    // Moved above the retrievals because the conversation-history query is built from
+    // it, and both retrievals now start at the same time.
     const recentConversationHistory = messages.length > 1
         ? messages
             .slice(-4)
@@ -152,13 +151,47 @@ export async function POST(req: Request, res: Response) {
             .join("\n")
         : "No prior conversation history";
 
-    const chatHistoryRetrievals = await queryPineconeVectorStore(
-        pinecone,
-        'medic',
-        "conversation-history",
-        `Find relevant prior conversation context for this follow-up question.\n\nCurrent question: ${redactedQuestion}\n\nRecent chat history:\n${recentConversationHistory}`,
-        reportFilter
-    );
+    // The conversation-history search is skipped unless this document actually has
+    // stored memory to find. It used to run unconditionally, and in two common cases it
+    // could only ever return "<nomatches>" - at the cost of one HuggingFace embedding
+    // plus a topK 12 query and a topK 500 corpus pull:
+    //
+    //  - First turn on a freshly ingested report. upsertConversationMemory only runs
+    //    after an answer completes, so nothing exists under this documentId yet.
+    //  - No report uploaded. Memory is only ever WRITTEN when vaultId is set, so the
+    //    user has none of their own to retrieve. Worse, reportFilter is undefined
+    //    without a vaultId, so this search ran UNFILTERED across every document's chat
+    //    memory - the only thing it could surface was other patients' conversations.
+    //
+    // `messages.length > 1` short-circuits the Redis lookup on every turn after the
+    // first: a prior turn in this session already wrote memory. So the flag is only
+    // read on the one turn where it can change the outcome.
+    const shouldRetrieveMemory =
+        !!vaultId && (messages.length > 1 || (await hasConversationMemory(vaultId)));
+
+    // These two are independent, so they run concurrently. Each costs one HuggingFace
+    // embedding - the slowest dependency in the pipeline - plus two Pinecone queries,
+    // and awaiting them in sequence doubled retrieval wall-clock for nothing.
+    // "<nomatches>" is the same sentinel queryPineconeVectorStore returns on an empty
+    // result, so the prompt sees an identical memory section either way.
+    const [retrievals, chatHistoryRetrievals] = await Promise.all([
+        queryPineconeVectorStore(
+            pinecone,
+            'medic',
+            "diagnosis2",
+            query,
+            reportFilter
+        ),
+        shouldRetrieveMemory
+            ? queryPineconeVectorStore(
+                pinecone,
+                'medic',
+                "conversation-history",
+                `Find relevant prior conversation context for this follow-up question.\n\nCurrent question: ${redactedQuestion}\n\nRecent chat history:\n${recentConversationHistory}`,
+                reportFilter
+            )
+            : Promise.resolve("<nomatches>"),
+    ]);
 
     const finalPrompt = `Here is a summary of a patient's clinical report, and a user query. Some generic clinical findings are also provided that may or may not be relevant for the report.
   Go through the clinical report and answer the user query.
@@ -256,6 +289,12 @@ export async function POST(req: Request, res: Response) {
                                 text: memoryText,
                             }
                         );
+                        // Marks this document as having memory worth searching, so the next
+                        // turn's conversation-history retrieval is not skipped. Set
+                        // unconditionally because upsertConversationMemory swallows its own
+                        // failures and reports nothing back; the cost of being wrong here is
+                        // one pointless retrieval, not a wrong answer.
+                        await markConversationMemory(vaultId);
                     }
 
                     // If the model produced no text (safety block, tool-only turn, etc.) the

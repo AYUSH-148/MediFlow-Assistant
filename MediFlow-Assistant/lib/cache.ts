@@ -148,6 +148,52 @@ export async function cacheResponse(
   }
 }
 
+// ==================== CONVERSATION MEMORY FLAG ====================
+//
+// Records whether the `conversation-history` Pinecone namespace holds anything for a
+// document, so the chat route can decide if that hybrid retrieval is worth running.
+// Without this the search ran unconditionally, and on the first turn of a freshly
+// ingested report it cost one HuggingFace embedding plus a topK 12 query and a topK 500
+// corpus pull to return "<nomatches>" - the namespace is only written to AFTER an answer.
+//
+// A Redis EXISTS is orders of magnitude cheaper than that, which is the whole point.
+//
+// Deliberately stored with NO TTL, unlike the vault and the response cache above. The
+// Pinecone memory vectors this mirrors are never deleted, so an expiring flag would
+// drift out of sync with them and silently switch memory retrieval off for older
+// reports - a degradation with no visible symptom. If memory pruning is ever added,
+// delete this key in the same place.
+
+function getMemoryFlagKey(documentId: string): string {
+  return `medic_memory:${documentId}`;
+}
+
+export async function hasConversationMemory(documentId: string): Promise<boolean> {
+  if (!documentId) return false;
+
+  try {
+    return (await redis.exists(getMemoryFlagKey(documentId))) === 1;
+  } catch (error) {
+    // Fail OPEN. Answering "true" wrongly costs one wasted retrieval; answering
+    // "false" wrongly would disable conversation memory for every request during a
+    // Redis outage, which shows up only as quietly worse answers.
+    console.error("Error checking conversation memory flag:", error);
+    return true;
+  }
+}
+
+export async function markConversationMemory(documentId: string): Promise<void> {
+  if (!documentId) return;
+
+  try {
+    await redis.set(getMemoryFlagKey(documentId), "1");
+  } catch (error) {
+    // Best-effort: a lost flag costs a skipped retrieval on the next turn, not a
+    // broken answer.
+    console.error("Error setting conversation memory flag:", error);
+  }
+}
+
 /**
  * Clear cache for a specific report
  */
