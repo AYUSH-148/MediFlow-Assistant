@@ -18,6 +18,9 @@ Most RAG demos stop at "chunk a PDF, embed it, stuff it in a prompt." The hard p
 |---|---|
 | PHI must not reach the LLM, the vector DB, the cache, or the trace backend | Rule-based redaction into a Redis **token vault**, with rehydration at the last possible moment |
 | Clinical questions rarely use the report's exact wording | **Hybrid retrieval** — dense vectors + TF-IDF, fused with Reciprocal Rank Fusion |
+| Nothing in a RAG pipeline naturally refuses, so trivia gets answered, cached, and stored as clinical memory | A **query guard** that routes to refuse / clarify / answer *before* anything expensive runs |
+| A vague follow-up ("is that bad?") means nothing to a cache keyed on question text | The guard **rewrites the question to stand alone**, so the cache key describes what was actually asked |
+| Retrieval always returns its top-k, so irrelevant chunks arrive labelled as evidence | **Corrective-RAG grading** against the bare question, with an explicit "not in your report" verdict |
 | A knowledge graph shared across patients can leak one patient's data into another's answer | Graph nodes are **scoped by document** on both the write *and* the read side |
 | Redaction that's too aggressive destroys the clinical text you're trying to search | Label-anchored, case-sensitive patterns tuned against real report layouts |
 | Scanned reports have no text layer; born-digital ones do | Text-layer extraction first, **Gemini vision OCR as fallback** |
@@ -51,6 +54,10 @@ Most RAG demos stop at "chunk a PDF, embed it, stuff it in a prompt." The hard p
                                           ▼
                               redact question (no vault)
                                           ▼
+                    query guard ──── refuse ──▶ redirect ──▶ stream
+                    (intent + rewrite) ─ clarify ──▶ ask ──▶ stream
+                                          │ answer
+                                          ▼  question now stands alone
                        semantic cache lookup (Redis, cos ≥ 0.95)
                                    hit ──▶ rehydrate ──▶ stream
                                    miss
@@ -61,6 +68,11 @@ Most RAG demos stop at "chunk a PDF, embed it, stuff it in a prompt." The hard p
         vector top-12 ┐                   when the namespace is empty)
         TF-IDF top-500┴─ RRF ─▶ top-10
                     └─────────────┬─────────────────────┘
+                                  ▼
+                  grade chunks against the question (corrective RAG)
+                  relevant / partial ─▶ keep survivors
+                  none ─────────────▶ drop context, require
+                                       "this is not in your report"
                                   ▼
                     Gemini 2.5 Flash + queryKnowledgeGraph tool
                           (agentic, up to 5 steps → Neo4j)
@@ -94,6 +106,50 @@ Semantic search alone misses exact clinical terms; keyword search alone misses p
 
 Both arms reuse a **single embedding call** — the query vector is computed once and passed into the keyword corpus fetch rather than recomputed.
 
+### 🧭 The query guard — scope and ambiguity, before anything expensive
+
+Nothing in a RAG pipeline naturally refuses. Ask *"what is the capital of India"* and the old flow ran full retrieval, answered from the model's general knowledge, cached the answer for 24 hours, and — with a report loaded — wrote it into long-term conversation memory as clinical history.
+
+A single classification pass now runs **ahead of the cache lookup** and returns one of three intents:
+
+- **refuse** — not health-related. Returns a redirect and stops.
+- **clarify** — health-related but ambiguous, or needs report data when no report is uploaded. Returns one question.
+- **answer** — proceeds, carrying a standalone rewrite of the question with pronouns resolved from conversation history.
+
+Placement is what makes it cheap. Refuse and clarify return *before* retrieval, so an off-topic question costs one Flash call instead of five embedding calls and four Pinecone queries — **refusals are faster than answers**. Because they return early, the cache write and memory write sit on an unreachable branch; no suppression flag is threaded through anything.
+
+The rewrite is the subtle half. *"Is that bad?"* means nothing on its own. The generator could resolve it from history, but the semantic cache keys on question text alone — so one turn's answer was replayed for a later, unrelated follow-up:
+
+| Turn | User asks | Cache key *before* | Cache key *after* |
+|---|---|---|---|
+| 2 | "is that bad?" | `is that bad?` | `Is an LDL of 165 mg/dL concerning?` |
+| 4 | "is that bad?" | `is that bad?` ← **collision** | `Is a BP of 148/92 concerning?` |
+
+Resolving the question first makes the key self-describing, fixing the collision without hashing conversation history into it. Stored memory stops preserving a pronoun whose referent is gone, too.
+
+The guard is pinned to `temperature: 0` — routing should not be a coin flip — and **fails open**: an outage degrades to the previous behaviour rather than to a chat that refuses everything.
+
+### ✅ Corrective RAG — grading retrieval before trusting it
+
+Retrieval always returns something. `<nomatches>` only appears when fusion yields literally zero rows, which does not happen on a populated index — so the top 10 chunks arrive labelled as evidence whether or not they bear on the question. The only thing between that and a confident wrong answer was a line of prompt etiquette asking the model to ignore irrelevant findings.
+
+A grading pass now judges the chunks **against the question** and returns a verdict:
+
+| Verdict | Chunks sent | What the generator is told |
+|---|---|---|
+| `relevant` | filtered survivors | answer from these |
+| `partial` | survivors | answer what's covered, state explicitly what the report does not cover |
+| `none` | none | say the report does not contain this — do not reach for general medical knowledge |
+
+There is deliberately **no cheap numeric pre-filter**, because neither available score measures relevance to the question:
+
+- The **RRF score** is `1/(60+rank)` summed across arms — pure rank position. The top result of a completely irrelevant corpus scores exactly as well as the top result of a perfect one.
+- The **vector similarity** is measured against a query that has the entire report prepended, so report chunks score high on report-to-report similarity no matter what was asked.
+
+Grading against the bare question is the one comparison the retrieval pipeline never makes. Empty retrievals still short-circuit without a model call, and surviving chunks are renumbered contiguously — a prompt listing "Finding 1, 4, 7" invites the model to wonder what it is not being shown.
+
+Both non-relevant instructions send the model back to the report summary before declaring anything absent. The grader only saw the excerpts, but the summary is also in the prompt, so an unqualified *"not in your report"* would contradict something the model can plainly see.
+
 ### 🕸️ GraphRAG as an agentic tool, not a prefetch
 
 Extracted `(subject, predicate, object)` triples land in Neo4j. Rather than prefetching graph context for a fixed entity list on every request, the model gets a `queryKnowledgeGraph` tool and decides when to reach for it — following chains across up to 5 steps (e.g. *drug → interacting drug → contraindication*).
@@ -102,7 +158,7 @@ The subtle part is **scoping the neighbour, not just the queried node**. Generic
 
 ### ⚡ Semantic caching
 
-Answers are cached in Redis keyed by report hash, matched by **cosine similarity ≥ 0.95** against the redacted question rather than by exact string. Cache hits are re-emitted in the AI SDK data-stream protocol so the client parses them identically to a live generation. `bestSimilarity` is recorded on misses too — otherwise a threshold that never fires is indistinguishable from a cold cache.
+Answers are cached in Redis keyed by report hash, matched by **cosine similarity ≥ 0.95** rather than by exact string. The match runs against the guard's **resolved** question, not the raw one — that is what stops two identical-looking follow-ups from colliding on one key. Cache hits are re-emitted in the AI SDK data-stream protocol so the client parses them identically to a live generation. `bestSimilarity` is recorded on misses too — otherwise a threshold that never fires is indistinguishable from a cold cache.
 
 ### 📄 Two extraction paths
 
@@ -190,11 +246,13 @@ npm run lint
 MediFlow-Assistant/
 ├── app/
 │   ├── api/extractreportgemini/route.ts   # ingest: extract → redact → chunk → index → graph
-│   ├── api/medichatgemini/route.ts        # chat: redact → cache → retrieve → generate → rehydrate
+│   ├── api/medichatgemini/route.ts        # chat: redact → guard → cache → retrieve → grade → generate → rehydrate
 │   ├── about/page.tsx
 │   └── page.tsx
 ├── lib/
 │   ├── pii-redaction.ts    # redaction rules, token vault, Neo4j read/write
+│   ├── query-guard.ts      # refuse / clarify / answer routing + question rewriting
+│   ├── retrieval-grader.ts # corrective-RAG chunk grading + grounding instructions
 │   ├── cache.ts            # semantic response cache + conversation-memory flag
 │   ├── embeddings.ts       # HuggingFace client, single source of truth for the model id
 │   ├── gemini.ts           # shared Gemini config + safety settings
@@ -217,6 +275,9 @@ MediFlow-Assistant/
 | RRF constant / final `topK` | 60 / 10 | `utils.ts` |
 | Cache similarity threshold | 0.95 | `app/api/medichatgemini/route.ts` |
 | Cache + vault TTL | 24 hours | `lib/cache.ts`, `lib/pii-redaction.ts` |
+| Conversation-memory flag TTL | none — mirrors non-expiring vectors | `lib/cache.ts` |
+| Guard / grader temperature | 0 | `lib/query-guard.ts`, `lib/retrieval-grader.ts` |
+| Gemini calls per answered question | 3 (guard → grader → generation) | `app/api/medichatgemini/route.ts` |
 | Max tool-calling steps | 5 | `app/api/medichatgemini/route.ts` |
 
 ---
@@ -224,6 +285,8 @@ MediFlow-Assistant/
 ## Known limitations
 
 - Redaction is **rule-based**, so a name written in free prose (`"my name is Rahul, is my LDL high?"`) has no label to anchor on and survives. This is why nothing downstream treats post-redaction text as safe by default.
+- The query guard and the retrieval grader are **model judgment, not deterministic rules**. Both can misclassify — a legitimate question refused, or irrelevant chunks kept — and both deliberately fail open, so an outage degrades to the older, less careful behaviour rather than blocking the chat. Their spans record `intent`, `verdict` and `ungraded` precisely so drift is measurable rather than anecdotal.
+- Answering a question now costs **three sequential Gemini calls** rather than one. Refusals and clarifications short-circuit before retrieval and grading, so the cheap paths stayed cheap, but the common case pays roughly two extra Flash round trips for the grounding.
 - Gemini safety filters are disabled — clinical prompts about dosages and treatments get blocked at default thresholds, and a blocked generation returns empty text rather than an error. Report contents are injected verbatim, so uploaded documents should be treated as untrusted input.
 - Documents are uploaded as base64 data URLs, which caps practical file size. Large reports would want a multipart upload to object storage.
 - If a vault expires before its cached answers do, those answers come back with `[NAME_1]` placeholders intact. The pipeline detects and reports this rather than hiding it.
