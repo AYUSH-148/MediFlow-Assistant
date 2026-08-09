@@ -45,13 +45,13 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
         if (!(isValidImage || isValidDoc)) {
             toast({
                 variant: 'destructive',
-                description: "Filetype not supproted!",
+                description: "File type not supported!",
             });
             return;
         }
 
         setSelectedFile(file);
-        // Reset any previously extracted data when a new file is selected
+        // Drop anything extracted from the previous file.
         setReportData("");
         setVaultId("");
         setPiiCount(0);
@@ -71,8 +71,8 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
         }
 
         if (isValidDoc) {
+            // PDFs are sent uncompressed; the route handles the text-layer/OCR split.
             const reader = new FileReader();
-            // Docs are not compressed. Might add note that upto 1MB supported. Or use server side compression libraries.
             reader.onloadend = () => {
                 const base64String = reader.result as string;
                 setBase64Data(base64String);
@@ -127,37 +127,29 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
         }
     }
 
+    // Images are re-encoded as JPEG in the browser before upload: the route takes a
+    // base64 data URL, so a raw phone photo would otherwise blow past the body limit.
     function compressImage(file: File, callback: (compressedFile: File) => void) {
+        const JPEG_QUALITY = 0.1;
         const reader = new FileReader();
 
         reader.onload = (e) => {
             const img = new Image();
             img.onload = () => {
-                // Create a canvas element
                 const canvas = document.createElement('canvas');
                 const ctx = canvas.getContext('2d');
 
-                // Set  canvas dimensions to match the image
                 canvas.width = img.width;
                 canvas.height = img.height;
-
-                // Draw the image onto the canvas
                 ctx!.drawImage(img, 0, 0);
 
+                const dataURL = canvas.toDataURL('image/jpeg', JPEG_QUALITY);
 
-                // Apply basic compression (adjust quality as needed)
-                const quality = 0.1; // Adjust quality as needed
-
-                // Convert canvas to data URL
-                const dataURL = canvas.toDataURL('image/jpeg', quality);
-
-                // Convert data URL back to Blob
                 const byteString = atob(dataURL.split(',')[1]);
                 const ab = new ArrayBuffer(byteString.length);
                 const ia = new Uint8Array(ab);
                 for (let i = 0; i < byteString.length; i++) {
                     ia[i] = byteString.charCodeAt(i);
-
                 }
                 const compressedFile = new File([ab], file.name, { type: 'image/jpeg' });
 
@@ -200,8 +192,8 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
                     description: `Report processed! ${data.piiCount} PII entities redacted.`,
                 });
             } else {
-                // Without this the spinner just stops and nothing happens, so an unreadable
-                // report looked identical to a report that produced no findings.
+                // The route returns a 422 with a human-readable `error` for a document it
+                // couldn't read; surface that rather than a generic failure.
                 const message = await response
                     .json()
                     .then((body) => body?.error)
@@ -213,16 +205,13 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
                 });
             }
         } catch (error) {
-            // A dropped connection or a gateway timeout on a slow report rejects the fetch
-            // outright. Report it instead of leaving the spinner up with no explanation.
+            // A dropped connection or gateway timeout rejects the fetch outright.
             console.error("Report extraction request failed:", error);
             toast({
                 variant: 'destructive',
                 description: "Couldn't reach the server. Check your connection and try again.",
             });
         } finally {
-            // In a finally block so no path - success, error response, or thrown fetch -
-            // can leave the upload stuck behind a permanent spinner.
             setIsLoading(false);
         }
     }
