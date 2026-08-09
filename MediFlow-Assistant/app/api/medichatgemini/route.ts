@@ -1,4 +1,11 @@
-import { generateDocumentId, queryPineconeVectorStore, pinecone, upsertConversationMemory } from "@/utils";
+import {
+    generateDocumentId,
+    queryPineconeVectorStore,
+    queryPineconeVectorStoreDetailed,
+    pinecone,
+    upsertConversationMemory,
+} from "@/utils";
+import { gradeRetrieval, buildGroundingInstruction } from "@/lib/retrieval-grader";
 import {
     getCachedResponse,
     cacheResponse,
@@ -383,8 +390,8 @@ async function handleChat({
     // Independent, so they run concurrently; awaiting them in sequence doubled retrieval
     // wall-clock for nothing. "<nomatches>" is the same sentinel queryPineconeVectorStore
     // returns on an empty result, so the prompt sees an identical memory section either way.
-    const [retrievals, chatHistoryRetrievals] = await Promise.all([
-        queryPineconeVectorStore(
+    const [reportRetrieval, chatHistoryRetrievals] = await Promise.all([
+        queryPineconeVectorStoreDetailed(
             pinecone,
             'medic',
             "diagnosis2",
@@ -405,11 +412,34 @@ async function handleChat({
     // A skipped retrieval simply has no span, so the skip is otherwise invisible.
     root?.setMetadata({ memoryRetrievalSkipped: !shouldRetrieveMemory });
 
-    const finalPrompt = `Here is a summary of a patient's clinical report, and a user query. Some generic clinical findings are also provided that may or may not be relevant for the report.
+    // Corrective-RAG grading. Retrieval hands back its top 10 chunks whether or not they
+    // bear on the question, so without this the generator receives padding labelled as
+    // evidence and has only a politely-worded prompt line telling it to ignore anything
+    // irrelevant. Grading against the bare question - the one comparison retrieval never
+    // makes, since its query has the whole report prepended - filters the chunks and,
+    // when nothing survives, switches the prompt to "say this is not in your report"
+    // instead of letting the model reach for general knowledge.
+    const graded = await gradeRetrieval({
+        question: effectiveQuestion,
+        retrievalText: reportRetrieval.text,
+        chunks: reportRetrieval.chunks,
+    });
+    const retrievals = graded.text;
+
+    root?.setMetadata({
+        retrievalVerdict: graded.verdict,
+        retrievalChunksKept: graded.chunks.length,
+        retrievalChunksDropped: reportRetrieval.chunks.length - graded.chunks.length,
+        retrievalUngraded: graded.ungraded,
+    });
+
+    const finalPrompt = `Here is a summary of a patient's clinical report, and a user query. Excerpts retrieved from that same report are also provided.
   Go through the clinical report and answer the user query.
   Ensure the response is factually accurate, and demonstrates a thorough understanding of the query topic and the clinical report.
-  Before answering you may enrich your knowledge by going through the provided clinical findings.
-  The clinical findings are generic insights and not part of the patient's medical report. Do not include any clinical finding if it is not relevant for the patient's case.
+  The retrieved excerpts are passages from THIS patient's own report, already checked for relevance to the query - treat them as evidence about this patient, not as generic background.
+
+  \n\n**Grounding rule (follow this exactly):**
+  \n${buildGroundingInstruction(graded)}
 
   \n\n**Today's date:** ${new Date().toISOString().slice(0, 10)}
 
@@ -419,9 +449,9 @@ async function handleChat({
   \n\n**User Query:**\n${effectiveQuestion}
   \n**end of user query**
 
-  \n\n**Generic Clinical findings:**
+  \n\n**Relevant excerpts from this patient's report:**
   \n\n${retrievals}.
-  \n\n**end of generic clinical findings**
+  \n\n**end of report excerpts**
 
   \n\n**Relevant conversation memory:**
   \n\n${chatHistoryRetrievals}
@@ -433,7 +463,9 @@ async function handleChat({
 
   \n\nYou also have a queryKnowledgeGraph tool that looks up known relationships for a medical entity in the patient's knowledge graph. Call it when an entity mentioned in the report or query would benefit from that context, and call it again with a new entity if a result reveals something else worth following (e.g. an interacting drug). Skip it entirely if the question doesn't need graph context.
 
-  \n\nProvide thorough justification for your answer.
+  \n\n${graded.verdict === "none"
+            ? "Keep the answer short and direct - there is nothing here to justify at length."
+            : "Provide thorough justification for your answer."}
   \n\n**Answer:**
   `;
 
