@@ -275,13 +275,31 @@ function fuseResultsWithRrf(
  * the query text and retrieved chunks are PHI-gated, while ids, ranks, scores and counts
  * are always recorded.
  */
-export async function queryPineconeVectorStore(
+export interface RetrievedChunk {
+  id: string;
+  text: string;
+  finalRank: number;
+}
+
+export interface HybridRetrieval {
+  /** The chunks concatenated and numbered, ready to drop into a prompt. */
+  text: string;
+  chunks: RetrievedChunk[];
+}
+
+/**
+ * As `queryPineconeVectorStore`, but also returns the individual chunks.
+ *
+ * The relevance grader needs to judge and filter chunks one by one, which the flattened
+ * string cannot support without re-parsing the "Clinical Finding N:" headings back out.
+ */
+export async function queryPineconeVectorStoreDetailed(
   client: Pinecone,
   indexName: string,
   namespace: string,
   query: string,
   filter?: Record<string, any>
-): Promise<string> {
+): Promise<HybridRetrieval> {
   return span(
     "hybrid_retrieve",
     { query, namespace, index: indexName, filter: filter ?? null },
@@ -391,19 +409,26 @@ export async function queryPineconeVectorStore(
 
       if (fusedResults.length === 0) {
         setSpanMetadata({ matched: false });
-        return "<nomatches>";
+        return { text: "<nomatches>", chunks: [] };
       }
 
-      const concatenatedRetrievals = fusedResults
-        .map((result, index) => `\nClinical Finding ${index + 1}: \n ${result.text}`)
-        .join(". \n\n");
+      const chunks: RetrievedChunk[] = fusedResults.map((result, index) => ({
+        id: result.id,
+        text: result.text,
+        finalRank: index + 1,
+      }));
+
+      const concatenatedRetrievals = formatChunks(chunks);
 
       setSpanMetadata({
         matched: concatenatedRetrievals.length > 0,
         contextChars: concatenatedRetrievals.length,
       });
 
-      return concatenatedRetrievals || "<nomatches>";
+      return {
+        text: concatenatedRetrievals || "<nomatches>",
+        chunks: concatenatedRetrievals ? chunks : [],
+      };
     },
     {
       runType: "retriever",
@@ -414,8 +439,42 @@ export async function queryPineconeVectorStore(
         filter: filter ?? null,
         ...textShape("query", query),
       },
-      safeOutputs: (retrievals) => textShape("retrievals", retrievals),
-      recordOutputs: (retrievals) => ({ retrievals }),
+      safeOutputs: (retrieval) => ({
+        chunkCount: retrieval.chunks.length,
+        ...textShape("retrievals", retrieval.text),
+      }),
+      recordOutputs: (retrieval) => ({ retrievals: retrieval.text }),
     }
   );
+}
+
+/**
+ * Number and concatenate chunks for a prompt.
+ *
+ * Exported because the grader can drop chunks, and the surviving ones have to be
+ * renumbered contiguously - a prompt listing "Finding 1, Finding 4, Finding 7" invites
+ * the model to wonder what it is not being shown.
+ */
+export function formatChunks(chunks: RetrievedChunk[]): string {
+  return chunks
+    .map((chunk, index) => `\nClinical Finding ${index + 1}: \n ${chunk.text}`)
+    .join(". \n\n");
+}
+
+/** Backwards-compatible wrapper: the flattened context string only. */
+export async function queryPineconeVectorStore(
+  client: Pinecone,
+  indexName: string,
+  namespace: string,
+  query: string,
+  filter?: Record<string, any>
+): Promise<string> {
+  const retrieval = await queryPineconeVectorStoreDetailed(
+    client,
+    indexName,
+    namespace,
+    query,
+    filter
+  );
+  return retrieval.text;
 }
