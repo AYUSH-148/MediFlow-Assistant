@@ -2,15 +2,23 @@ import { generateObject, NoObjectGeneratedError, TypeValidationError } from "ai"
 import { z } from "zod";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { redactDocument, redactTriples, storeVault, storeTriplesInNeo4j, getVault } from "@/lib/pii-redaction";
-import { geminiModel } from "@/lib/gemini";
+import { geminiModel, GEMINI_MODEL_ID } from "@/lib/gemini";
 import { generateEmbeddings } from "@/lib/embeddings";
 import { generateDocumentId, upsertVectors, pinecone } from "@/utils";
+import {
+  span,
+  setSpanMetadata,
+  flushTraces,
+  textShape,
+  llmMetadata,
+  usageMetadata,
+} from "@/lib/tracing";
 
 export const maxDuration = 60;
 
-// The shape is enforced by Gemini's structured-output mode rather than described in
-// the prompt and parsed by hand, so a malformed or renamed field fails loudly here
-// instead of silently becoming an empty summary downstream.
+// Enforced by Gemini's structured-output mode rather than described in the prompt and
+// parsed by hand, so a malformed or renamed field fails loudly here instead of silently
+// becoming an empty summary downstream.
 const TRIPLE_SCHEMA = z.object({
   subject: z.string().describe("The source medical entity, e.g. a drug or condition"),
   predicate: z.string().describe("The relationship, e.g. treats, causes, interacts with"),
@@ -22,12 +30,10 @@ const TEXT_ANALYSIS_SCHEMA = z.object({
   triples: z.array(TRIPLE_SCHEMA).describe("Entity relationships found in the report"),
 });
 
-// The newline instruction is load-bearing, not cosmetic. Gemini's structured-output
-// mode returns string fields with the line breaks stripped, which runs the report's
-// lines together ("...RAHUL MEHTAMRN 884213PHONE..."). The PII rules in
-// @/lib/pii-redaction are label-anchored and mostly \b-delimited, so a run-together
-// transcription defeats them and identifiers survive into the vault-less output.
-// Asking for the line structure explicitly restores it.
+// The newline instruction is load-bearing. Gemini's structured-output mode strips line
+// breaks from string fields, which runs the report's lines together
+// ("...RAHUL MEHTAMRN 884213PHONE..."); the label-anchored, mostly \b-delimited PII rules
+// in @/lib/pii-redaction cannot match that, so identifiers survive redaction.
 const VISION_ANALYSIS_SCHEMA = TEXT_ANALYSIS_SCHEMA.extend({
   transcription: z
     .string()
@@ -39,19 +45,19 @@ const VISION_ANALYSIS_SCHEMA = TEXT_ANALYSIS_SCHEMA.extend({
 
 type Triple = z.infer<typeof TRIPLE_SCHEMA>;
 
-// Chunk sizing is tuned for the embedding model in @/lib/embeddings
-// (mxbai-embed-large-v1, 512-token limit). ~1200 chars ≈ well under 512 tokens for
-// dense clinical text, with overlap to preserve context across boundaries.
+// Tuned for the embedding model in @/lib/embeddings (mxbai-embed-large-v1, 512-token
+// limit): ~1200 chars stays well under that for dense clinical text, with overlap to
+// preserve context across boundaries.
 const CHUNK_SIZE = 1200;
 const CHUNK_OVERLAP = 150;
 
-// A PDF is treated as "born-digital" (has a real text layer) only if extraction yields
-// enough text. Scanned/photographed PDFs return little or no text and fall back to Gemini OCR.
+// A PDF counts as born-digital only if its text layer yields this much text. Scanned or
+// photographed PDFs return little or nothing and fall back to Gemini OCR.
 const MIN_TEXT_LAYER_CHARS = 100;
 const MIN_CHARS_PER_PAGE = 20;
 
-// The prompts no longer describe the JSON shape or ask for "JSON only" - the schema
-// above does that, and repeating it in the prompt just invites the two to disagree.
+// The prompts deliberately do not describe the JSON shape - the schemas above do, and
+// repeating it invites the two to disagree.
 const TEXT_ANALYSIS_PROMPT = `Below is the extracted text of a clinical report.
 Go over it and identify biomarkers that show slight or large abnormalities, then summarize in about 100 words (you may exceed this for multi-page reports). Include numerical values, key details, and the report title.
 
@@ -74,8 +80,8 @@ function parseDataUrl(dataUrl: string): { mimeType: string; buffer: Buffer } {
   return { mimeType, buffer: Buffer.from(b64, "base64") };
 }
 
-// Raised when Gemini gives us nothing usable to work with. Carries a developer-facing
-// detail; the route turns it into a 422 with a human-readable message.
+// Carries a developer-facing detail; the route turns it into a 422 with a
+// human-readable message.
 class ExtractionFailedError extends Error {
   constructor(public readonly detail: string) {
     super(detail);
@@ -83,10 +89,9 @@ class ExtractionFailedError extends Error {
   }
 }
 
-// generateObject throws when the model produces nothing parseable or something that
-// doesn't match the schema - a safety block, a truncated response, or a hallucinated
-// shape. Those are all "this document couldn't be read" and belong in a 422. Anything
-// else (network, auth, quota) is a real server fault and rethrows as a 500.
+// generateObject throws on a safety block, a truncated response, or a hallucinated
+// shape - all of which mean "this document couldn't be read" and belong in a 422.
+// Anything else (network, auth, quota) is a server fault and rethrows as a 500.
 function asExtractionFailure(error: unknown): never {
   if (NoObjectGeneratedError.isInstance(error)) {
     throw new ExtractionFailedError(`Gemini returned no usable object: ${error.message}`);
@@ -109,37 +114,97 @@ function stripPdfParseArtifacts(text: string): string {
 // Extract the text layer of a born-digital PDF. Returns null when the PDF has no usable
 // text layer (scanned/image-only), signalling the caller to fall back to Gemini OCR.
 async function extractPdfTextLayer(buffer: Buffer): Promise<string | null> {
-  try {
-    const { PDFParse } = await import("pdf-parse");
-    const parser = new PDFParse({ data: new Uint8Array(buffer) });
-    try {
-      const result = await parser.getText();
-      const text = stripPdfParseArtifacts(result.text ?? "");
-      const pageCount = result.total || result.pages?.length || 1;
-      if (text.length < MIN_TEXT_LAYER_CHARS || text.length / pageCount < MIN_CHARS_PER_PAGE) {
+  // The output is the raw text layer, identifiers included, so it is PHI-gated. The
+  // metadata answers "how often do uploads fall back to OCR, and why".
+  return span(
+    "pdf_text_layer",
+    { bytes: buffer.byteLength },
+    async () => {
+      try {
+        const { PDFParse } = await import("pdf-parse");
+        const parser = new PDFParse({ data: new Uint8Array(buffer) });
+        try {
+          const result = await parser.getText();
+          const text = stripPdfParseArtifacts(result.text ?? "");
+          const pageCount = result.total || result.pages?.length || 1;
+          const charsPerPage = text.length / pageCount;
+          setSpanMetadata({ pageCount, chars: text.length, charsPerPage });
+
+          if (text.length < MIN_TEXT_LAYER_CHARS || charsPerPage < MIN_CHARS_PER_PAGE) {
+            setSpanMetadata({
+              usable: false,
+              reason:
+                text.length < MIN_TEXT_LAYER_CHARS ? "too-few-chars" : "too-few-chars-per-page",
+            });
+            return null;
+          }
+          setSpanMetadata({ usable: true });
+          return text;
+        } finally {
+          await parser.destroy();
+        }
+      } catch (error) {
+        console.error("PDF text-layer extraction failed, will fall back to OCR:", error);
+        setSpanMetadata({
+          usable: false,
+          reason: "parse-error",
+          swallowedError: error instanceof Error ? error.message : String(error),
+        });
         return null;
       }
-      return text;
-    } finally {
-      await parser.destroy();
+    },
+    {
+      runType: "parser",
+      tags: ["pdf-parse", "pii-boundary"],
+      safeOutputs: (text) => ({ usable: text !== null, ...textShape("text", text) }),
+      recordOutputs: (text) => ({ usable: text !== null, text }),
     }
-  } catch (error) {
-    console.error("PDF text-layer extraction failed, will fall back to OCR:", error);
-    return null;
-  }
+  );
 }
 
+// Both extraction paths are `llm` spans so token usage rolls up into cost. Their inputs
+// are raw report text and a triple can name the patient before redactTriples runs, so
+// both sides are PHI-gated.
 async function analyzeText(fullText: string): Promise<{ summary: string; triples: Triple[] }> {
-  try {
-    const { object } = await generateObject({
-      model: geminiModel,
-      schema: TEXT_ANALYSIS_SCHEMA,
-      prompt: TEXT_ANALYSIS_PROMPT + fullText,
-    });
-    return object;
-  } catch (error) {
-    asExtractionFailure(error);
-  }
+  const result = await span(
+    "extract_from_text_layer",
+    { prompt: TEXT_ANALYSIS_PROMPT, reportText: fullText },
+    async () => {
+      try {
+        const { object, usage, finishReason } = await generateObject({
+          model: geminiModel,
+          schema: TEXT_ANALYSIS_SCHEMA,
+          prompt: TEXT_ANALYSIS_PROMPT + fullText,
+        });
+        setSpanMetadata({
+          inputChars: fullText.length,
+          summaryChars: object.summary.length,
+          triplesExtracted: object.triples.length,
+          finishReason,
+        });
+        return { ...object, usage };
+      } catch (error) {
+        asExtractionFailure(error);
+      }
+    },
+    {
+      runType: "llm",
+      tags: ["gemini", "extract", "text-layer", "pii-boundary"],
+      metadata: llmMetadata(GEMINI_MODEL_ID),
+      safeInputs: { prompt: TEXT_ANALYSIS_PROMPT, ...textShape("reportText", fullText) },
+      safeOutputs: (r) => ({
+        ...textShape("summary", r.summary),
+        tripleCount: r.triples.length,
+        ...usageMetadata(r.usage),
+      }),
+      recordOutputs: (r) => ({
+        summary: r.summary,
+        triples: r.triples,
+        ...usageMetadata(r.usage),
+      }),
+    }
+  );
+  return { summary: result.summary, triples: result.triples };
 }
 
 // Images go as an image part; a scanned PDF goes as a file part with its mime type -
@@ -148,39 +213,95 @@ async function transcribeAndAnalyze(
   mimeType: string,
   buffer: Buffer
 ): Promise<{ fullText: string; summary: string; triples: Triple[] }> {
-  try {
-    const { object } = await generateObject({
-      model: geminiModel,
-      schema: VISION_ANALYSIS_SCHEMA,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: VISION_PROMPT },
-            mimeType === "application/pdf"
-              ? { type: "file", data: buffer, mimeType }
-              : { type: "image", image: buffer, mimeType },
+  const result = await span(
+    "ocr_transcribe_and_extract",
+    // The document bytes are never recorded - megabytes of the most sensitive payload
+    // in the request, where the size alone is all a trace needs.
+    { prompt: VISION_PROMPT, mimeType, bytes: buffer.byteLength },
+    async () => {
+      try {
+        const { object, usage, finishReason } = await generateObject({
+          model: geminiModel,
+          schema: VISION_ANALYSIS_SCHEMA,
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: VISION_PROMPT },
+                mimeType === "application/pdf"
+                  ? { type: "file", data: buffer, mimeType }
+                  : { type: "image", image: buffer, mimeType },
+              ],
+            },
           ],
-        },
-      ],
-    });
-    return {
-      // Transcription drives redaction and chunking; the summary is a usable fallback
-      // if the model returns an empty transcription for an unreadable scan.
-      fullText: object.transcription || object.summary,
-      summary: object.summary,
-      triples: object.triples,
-    };
-  } catch (error) {
-    asExtractionFailure(error);
-  }
+        });
+        setSpanMetadata({
+          transcriptionChars: object.transcription.length,
+          summaryChars: object.summary.length,
+          triplesExtracted: object.triples.length,
+          finishReason,
+          // An empty transcription means the fallback below kicked in and the whole
+          // document was reduced to its ~100-word summary before chunking.
+          transcriptionEmpty: !object.transcription,
+        });
+        return { ...object, usage };
+      } catch (error) {
+        asExtractionFailure(error);
+      }
+    },
+    {
+      runType: "llm",
+      tags: ["gemini", "extract", "ocr", "pii-boundary"],
+      metadata: llmMetadata(GEMINI_MODEL_ID),
+      safeInputs: { prompt: VISION_PROMPT, mimeType, bytes: buffer.byteLength },
+      safeOutputs: (r) => ({
+        ...textShape("transcription", r.transcription),
+        ...textShape("summary", r.summary),
+        tripleCount: r.triples.length,
+        ...usageMetadata(r.usage),
+      }),
+      recordOutputs: (r) => ({
+        transcription: r.transcription,
+        summary: r.summary,
+        triples: r.triples,
+        ...usageMetadata(r.usage),
+      }),
+    }
+  );
+
+  return {
+    // Transcription drives redaction and chunking; the summary is a usable fallback
+    // if the model returns an empty transcription for an unreadable scan.
+    fullText: result.transcription || result.summary,
+    summary: result.summary,
+    triples: result.triples,
+  };
 }
 
 export async function POST(req: Request) {
   const { base64 } = await req.json();
   const { mimeType, buffer } = parseDataUrl(base64);
 
-  // ==================== EXTRACTION ====================
+  try {
+    return await span(
+      "ingest_report",
+      { mimeType, bytes: buffer.byteLength },
+      () => ingestReport(mimeType, buffer),
+      {
+        runType: "chain",
+        tags: ["ingest", mimeType],
+        recordOutputs: (response) => ({ status: response.status }),
+      }
+    );
+  } finally {
+    // The trace client batches uploads in the background and a serverless host can freeze
+    // the function the instant the response is returned, so the batch has to be pushed on
+    // every exit path - including the 422s and an unexpected throw.
+    await flushTraces();
+  }
+}
+
+async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response> {
   let fullText: string;
   let summary: string;
   let triples: Triple[];
@@ -189,20 +310,21 @@ export async function POST(req: Request) {
     if (mimeType === "application/pdf") {
       const textLayer = await extractPdfTextLayer(buffer);
       if (textLayer) {
-        console.log("📄 Using PDF text layer for extraction");
+        setSpanMetadata({ extractionPath: "pdf-text-layer" });
         fullText = textLayer;
         ({ summary, triples } = await analyzeText(fullText));
       } else {
-        console.log("🖼️ PDF has no usable text layer, falling back to Gemini OCR");
+        setSpanMetadata({ extractionPath: "pdf-ocr-fallback" });
         ({ fullText, summary, triples } = await transcribeAndAnalyze(mimeType, buffer));
       }
     } else {
-      console.log("🖼️ Image input, using Gemini OCR");
+      setSpanMetadata({ extractionPath: "image-ocr" });
       ({ fullText, summary, triples } = await transcribeAndAnalyze(mimeType, buffer));
     }
   } catch (error) {
     if (error instanceof ExtractionFailedError) {
-      console.error("❌ Extraction failed:", error.detail);
+      console.error("Extraction failed:", error.detail);
+      setSpanMetadata({ outcome: "extraction-failed", detail: error.detail });
       return new Response(
         JSON.stringify({
           error:
@@ -216,71 +338,188 @@ export async function POST(req: Request) {
   }
 
   if (!fullText.trim()) {
+    setSpanMetadata({ outcome: "no-text-extracted" });
     return new Response(JSON.stringify({ error: "Could not extract any text from the document" }), {
       status: 422,
       headers: { "Content-Type": "application/json" },
     });
   }
 
-  // ==================== PII REDACTION ====================
-  // Redact the full document text and the summary together so they share one coherent
-  // vault (a given name/number maps to the same token in both).
-  console.log("🔒 Applying PII redaction to full document...");
-  const { redactedTexts, vault } = redactDocument([fullText, summary]);
+  // The document text and the summary are redacted together so they share one coherent
+  // vault: a given name or number maps to the same token in both.
+  //
+  // Every field on both sides of this span is PHI, so with capture off it records only
+  // lengths and which token types fired - still enough to catch the failure that
+  // matters, a report where redaction found nothing.
+  const { redactedTexts, vault } = await span(
+    "redact_document",
+    { fullText, summary },
+    async () => {
+      const result = redactDocument([fullText, summary]);
+      const tokens = Object.keys(result.vault);
+      setSpanMetadata({
+        piiCount: tokens.length,
+        // e.g. { NAME: 2, MRN: 1, PHONE: 1 } - shows which rules actually fired.
+        tokenTypes: tokens.reduce<Record<string, number>>((counts, token) => {
+          const type = token.replace(/^\[|_\d+\]$/g, "");
+          counts[type] = (counts[type] ?? 0) + 1;
+          return counts;
+        }, {}),
+        inputChars: fullText.length,
+        redactedChars: result.redactedTexts[0].length,
+        foundNothing: tokens.length === 0,
+      });
+      return result;
+    },
+    {
+      runType: "chain",
+      tags: ["redaction", "pii-boundary"],
+      safeInputs: { ...textShape("fullText", fullText), ...textShape("summary", summary) },
+      safeOutputs: (result) => ({
+        ...textShape("redactedFullText", result.redactedTexts[0]),
+        ...textShape("redactedSummary", result.redactedTexts[1]),
+        piiCount: Object.keys(result.vault).length,
+        tokens: Object.keys(result.vault),
+      }),
+    }
+  );
   const [redactedFullText, redactedSummary] = redactedTexts;
   const piiCount = Object.keys(vault).length;
-  console.log(`📊 Redacted ${piiCount} PII entities`);
 
-  // Document identity is derived from the redacted FULL text now (not the summary).
-  const documentId = generateDocumentId(redactedFullText);
-  console.log("Document ID:", documentId);
+  // Document identity comes from the RAW full text, deliberately not the redacted text.
+  // Redaction is lossy by design - it replaces identifiers with positional tokens - so
+  // two patients whose reports share the same clinical content redact to byte-identical
+  // output. Hashing that would give them one shared id, and since the id is also the
+  // vaultId, the second upload's vault would overwrite the first's and the first
+  // patient's next answer would rehydrate with the second patient's name. Hashing the
+  // raw text keeps dedup meaning what it should: the same bytes uploaded twice.
+  const documentId = generateDocumentId(fullText);
 
   let chunkCount = 0;
+  let vectorStoreFailed = false;
   const existingVault = await getVault(documentId);
   if (existingVault) {
-    console.log(`✅ Document already exists: ${documentId}. Refreshing TTL and skipping re-ingestion.`);
+    // Already ingested: refresh the vault TTL and skip the work.
+    setSpanMetadata({ duplicate: true });
     await storeVault(documentId, existingVault);
   } else {
+    setSpanMetadata({ duplicate: false });
     await storeVault(documentId, vault);
 
-    // ==================== CHUNK + EMBED + UPSERT ====================
-    try {
-      const splitter = new RecursiveCharacterTextSplitter({
-        chunkSize: CHUNK_SIZE,
-        chunkOverlap: CHUNK_OVERLAP,
-      });
-      const chunks = await splitter.splitText(redactedFullText);
-      chunkCount = chunks.length;
-      console.log(`✂️ Split document into ${chunkCount} chunks`);
+    // Errors here are swallowed so a Pinecone or HuggingFace outage still returns a
+    // usable summary. The cost is a 200 carrying chunkCount: 0 - a document that is
+    // silently unsearchable - so the span records the failure as an error.
+    await span(
+      "index_document",
+      { documentId, chars: redactedFullText.length },
+      async () => {
+        try {
+          const chunks = await span(
+            "chunk_document",
+            { chars: redactedFullText.length, chunkSize: CHUNK_SIZE, chunkOverlap: CHUNK_OVERLAP },
+            async () => {
+              const splitter = new RecursiveCharacterTextSplitter({
+                chunkSize: CHUNK_SIZE,
+                chunkOverlap: CHUNK_OVERLAP,
+              });
+              const split = await splitter.splitText(redactedFullText);
+              setSpanMetadata({
+                chunkCount: split.length,
+                avgChunkChars: split.length
+                  ? Math.round(split.reduce((sum, c) => sum + c.length, 0) / split.length)
+                  : 0,
+                maxChunkChars: split.reduce((max, c) => Math.max(max, c.length), 0),
+              });
+              return split;
+            },
+            {
+              runType: "parser",
+              tags: ["chunking"],
+              // Chunk text is the whole redacted document again, which the parent span
+              // already accounts for, so only the shape of the split is recorded.
+              recordOutputs: (split) => ({
+                chunkCount: split.length,
+                chunkChars: split.map((c) => c.length),
+              }),
+            }
+          );
 
-      const embeddings = await generateEmbeddings(chunks);
-      const vectors = chunks.map((chunk, i) => ({
-        id: `${documentId}-chunk-${i}`,
-        values: embeddings[i],
-        metadata: {
-          documentId,
-          chunk,
-          chunkIndex: i,
-          piiCount,
-        },
-      }));
+          chunkCount = chunks.length;
 
-      await upsertVectors(pinecone, "medic", vectors, "diagnosis2");
-      console.log(`✅ Stored ${chunkCount} redacted chunks in Pinecone`);
-    } catch (error) {
-      console.error("Failed to chunk/embed/store document in Pinecone:", error);
-    }
+          const embeddings = await generateEmbeddings(chunks);
+          const vectors = chunks.map((chunk, i) => ({
+            id: `${documentId}-chunk-${i}`,
+            values: embeddings[i],
+            metadata: {
+              documentId,
+              chunk,
+              chunkIndex: i,
+              piiCount,
+            },
+          }));
+
+          await upsertVectors(pinecone, "medic", vectors, "diagnosis2");
+          setSpanMetadata({ indexed: true, chunkCount });
+          return { indexed: true, chunkCount };
+        } catch (error) {
+          console.error("Failed to chunk/embed/store document in Pinecone:", error);
+          vectorStoreFailed = true;
+          setSpanMetadata({
+            indexed: false,
+            swallowedError: error instanceof Error ? error.message : String(error),
+          });
+          // Rethrown so the span is marked failed and surfaces in LangSmith's error
+          // view; caught immediately below to keep the 200 response.
+          throw error;
+        }
+      },
+      { runType: "chain", tags: ["indexing"] }
+    ).catch(() => {
+      // An indexing failure must not fail the upload.
+    });
   }
 
-  // ==================== STORE TRIPLES IN NEO4J ====================
+  let graphStoreFailed = false;
   if (triples && Array.isArray(triples) && triples.length > 0) {
-    const redactedTriples = redactTriples(triples, vault);
-    console.log(`📈 Storing ${redactedTriples.length} redacted triples in Neo4j...`);
+    // Input triples are pre-redaction (a triple can name the patient); the output is
+    // post-vault, so only the input side needs gating.
+    const redactedTriples = await span(
+      "redact_triples",
+      { triples, vaultTokens: Object.keys(vault).length },
+      async () => {
+        const result = redactTriples(triples, vault);
+        setSpanMetadata({
+          tripleCount: result.length,
+          tokenisedTriples: result.filter((t) =>
+            /\[[A-Z]+_\d+\]/.test(`${t.subject}${t.predicate}${t.object}`)
+          ).length,
+        });
+        return result;
+      },
+      {
+        runType: "chain",
+        tags: ["redaction", "pii-boundary"],
+        safeInputs: { tripleCount: triples.length, vaultTokens: Object.keys(vault).length },
+        // Vault substitution only replaces values the rules actually found, so a
+        // redacted triple can still name someone.
+        safeOutputs: (result) => ({ tripleCount: result.length }),
+      }
+    );
+
     try {
-      await storeTriplesInNeo4j(redactedTriples, documentId);
-      console.log("✅ Redacted triples stored successfully");
+      // The vault goes in so scoping is decided against what redaction actually found
+      // rather than the token shape of the string alone: a value redactTriples failed to
+      // substitute (it matches case-sensitively) would otherwise look like generic
+      // knowledge and land in the graph's globally shared tier.
+      await storeTriplesInNeo4j(redactedTriples, documentId, vault);
     } catch (error) {
       console.error("Failed to store triples in Neo4j:", error);
+      // Same silent-200 shape as the indexing block above, so it gets the same
+      // treatment: recorded on the root span rather than only in the console.
+      graphStoreFailed = true;
+      setSpanMetadata({
+        graphStoreError: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -292,7 +531,20 @@ export async function POST(req: Request) {
     chunkCount,
   };
 
-  console.log("✅ Report processed with PII redaction and GraphRAG storage");
+  // Rolled onto the root span so one trace answers "did this upload actually land?".
+  // A 200 with degraded: true is the case worth alerting on - the user saw success
+  // while the document ended up unsearchable.
+  setSpanMetadata({
+    outcome: "ok",
+    vaultId: documentId,
+    piiCount,
+    chunkCount,
+    triplesStored: triples ? triples.length : 0,
+    vectorStoreFailed,
+    graphStoreFailed,
+    degraded: vectorStoreFailed || graphStoreFailed,
+  });
+
   return new Response(JSON.stringify(response), {
     status: 200,
     headers: { "Content-Type": "application/json" },

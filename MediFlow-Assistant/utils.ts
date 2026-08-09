@@ -1,8 +1,8 @@
 import { createHash } from "crypto";
 import { Pinecone } from "@pinecone-database/pinecone";
 import { generateEmbedding } from "@/lib/embeddings";
+import { span, setSpanMetadata, textShape } from "@/lib/tracing";
 
-// Centralized Pinecone client
 export const pinecone = new Pinecone({
   apiKey: process.env.PINECONE_API_KEY ?? "",
 });
@@ -13,9 +13,17 @@ export async function upsertVectors(
   vectors: { id: string; values: number[]; metadata?: Record<string, any> }[],
   namespace?: string
 ) {
-  const index = client.Index(indexName) as any;
-  const target = namespace ? index.namespace(namespace) : index;
-  await target.upsert(vectors);
+  return span(
+    "pinecone_upsert",
+    { index: indexName, namespace: namespace ?? "(default)", vectorCount: vectors.length },
+    async () => {
+      const index = client.Index(indexName) as any;
+      const target = namespace ? index.namespace(namespace) : index;
+      await target.upsert(vectors);
+      return { upserted: vectors.length };
+    },
+    { runType: "chain", tags: ["pinecone", "write"] }
+  );
 }
 
 export async function upsertConversationMemory(
@@ -31,28 +39,48 @@ export async function upsertConversationMemory(
     text: string;
   }
 ) {
-  try {
-    const embedding = await generateEmbedding(text);
-    await upsertVectors(
-      client,
-      indexName,
-      [
-        {
-          id,
-          values: embedding,
-          metadata: {
-            documentId,
-            chunk: text,
-            type: "chat-memory",
-            source: "conversation",
-          },
-        },
-      ],
-      "conversation-history"
-    );
-  } catch (error) {
-    console.error("Failed to upsert conversation memory:", error);
-  }
+  // Failures are swallowed so chat keeps working when a memory write fails, and the
+  // span records the outcome so a persistently broken write does not stay invisible.
+  // The stored text is post-redaction but PHI-gated anyway - see
+  // queryPineconeVectorStore for why that is not the same as identifier-free.
+  return span(
+    "upsert_conversation_memory",
+    { id, documentId, text },
+    async () => {
+      try {
+        const embedding = await generateEmbedding(text);
+        await upsertVectors(
+          client,
+          indexName,
+          [
+            {
+              id,
+              values: embedding,
+              metadata: {
+                documentId,
+                chunk: text,
+                type: "chat-memory",
+                source: "conversation",
+              },
+            },
+          ],
+          "conversation-history"
+        );
+        setSpanMetadata({ stored: true });
+        return { stored: true as boolean, error: null as string | null };
+      } catch (error) {
+        console.error("Failed to upsert conversation memory:", error);
+        const message = error instanceof Error ? error.message : String(error);
+        setSpanMetadata({ stored: false, swallowedError: message });
+        return { stored: false as boolean, error: message };
+      }
+    },
+    {
+      runType: "chain",
+      tags: ["pinecone", "memory", "write"],
+      safeInputs: { id, documentId, ...textShape("text", text) },
+    }
+  );
 }
 
 export function generateDocumentId(content: string): string {
@@ -100,26 +128,48 @@ async function getKeywordCorpus(
   filter?: Record<string, any>,
   maxDocuments: number = 500
 ): Promise<Array<{ id: string; text: string }>> {
-  const index = client.Index(indexName) as any;
-  const namespaceIndex = index.namespace(namespace);
+  // The expensive half of the hybrid retrieval - up to `maxDocuments` chunks, against
+  // topK 12 for the vector side - so it gets its own span for latency attribution.
+  return span(
+    "keyword_corpus_fetch",
+    { namespace, topK: maxDocuments, filter: filter ?? null },
+    async () => {
+      const index = client.Index(indexName) as any;
+      const namespaceIndex = index.namespace(namespace);
 
-  // Reuses the same filter as the vector search (e.g. documentId scoping). Previously
-  // this listed the ENTIRE namespace unfiltered, so the keyword-search half of the
-  // hybrid retrieval could pull in another document's chunks regardless of which
-  // document the vector search was scoped to - RRF fusion then blended them into the
-  // final context. Pinecone's list API has no metadata filter, so a filtered query()
-  // (topK standing in for "give me everything under this filter") replaces it here.
-  const response = await namespaceIndex.query({
-    topK: maxDocuments,
-    vector: queryEmbedding,
-    includeMetadata: true,
-    includeValues: false,
-    filter,
-  });
+      // Reuses the vector search's filter (e.g. documentId scoping), so the keyword arm
+      // cannot pull in another document's chunks for RRF to blend into the context.
+      // Pinecone's list API has no metadata filter, so a filtered query() with a large
+      // topK stands in for "everything under this filter".
+      const response = await namespaceIndex.query({
+        topK: maxDocuments,
+        vector: queryEmbedding,
+        includeMetadata: true,
+        includeValues: false,
+        filter,
+      });
 
-  return ((response.matches ?? []) as Array<any>)
-    .map((match) => ({ id: String(match.id ?? ""), text: String(match.metadata?.chunk ?? "") }))
-    .filter((doc) => doc.id && doc.text.trim().length > 0);
+      const rawMatches = (response.matches ?? []) as Array<any>;
+      const corpus = rawMatches
+        .map((match) => ({ id: String(match.id ?? ""), text: String(match.metadata?.chunk ?? "") }))
+        .filter((doc) => doc.id && doc.text.trim().length > 0);
+
+      setSpanMetadata({
+        matchesReturned: rawMatches.length,
+        corpusSize: corpus.length,
+        // A gap here means chunks were stored without usable `chunk` metadata.
+        droppedEmptyChunks: rawMatches.length - corpus.length,
+      });
+
+      return corpus;
+    },
+    {
+      runType: "retriever",
+      tags: ["pinecone", "keyword"],
+      // Up to 500 chunks of report text would dominate the trace payload.
+      recordOutputs: (corpus) => ({ corpusSize: corpus.length }),
+    }
+  );
 }
 
 function rankWithTfIdf(query: string, documents: { id: string; text: string }[]) {
@@ -216,6 +266,15 @@ function fuseResultsWithRrf(
     }));
 }
 
+/**
+ * Hybrid retrieval: dense vector search and TF-IDF keyword search over the same
+ * filtered corpus, fused with Reciprocal Rank Fusion.
+ *
+ * Post-redaction is not the same as identifier-free - the query is built from the user's
+ * question, and the label-anchored PII rules do not catch a name written in prose. So
+ * the query text and retrieved chunks are PHI-gated, while ids, ranks, scores and counts
+ * are always recorded.
+ */
 export async function queryPineconeVectorStore(
   client: Pinecone,
   indexName: string,
@@ -223,38 +282,140 @@ export async function queryPineconeVectorStore(
   query: string,
   filter?: Record<string, any>
 ): Promise<string> {
-  // One embedding call serves both halves of the hybrid search below: it is passed
-  // into getKeywordCorpus rather than recomputed there.
-  const queryEmbedding = await generateEmbedding(query);
-  const index = client.Index(indexName);
-  const queryResponse = await index.namespace(namespace).query({
-    topK: 12,
-    vector: queryEmbedding,
-    includeMetadata: true,
-    includeValues: false,
-    filter,
-  });
+  return span(
+    "hybrid_retrieve",
+    { query, namespace, index: indexName, filter: filter ?? null },
+    async () => {
+      // One embedding serves both halves of the hybrid search: it is passed into
+      // getKeywordCorpus rather than recomputed there.
+      const queryEmbedding = await generateEmbedding(query);
 
-  const vectorMatches = (queryResponse.matches ?? []) as Array<any>;
-  const vectorResults = vectorMatches
-    .map((match, index) => ({
-      id: String(match.id ?? `doc-${index}`),
-      text: String(match.metadata?.chunk ?? ""),
-      rank: index + 1,
-    }))
-    .filter((match) => match.text.trim().length > 0);
+      const vectorResults = await span(
+        "vector_search",
+        { namespace, topK: 12, filter: filter ?? null },
+        async () => {
+          const index = client.Index(indexName);
+          const queryResponse = await index.namespace(namespace).query({
+            topK: 12,
+            vector: queryEmbedding,
+            includeMetadata: true,
+            includeValues: false,
+            filter,
+          });
 
-  const keywordCorpus = await getKeywordCorpus(client, indexName, namespace, queryEmbedding, filter);
-  const keywordResults = rankWithTfIdf(query, keywordCorpus);
-  const fusedResults = fuseResultsWithRrf(vectorResults, keywordResults, 10);
+          const vectorMatches = (queryResponse.matches ?? []) as Array<any>;
+          const results = vectorMatches
+            .map((match, index) => ({
+              id: String(match.id ?? `doc-${index}`),
+              text: String(match.metadata?.chunk ?? ""),
+              rank: index + 1,
+              score: typeof match.score === "number" ? match.score : undefined,
+            }))
+            .filter((match) => match.text.trim().length > 0);
 
-  if (fusedResults.length === 0) {
-    return "<nomatches>";
-  }
+          setSpanMetadata({
+            matchesReturned: vectorMatches.length,
+            usableMatches: results.length,
+            topScore: results[0]?.score,
+          });
 
-  const concatenatedRetrievals = fusedResults
-    .map((result, index) => `\nClinical Finding ${index + 1}: \n ${result.text}`)
-    .join(". \n\n");
+          return results;
+        },
+        {
+          runType: "retriever",
+          tags: ["pinecone", "vector"],
+          // The parent span already reports the chunk text once.
+          recordOutputs: (results) => ({
+            matches: results.map(({ id, rank, score }) => ({ id, rank, score })),
+          }),
+        }
+      );
 
-  return concatenatedRetrievals || "<nomatches>";
+      const keywordCorpus = await getKeywordCorpus(
+        client,
+        indexName,
+        namespace,
+        queryEmbedding,
+        filter
+      );
+
+      // Synchronous, but real CPU work over the whole corpus - worth its own timing so a
+      // slow retrieval can be blamed on the right half.
+      const keywordResults = await span(
+        "tfidf_rank",
+        { query, corpusSize: keywordCorpus.length },
+        async () => {
+          const ranked = rankWithTfIdf(query, keywordCorpus);
+          setSpanMetadata({ matched: ranked.length, topScore: ranked[0]?.score });
+          return ranked;
+        },
+        {
+          runType: "parser",
+          tags: ["keyword"],
+          safeInputs: { corpusSize: keywordCorpus.length, ...textShape("query", query) },
+          recordOutputs: (ranked) => ({
+            matched: ranked.length,
+            top: ranked.slice(0, 10).map(({ id, score, rank }) => ({ id, score, rank })),
+          }),
+        }
+      );
+
+      const fusedResults = await span(
+        "rrf_fuse",
+        { vectorCount: vectorResults.length, keywordCount: keywordResults.length, topK: 10 },
+        async () => {
+          const fused = fuseResultsWithRrf(vectorResults, keywordResults, 10);
+          setSpanMetadata({
+            fusedCount: fused.length,
+            // How much each retrieval arm actually contributed to the final context.
+            fromBothArms: fused.filter((r) => r.vectorRank && r.keywordRank).length,
+            vectorOnly: fused.filter((r) => r.vectorRank && !r.keywordRank).length,
+            keywordOnly: fused.filter((r) => !r.vectorRank && r.keywordRank).length,
+          });
+          return fused;
+        },
+        {
+          runType: "parser",
+          tags: ["rrf"],
+          recordOutputs: (fused) => ({
+            fused: fused.map(({ id, score, finalRank, vectorRank, keywordRank }) => ({
+              id,
+              score,
+              finalRank,
+              vectorRank,
+              keywordRank,
+            })),
+          }),
+        }
+      );
+
+      if (fusedResults.length === 0) {
+        setSpanMetadata({ matched: false });
+        return "<nomatches>";
+      }
+
+      const concatenatedRetrievals = fusedResults
+        .map((result, index) => `\nClinical Finding ${index + 1}: \n ${result.text}`)
+        .join(". \n\n");
+
+      setSpanMetadata({
+        matched: concatenatedRetrievals.length > 0,
+        contextChars: concatenatedRetrievals.length,
+      });
+
+      return concatenatedRetrievals || "<nomatches>";
+    },
+    {
+      runType: "retriever",
+      tags: ["pinecone", "hybrid", namespace],
+      safeInputs: {
+        namespace,
+        index: indexName,
+        filter: filter ?? null,
+        ...textShape("query", query),
+      },
+      safeOutputs: (retrievals) => textShape("retrievals", retrievals),
+      recordOutputs: (retrievals) => ({ retrievals }),
+    }
+  );
 }
