@@ -106,6 +106,12 @@ export async function guardQuestion({
         const { object } = await generateObject({
             model: geminiModel,
             schema: GuardSchema,
+            // This is a classifier, not a writer. At the provider default the same
+            // question can land on different intents between runs, which would show up
+            // as a chat that refuses a question it answered a minute ago. Pinning to 0
+            // makes routing near-deterministic; the small loss in phrasing variety for
+            // `reply` is a fair trade for a decision the user can rely on.
+            temperature: 0,
             prompt: buildPrompt(question, history, hasReport),
         });
 
