@@ -1,14 +1,13 @@
 import { Redis } from "@upstash/redis";
 import neo4j from "neo4j-driver";
+import { span, setSpanMetadata } from "@/lib/tracing";
 
-// Use the same Redis instance for both caching and vault
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL!,
   token: process.env.UPSTASH_REDIS_REST_TOKEN!,
 });
 
-// Neo4j driver setup is initialized lazily so builds can succeed even when
-// these credentials are not present in the current environment.
+// Initialized lazily so builds succeed without Neo4j credentials in the environment.
 let neo4jDriver: any = null;
 
 function getNeo4jDriver() {
@@ -40,34 +39,31 @@ export async function verifyNeo4jConnectivity(): Promise<boolean> {
 
   try {
     await driver.verifyConnectivity();
-    console.log("✅ Neo4j connectivity verified.");
     return true;
   } catch (error) {
-    console.error("❌ Neo4j connectivity check failed:", error);
+    console.error("Neo4j connectivity check failed:", error);
     return false;
   }
 }
 
-// PII detection rules. Each rule has a type (used for the token label) and a regex.
-// When a regex has a capturing group, only group 1 is treated as PII and redacted
-// (e.g. the name after a "Patient:" label), leaving the surrounding context intact.
+// PII detection rules. Each rule has a type (used for the token label) and a regex; when
+// a regex has a capturing group, only group 1 is redacted (e.g. the name after a
+// "Patient:" label), leaving the surrounding context intact.
 //
-// These patterns are intentionally precise. The pipeline now redacts the ENTIRE
-// document before chunking (not just a short summary), so broad patterns like the
-// old NAME (any two capitalized words) or ADDRESS (a number followed by anything,
-// spanning newlines) would tokenize large amounts of legitimate clinical data and
-// wreck retrieval. Unambiguous PII (email, phone, SSN, MRN) stays aggressively matched;
-// contextual PII (name, DOB, address) is anchored to labels or structural cues.
-// NOTE: inter-token whitespace uses [ \t] (never \s), because \s matches newlines and a
-// multi-word capture like a name would greedily swallow the start of the next line
-// (e.g. "John Doe\nDOB"), producing a vault value that no longer matches the real name
-// elsewhere and leaving it un-redacted.
-// Words that must never be absorbed into a captured name: neighbouring field labels and
-// common filler. Without this guard the name capture runs past the end of the name and
-// into the next column of the header - "Patient: Rahul Mehta   MRN: 884213" yielded the
-// name "Rahul Mehta MRN", which is then what lands in the vault. The plain name, as it
-// appears in the model's summary, no longer matches that value, so it survives redaction
-// and reaches the client.
+// The patterns are deliberately precise. The whole document is redacted before chunking,
+// so broad patterns - any two capitalized words as a NAME, a number followed by anything
+// as an ADDRESS - would tokenize large amounts of legitimate clinical data and wreck
+// retrieval. Unambiguous PII (email, phone, SSN, MRN) is matched aggressively; contextual
+// PII (name, DOB, address) is anchored to labels or structural cues.
+//
+// Inter-token whitespace uses [ \t], never \s: \s matches newlines, so a multi-word name
+// capture would swallow the start of the next line ("John Doe\nDOB") and store a vault
+// value that no longer matches the real name elsewhere in the text.
+
+// Field labels and filler that must never be absorbed into a captured name. Without this
+// guard "Patient: Rahul Mehta   MRN: 884213" captures "Rahul Mehta MRN", and the plain
+// name as it appears in the summary no longer matches that vault value - so it survives
+// redaction and reaches the client.
 const NON_NAME_WORDS = [
   "MRN", "DOB", "ID", "SSN", "SEX", "GENDER", "AGE", "TEL", "FAX", "PHONE", "MOBILE",
   "EMAIL", "DATE", "TIME", "ADDRESS", "NUMBER", "NO", "REF", "VISIT", "ACCESSION",
@@ -127,11 +123,10 @@ const PII_RULES: Array<{ type: string; regex: RegExp }> = [
     ),
   },
 
-  // Same, but with no separator and an ALL-CAPS name - which is how OCR of a scanned or
-  // photographed header usually reads ("PATIENT RAHUL MEHTA"). Two or three ALL-CAPS
-  // words are required here: without a separator to anchor on, a single word would let
-  // ordinary prose through, whereas a phrase like "PATIENT HAS ANEMIA" is rejected
-  // because "HAS" is excluded and that breaks the required run.
+  // Same, but with no separator and an ALL-CAPS name - how OCR of a scanned header
+  // usually reads ("PATIENT RAHUL MEHTA"). Two or three ALL-CAPS words are required:
+  // with no separator to anchor on, a single word would let ordinary prose through,
+  // while "PATIENT HAS ANEMIA" is rejected because excluding "HAS" breaks the run.
   {
     type: "NAME",
     regex: new RegExp(
@@ -145,11 +140,10 @@ const PII_RULES: Array<{ type: string; regex: RegExp }> = [
   { type: "NAME", regex: /\b(?:Mr|Mrs|Ms|Miss|Dr|Prof)\.?[ \t]+([A-Z][a-z]+(?:[ \t]+[A-Z][a-z]+){0,2})\b/g },
 
   // Street address on a single line: a house number, one to four Title-cased street-name
-  // words, then a street-type suffix. Case-SENSITIVE (no /i) and Title-case-anchored on
-  // purpose: the abbreviated suffixes (St, Dr, Rd, Ln, Ct, Pl…) collide with common
-  // ALL-CAPS clinical terms otherwise — e.g. the old case-insensitive rule matched "St"
-  // inside "ST-segment" and swallowed "Stage 2 … ST" into one ADDRESS token. The trailing
-  // (?![-A-Za-z]) also rejects hyphenated continuations like "St-segment".
+  // words, then a street-type suffix. Case-SENSITIVE and Title-case-anchored on purpose -
+  // the abbreviated suffixes (St, Dr, Rd, Ln, Ct, Pl…) otherwise collide with ALL-CAPS
+  // clinical terms, matching "St" inside "ST-segment". The trailing (?![-A-Za-z]) rejects
+  // hyphenated continuations for the same reason.
   { type: "ADDRESS", regex: /\b\d{1,6}[ \t]+(?:[A-Z][A-Za-z0-9.\-]*[ \t]+){1,4}(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Way|Place|Pl|Terrace|Ter|Circle|Cir|Suite|Ste|Apt|Unit)\.?(?![-A-Za-z])/g },
 ];
 
@@ -168,9 +162,6 @@ interface RedactionResult {
   vaultId: string;
 }
 
-/**
- * Create a unique vault ID for this redaction session
- */
 function generateVaultId(): string {
   return `vault_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 }
@@ -214,11 +205,11 @@ export function redactDocument(texts: string[]): { redactedTexts: string[]; vaul
   }
 
   // Replacement is case-INSENSITIVE and tolerant of whitespace width. A scanned report
-  // transcribes as "PATIENT RAHUL MEHTA" while the model's summary refers to "Rahul
-  // Mehta"; an exact replace leaves that second spelling in place, so the name reaches
-  // the browser and the response cache even though it is sitting in the vault. The
-  // values here are specific (names, emails, phone/MRN digits), so matching them
-  // loosely does not endanger surrounding clinical text.
+  // transcribes as "PATIENT RAHUL MEHTA" while the model's summary says "Rahul Mehta";
+  // an exact replace leaves that second spelling in place, so the name reaches the
+  // browser and the response cache even though it is sitting in the vault. The values
+  // are specific enough (names, emails, phone/MRN digits) that loose matching does not
+  // endanger surrounding clinical text.
   const orderedValues = Array.from(valueToToken.keys()).sort((a, b) => b.length - a.length);
   const redactedTexts = texts.map((text) => {
     let out = text;
@@ -247,47 +238,94 @@ export function redactPII(text: string): RedactionResult {
 }
 
 /**
- * Store the token vault in Redis with TTL.
+ * Store the token vault in Redis with a TTL.
+ *
  * Best-effort: if Redis is unreachable, log and continue rather than failing the caller,
  * since the redacted report has already been produced without it.
+ *
+ * The vault maps every placeholder back to its real value, so shipping it to a trace
+ * backend alongside the redacted text would hand over both the ciphertext and the key.
+ * Only token labels and the count are recorded unless PHI capture is enabled.
  */
 export async function storeVault(vaultId: string, vault: TokenVault, ttlSeconds: number = 86400): Promise<boolean> {
-  try {
-    await redis.setex(`vault:${vaultId}`, ttlSeconds, JSON.stringify(vault));
-    console.log(`Stored vault ${vaultId} with ${Object.keys(vault).length} tokens`);
-    return true;
-  } catch (error) {
-    console.error("Error storing vault:", error);
-    return false;
-  }
+  return span(
+    "vault_store",
+    { vaultId, vault, ttlSeconds },
+    async () => {
+      try {
+        await redis.setex(`vault:${vaultId}`, ttlSeconds, JSON.stringify(vault));
+        setSpanMetadata({ stored: true, tokenCount: Object.keys(vault).length });
+        return true;
+      } catch (error) {
+        console.error("Error storing vault:", error);
+        setSpanMetadata({
+          stored: false,
+          swallowedError: error instanceof Error ? error.message : String(error),
+        });
+        return false;
+      }
+    },
+    {
+      runType: "chain",
+      tags: ["vault", "redis", "write", "pii-boundary"],
+      safeInputs: {
+        vaultId,
+        ttlSeconds,
+        tokenCount: Object.keys(vault).length,
+        tokens: Object.keys(vault),
+      },
+      safeOutputs: (stored) => ({ stored }),
+    }
+  );
 }
 
-/**
- * Retrieve vault from Redis
- */
 export async function getVault(vaultId: string): Promise<TokenVault | null> {
-  try {
-    // Upstash Redis auto-deserializes stored JSON: get() returns an object here even
-    // though storeVault() wrote a JSON string. Handle both so we never JSON.parse an
-    // object (which throws and silently disables PII rehydration).
-    const vaultData = await redis.get<TokenVault | string>(`vault:${vaultId}`);
-    if (!vaultData) return null;
+  return span(
+    "vault_fetch",
+    { vaultId },
+    async () => {
+      try {
+        // Upstash auto-deserializes stored JSON, so get() returns an object even though
+        // storeVault() wrote a string. Both are handled - JSON.parse on an object throws
+        // and would silently disable rehydration.
+        const vaultData = await redis.get<TokenVault | string>(`vault:${vaultId}`);
+        if (!vaultData) {
+          // A miss here is why an answer can come back still full of "[NAME_1]".
+          setSpanMetadata({ found: false });
+          return null;
+        }
 
-    return typeof vaultData === "string" ? (JSON.parse(vaultData) as TokenVault) : vaultData;
-  } catch (error) {
-    console.error("Error retrieving vault:", error);
-    return null;
-  }
+        const vault =
+          typeof vaultData === "string" ? (JSON.parse(vaultData) as TokenVault) : vaultData;
+        setSpanMetadata({ found: true, tokenCount: Object.keys(vault).length });
+        return vault;
+      } catch (error) {
+        console.error("Error retrieving vault:", error);
+        setSpanMetadata({
+          found: false,
+          swallowedError: error instanceof Error ? error.message : String(error),
+        });
+        return null;
+      }
+    },
+    {
+      runType: "retriever",
+      tags: ["vault", "redis", "pii-boundary"],
+      safeOutputs: (vault) => ({
+        found: vault !== null,
+        tokenCount: vault ? Object.keys(vault).length : 0,
+        tokens: vault ? Object.keys(vault) : [],
+      }),
+    }
+  );
 }
 
 /**
- * Redact user question using the same patterns (no vault needed for questions)
+ * Redact a user question with the same rules. The vault is discarded - questions are
+ * never rehydrated - so token numbering here is independent of the document vault. This
+ * only keeps PII out of the semantic cache, the retrieval query, and the prompt.
  */
 export function redactUserQuestion(question: string): string {
-  // Reuse the shared redactor; the vault it builds is discarded because questions
-  // are never rehydrated (only the report/answer are). Token numbering here is
-  // independent of the document vault, which is fine: this only keeps PII out of
-  // the semantic cache, retrieval query, and LLM prompt.
   return redactDocument([question]).redactedTexts[0];
 }
 
@@ -316,15 +354,12 @@ export function redactTriples(
   }));
 }
 
-/**
- * Re-hydrate text by replacing tokens with original values from vault
- */
+/** Replace vault tokens in `text` with the original values. */
 export function rehydrateText(text: string, vault: TokenVault): string {
   let rehydratedText = text;
 
-  // Use literal split/join rather than new RegExp(token): tokens like "[NAME_1]"
-  // contain regex-special characters ([, ]) that would otherwise be interpreted as
-  // a character class and corrupt the output.
+  // Literal split/join rather than new RegExp(token): tokens like "[NAME_1]" contain
+  // regex-special characters that would otherwise be read as a character class.
   Object.entries(vault).forEach(([token, originalValue]) => {
     rehydratedText = rehydratedText.split(token).join(originalValue);
   });
@@ -332,21 +367,15 @@ export function rehydrateText(text: string, vault: TokenVault): string {
   return rehydratedText;
 }
 
-/**
- * Clean up vault from Redis (optional - TTL will handle this automatically)
- */
+/** Delete a vault ahead of its TTL. */
 export async function cleanupVault(vaultId: string): Promise<void> {
   try {
     await redis.del(`vault:${vaultId}`);
-    console.log(`Cleaned up vault ${vaultId}`);
   } catch (error) {
     console.error("Error cleaning up vault:", error);
   }
 }
 
-/**
- * Get vault statistics
- */
 export async function getVaultStats(vaultId: string) {
   try {
     const vault = await getVault(vaultId);
@@ -363,57 +392,166 @@ export async function getVaultStats(vaultId: string) {
   }
 }
 
-// Matches vault tokens like [NAME_1] or [PHONE_2]. These are only unique within the
-// document they were redacted from - redactPII() restarts the counter at 1 for every
-// document, so "[NAME_1]" from one patient's report is a different person than
-// "[NAME_1]" from another's.
-const VAULT_TOKEN_PATTERN = /^\[[A-Z]+_\d+\]$/;
+// Detects a vault token like [NAME_1] anywhere in a string. Tokens are unique only
+// within the document they were redacted from - the counter restarts at 1 for every
+// document - so any string carrying one is private to its document.
+//
+// Deliberately unanchored rather than "is exactly one token": the model glues tokens to
+// other text, producing names like "[NAME_4], Delhi" or "0.[ADDRESS_3]/mL". Those still
+// carry an identifier, so containment is the correct test.
+const CONTAINS_VAULT_TOKEN = /\[[A-Z]+_\d+\]/;
+
+// Global variant for enumerating tokens. Kept separate because a /g regex carries
+// lastIndex state, which is unsafe to share with .test() calls.
+const ALL_VAULT_TOKENS = /\[[A-Z]+_\d+\]/g;
+
+/**
+ * Every distinct vault token appearing in `text`, so callers can assert their absence
+ * after rehydration - a surviving token is otherwise a silent failure that shows the user
+ * a literal "[NAME_1]". The returned values are token LABELS, never the identifiers
+ * behind them, so they are safe to record in a trace.
+ */
+export function findVaultTokens(text: string): string[] {
+  return Array.from(new Set(text.match(ALL_VAULT_TOKENS) ?? []));
+}
+
+// The same test for Neo4j's `=~`, which uses Java regex syntax and is fully anchored -
+// hence the explicit .* on both ends. Passed as a query parameter rather than inlined, so
+// the backslashes never have to survive Cypher's string-literal escaping. Keep in sync
+// with the RegExp above.
+const CYPHER_CONTAINS_VAULT_TOKEN = ".*\\[[A-Z]+_\\d+\\].*";
+
+/**
+ * Whether a triple element must be kept private to its source document. Two independent
+ * reasons, because token shape alone only fingerprints what the redactor happened to
+ * catch:
+ *
+ *  - it carries a vault token, so redaction already identified it as PII; or
+ *  - it still contains a raw vault VALUE. redactTriples() substitutes case-sensitively,
+ *    unlike redactDocument(), so a name can come back through the model in a different
+ *    case ("RAHUL MEHTA" from a header-derived triple) and survive tokenisation.
+ *
+ * This makes the node private, which stops it bridging documents; it does NOT un-write
+ * the raw value from the node name.
+ */
+function isDocumentPrivate(text: string, vault?: TokenVault): boolean {
+  if (CONTAINS_VAULT_TOKEN.test(text)) return true;
+  if (!vault) return false;
+
+  const haystack = text.toLowerCase();
+  return Object.values(vault).some(
+    (value) => value && haystack.includes(value.toLowerCase())
+  );
+}
 
 /**
  * Store extracted triples in Neo4j.
  *
- * `documentId` scopes vault-token entities (e.g. "[NAME_1]") to the document they came
- * from, so the same token reused across different patients' reports doesn't merge into
- * one shared node. Generic medical terms (e.g. "Aspirin") are left unscoped so the graph
- * still shares that knowledge across documents.
+ * `documentId` scopes entities carrying patient data (e.g. "[NAME_1]") to the document
+ * they came from, so the same token reused across different patients' reports does not
+ * merge into one shared node. Generic medical terms ("Aspirin") are left unscoped so the
+ * graph still shares that knowledge across documents.
+ *
+ * Pass `vault` so scoping is decided against what redaction actually found rather than
+ * the shape of the string alone - see isDocumentPrivate. Omitting it weakens the decision
+ * to shape-only.
  */
 export async function storeTriplesInNeo4j(
   triples: { subject: string; predicate: string; object: string }[],
-  documentId?: string
+  documentId?: string,
+  vault?: TokenVault
 ) {
-  const driver = getNeo4jDriver();
-  if (!driver) {
-    console.warn("Neo4j is not configured. Skipping triple storage.");
-    return;
-  }
+  // Triples arrive redacted, but vault substitution only replaces values the
+  // label-anchored rules found, so a triple can still carry a name - hence the gating.
+  // Counts and the scoping decision are always recorded.
+  return span(
+    "graph_store_triples",
+    { triples, documentId: documentId ?? null, tripleCount: triples.length },
+    async () => {
+      const driver = getNeo4jDriver();
+      if (!driver) {
+        console.warn("Neo4j is not configured. Skipping triple storage.");
+        // Distinguishes "graph is empty because Neo4j is unconfigured" from
+        // "graph is empty because the model extracted nothing".
+        setSpanMetadata({ skipped: true, reason: "neo4j-not-configured" });
+        return { stored: 0, skipped: true };
+      }
 
-  const session = driver.session();
-  try {
-    for (const { subject, predicate, object } of triples) {
-      const subjectMerge = documentId && VAULT_TOKEN_PATTERN.test(subject)
-        ? `MERGE (a:Entity {name: $subject, documentId: $documentId})`
-        : `MERGE (a:Entity {name: $subject})`;
-      const objectMerge = documentId && VAULT_TOKEN_PATTERN.test(object)
-        ? `MERGE (b:Entity {name: $object, documentId: $documentId})`
-        : `MERGE (b:Entity {name: $object})`;
+      const session = driver.session();
+      try {
+        let scopedNodes = 0;
+        // Split out so the trace shows WHY a node was scoped: a vault-value hit means a
+        // raw identifier reached the graph despite redaction.
+        let scopedByToken = 0;
+        let scopedByVaultValue = 0;
+        // A private node with no documentId is unattributable, and
+        // queryNeo4jRelationships refuses to traverse into those - so it would be written
+        // and then be unreachable.
+        let unscopeablePrivateNodes = 0;
 
-      await session.run(
-        `${subjectMerge}
-         ${objectMerge}
-         MERGE (a)-[:RELATIONSHIP {type: $predicate}]->(b)`,
-        { subject, predicate, object, documentId }
-      );
+        for (const { subject, predicate, object } of triples) {
+          const subjectPrivate = isDocumentPrivate(subject, vault);
+          const objectPrivate = isDocumentPrivate(object, vault);
+          const subjectScoped = !!documentId && subjectPrivate;
+          const objectScoped = !!documentId && objectPrivate;
+
+          for (const [text, isPrivate, scoped] of [
+            [subject, subjectPrivate, subjectScoped],
+            [object, objectPrivate, objectScoped],
+          ] as Array<[string, boolean, boolean]>) {
+            if (!isPrivate) continue;
+            if (!scoped) {
+              unscopeablePrivateNodes++;
+            } else if (CONTAINS_VAULT_TOKEN.test(text)) {
+              scopedByToken++;
+            } else {
+              scopedByVaultValue++;
+            }
+          }
+
+          if (subjectScoped) scopedNodes++;
+          if (objectScoped) scopedNodes++;
+
+          const subjectMerge = subjectScoped
+            ? `MERGE (a:Entity {name: $subject, documentId: $documentId})`
+            : `MERGE (a:Entity {name: $subject})`;
+          const objectMerge = objectScoped
+            ? `MERGE (b:Entity {name: $object, documentId: $documentId})`
+            : `MERGE (b:Entity {name: $object})`;
+
+          await session.run(
+            `${subjectMerge}
+             ${objectMerge}
+             MERGE (a)-[:RELATIONSHIP {type: $predicate}]->(b)`,
+            { subject, predicate, object, documentId }
+          );
+        }
+        setSpanMetadata({
+          stored: triples.length,
+          documentScopedNodes: scopedNodes,
+          scopedByToken,
+          // Non-zero means redaction found the identifier in the report but redactTriples
+          // failed to substitute it, so the raw value is now a node name.
+          scopedByVaultValue,
+          // Non-zero means private data was written unscoped and is now unreachable.
+          unscopeablePrivateNodes,
+          vaultProvided: !!vault,
+        });
+        return { stored: triples.length, skipped: false };
+      } finally {
+        await session.close();
+      }
+    },
+    {
+      runType: "chain",
+      tags: ["neo4j", "graph", "write"],
+      safeInputs: { documentId: documentId ?? null, tripleCount: triples.length },
     }
-  } finally {
-    await session.close();
-  }
+  );
 }
 
-/**
- * Serialize Neo4j path objects into clean JSON for Gemini consumption
- */
+/** Flatten a Neo4j path object into plain JSON. */
 function serializeNeo4jPath(path: any): any {
-  // Handle single-segment paths (most common case)
   if (path.segments && path.segments.length > 0) {
     const segment = path.segments[0];
     return {
@@ -432,12 +570,30 @@ function serializeNeo4jPath(path: any): any {
 }
 
 /**
- * Query Neo4j for the immediate neighborhood of each extracted entity.
+ * Query Neo4j for the immediate neighbourhood of each entity.
  *
- * `documentId` scopes the lookup when `entity` is a vault token (e.g. "[NAME_1]"), so it
- * only matches the node created for that specific document instead of every document
- * that happened to produce the same token. Generic medical terms are matched unscoped,
- * same as in storeTriplesInNeo4j.
+ * `documentId` scopes the lookup when `entity` carries a vault token, so it matches only
+ * the node created for that document rather than every document that produced the same
+ * token. Generic medical terms are matched unscoped, as in storeTriplesInNeo4j.
+ *
+ * The NEIGHBOUR is scoped too, and that is the half that matters. "Atorvastatin" is
+ * unscoped by design, so traversing out of it would return the "[NAME_n]" nodes of every
+ * patient ever prescribed it - and the chat route then rehydrates through the CURRENT
+ * document's vault, resolving another patient's token to this patient's name. The model
+ * would be handed a relationship belonging to someone else, and nothing about that output
+ * looks wrong from the outside.
+ *
+ * The neighbour filter tests for a token anywhere in the name rather than for a
+ * documentId property, because the graph can hold token-bearing nodes with no documentId
+ * (storeTriplesInNeo4j only scopes when one is supplied). Such a node is unattributable,
+ * so "no documentId" cannot be read as "generic knowledge". A neighbour is admitted only
+ * when it is genuinely generic (no documentId and no token) or scoped to this document.
+ *
+ * Only the shape can be tested here - the entity name comes from the model, which has
+ * only seen redacted text. The vault-value half of the decision belongs on the write
+ * path. With no documentId, `b.documentId = null` is UNKNOWN rather than true, so the
+ * predicate collapses to the generic-only branch: the right reading of "no report
+ * attached".
  */
 export async function queryNeo4jRelationships(entities: string[], documentId?: string) {
   const driver = getNeo4jDriver();
@@ -448,17 +604,27 @@ export async function queryNeo4jRelationships(entities: string[], documentId?: s
   const session = driver.session();
   try {
     const relationships: Array<{ source: string; relationship: string; target: string }> = [];
+    // The chat route passes "" when no report is attached. Normalising "" and undefined
+    // to null keeps the comparison below a plain IS NULL / equality test rather than a
+    // match against the empty string, which no node carries.
+    const scopeId = documentId ? documentId : null;
 
     for (const entity of entities) {
-      const matchClause = documentId && VAULT_TOKEN_PATTERN.test(entity)
+      const matchClause = scopeId && CONTAINS_VAULT_TOKEN.test(entity)
         ? `MATCH (a:Entity {name: $entity_name, documentId: $documentId})-[r]-(b:Entity)`
         : `MATCH (a:Entity {name: $entity_name})-[r]-(b:Entity)`;
 
       const result = await session.run(
         `${matchClause}
+         WHERE (b.documentId IS NULL AND NOT b.name =~ $tokenPattern)
+            OR b.documentId = $documentId
          RETURN a.name AS source, r.type AS relationship, b.name AS target
          LIMIT 10`,
-        { entity_name: entity, documentId }
+        {
+          entity_name: entity,
+          documentId: scopeId,
+          tokenPattern: CYPHER_CONTAINS_VAULT_TOKEN,
+        }
       );
 
       for (const record of result.records) {
@@ -470,7 +636,6 @@ export async function queryNeo4jRelationships(entities: string[], documentId?: s
       }
     }
 
-    // Deduplicate similar triples
     return relationships.filter((item, index, self) =>
       index === self.findIndex((other) =>
         other.source === item.source &&

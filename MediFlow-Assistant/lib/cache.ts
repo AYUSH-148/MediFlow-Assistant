@@ -1,14 +1,12 @@
 import { Redis } from "@upstash/redis";
 import { generateEmbedding } from "@/lib/embeddings";
+import { span, setSpanMetadata, textShape } from "@/lib/tracing";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL!,
   token: process.env.UPSTASH_REDIS_REST_TOKEN!,
 });
 
-/**
- * Calculate cosine similarity between two vectors
- */
 function cosineSimilarity(vecA: number[], vecB: number[]): number {
   let dotProduct = 0;
   let normA = 0;
@@ -27,24 +25,18 @@ function cosineSimilarity(vecA: number[], vecB: number[]): number {
   return dotProduct / (normA * normB);
 }
 
-/**
- * Create a cache key from report data and question
- */
 function getCacheKeyPrefix(reportHash: string): string {
   return `medic_cache:${reportHash}`;
 }
 
-/**
- * Generate a hash for the report data (simple hash)
- */
 function generateReportHash(reportData?: string): string {
-  // No report uploaded → chats share one namespace instead of crashing on undefined.
+  // With no report uploaded, chats share one namespace instead of crashing on undefined.
   const source = reportData ?? "";
   let hash = 0;
   for (let i = 0; i < source.length; i++) {
     const char = source.charCodeAt(i);
     hash = (hash << 5) - hash + char;
-    hash = hash & hash; // Convert to 32bit integer
+    hash = hash & hash;
   }
   return Math.abs(hash).toString(36);
 }
@@ -57,112 +49,162 @@ interface CacheEntry {
 }
 
 /**
- * Try to find a cached response for a similar question
- * Returns the cached answer if found with similarity > threshold, null otherwise
+ * Return a cached answer for a semantically similar question, or null.
+ *
+ * The question is post-redaction and the cached answer is pre-rehydration, but neither
+ * is guaranteed identifier-free - the PII rules only catch labelled shapes - so both
+ * sides are PHI-gated.
+ *
+ * `bestSimilarity` is recorded on misses too: without it, a threshold that never fires
+ * is indistinguishable from a cache that is simply cold.
  */
 export async function getCachedResponse(
   question: string,
   reportData: string,
   similarityThreshold: number = 0.95
 ): Promise<string | null> {
-  try {
-    // Generate embedding for the current question
-    const currentEmbedding = await generateEmbedding(question);
-    
-    // Get cache key prefix based on report
-    const reportHash = generateReportHash(reportData);
-    const cacheKeyPrefix = getCacheKeyPrefix(reportHash);
-    
-    // Get all cached entries for this report
-    const keys = await redis.keys(`${cacheKeyPrefix}:*`);
-    
-    if (keys.length === 0) {
-      return null;
-    }
+  return span(
+    "semantic_cache_lookup",
+    { question, threshold: similarityThreshold },
+    async () => {
+      try {
+        const currentEmbedding = await generateEmbedding(question);
+        const reportHash = generateReportHash(reportData);
+        const cacheKeyPrefix = getCacheKeyPrefix(reportHash);
 
-    // Fetch all cached entries for this report in a single round trip
-    const cachedEntries = await redis.mget<CacheEntry[]>(...keys);
+        const keys = await redis.keys(`${cacheKeyPrefix}:*`);
 
-    // Check each cached entry for similarity
-    for (let i = 0; i < keys.length; i++) {
-      const cachedData = cachedEntries[i];
+        if (keys.length === 0) {
+          setSpanMetadata({ cacheHit: false, entriesScanned: 0, reason: "empty-namespace" });
+          return null;
+        }
 
-      if (!cachedData || !cachedData.embedding) {
-        continue;
+        // One round trip for every entry under this report.
+        const cachedEntries = await redis.mget<CacheEntry[]>(...keys);
+
+        let bestSimilarity = 0;
+        let comparable = 0;
+        for (let i = 0; i < keys.length; i++) {
+          const cachedData = cachedEntries[i];
+
+          if (!cachedData || !cachedData.embedding) {
+            continue;
+          }
+          comparable++;
+
+          const similarity = cosineSimilarity(
+            currentEmbedding,
+            cachedData.embedding
+          );
+          if (similarity > bestSimilarity) bestSimilarity = similarity;
+
+          if (similarity >= similarityThreshold) {
+            setSpanMetadata({
+              cacheHit: true,
+              similarity,
+              entriesScanned: keys.length,
+              comparableEntries: comparable,
+              matchedKey: keys[i],
+            });
+            return cachedData.answer;
+          }
+        }
+
+        setSpanMetadata({
+          cacheHit: false,
+          bestSimilarity,
+          entriesScanned: keys.length,
+          comparableEntries: comparable,
+          reason: "below-threshold",
+        });
+        return null;
+      } catch (error) {
+        console.error("Error in getCachedResponse:", error);
+        // Swallowed so a Redis outage degrades to a cache miss rather than a failed
+        // chat, and recorded so it does not degrade silently forever.
+        setSpanMetadata({
+          cacheHit: false,
+          reason: "error",
+          swallowedError: error instanceof Error ? error.message : String(error),
+        });
+        return null;
       }
-
-      const similarity = cosineSimilarity(
-        currentEmbedding,
-        cachedData.embedding
-      );
-
-      if (similarity >= similarityThreshold) {
-        console.log(
-          `Cache HIT! Similarity: ${similarity.toFixed(4)}, Key: ${keys[i]}`
-        );
-        return cachedData.answer;
-      }
+    },
+    {
+      runType: "retriever",
+      tags: ["cache", "redis"],
+      safeInputs: { threshold: similarityThreshold, ...textShape("question", question) },
+      safeOutputs: (answer) => ({
+        cacheHit: answer !== null,
+        ...textShape("answer", answer),
+      }),
+      recordOutputs: (answer) => ({
+        cacheHit: answer !== null,
+        answer: answer ?? null,
+      }),
     }
-
-    return null;
-  } catch (error) {
-    console.error("Error in getCachedResponse:", error);
-    return null;
-  }
+  );
 }
 
-/**
- * Cache a question-answer pair
- * Stores the embedding for future similarity checks
- */
+/** Cache a question/answer pair, storing the embedding for future similarity checks. */
 export async function cacheResponse(
   question: string,
   answer: string,
   reportData: string,
   ttlSeconds: number = 86400 // 24 hours default
 ): Promise<void> {
-  try {
-    // Generate embedding for the question
-    const embedding = await generateEmbedding(question);
+  await span(
+    "semantic_cache_write",
+    { question, answer, ttlSeconds },
+    async () => {
+      try {
+        const embedding = await generateEmbedding(question);
+        const reportHash = generateReportHash(reportData);
+        const questionHash = generateReportHash(question);
+        const cacheKey = `${getCacheKeyPrefix(reportHash)}:${questionHash}`;
 
-    // Get cache key based on report and question hash
-    const reportHash = generateReportHash(reportData);
-    const questionHash = generateReportHash(question);
-    const cacheKey = `${getCacheKeyPrefix(reportHash)}:${questionHash}`;
+        const cacheEntry: CacheEntry = {
+          question,
+          embedding,
+          answer,
+          timestamp: Date.now(),
+        };
 
-    // Prepare cache entry
-    const cacheEntry: CacheEntry = {
-      question,
-      embedding,
-      answer,
-      timestamp: Date.now(),
-    };
+        await redis.setex(cacheKey, ttlSeconds, JSON.stringify(cacheEntry));
 
-    // Store in Redis with TTL
-    await redis.setex(cacheKey, ttlSeconds, JSON.stringify(cacheEntry));
-    
-    console.log(`Cached response with key: ${cacheKey}`);
-  } catch (error) {
-    console.error("Error in cacheResponse:", error);
-    // Don't throw - caching errors shouldn't break the main flow
-  }
+        setSpanMetadata({ cached: true, cacheKey });
+        return { cached: true };
+      } catch (error) {
+        console.error("Error in cacheResponse:", error);
+        // Never thrown: a caching failure must not break the chat.
+        setSpanMetadata({
+          cached: false,
+          swallowedError: error instanceof Error ? error.message : String(error),
+        });
+        return { cached: false };
+      }
+    },
+    {
+      runType: "chain",
+      tags: ["cache", "redis", "write"],
+      safeInputs: {
+        ttlSeconds,
+        ...textShape("question", question),
+        ...textShape("answer", answer),
+      },
+    }
+  );
 }
 
-// ==================== CONVERSATION MEMORY FLAG ====================
-//
 // Records whether the `conversation-history` Pinecone namespace holds anything for a
-// document, so the chat route can decide if that hybrid retrieval is worth running.
-// Without this the search ran unconditionally, and on the first turn of a freshly
-// ingested report it cost one HuggingFace embedding plus a topK 12 query and a topK 500
-// corpus pull to return "<nomatches>" - the namespace is only written to AFTER an answer.
+// document, so the chat route can skip that retrieval when it could only ever miss. A
+// Redis EXISTS is orders of magnitude cheaper than an embedding plus two Pinecone
+// queries.
 //
-// A Redis EXISTS is orders of magnitude cheaper than that, which is the whole point.
-//
-// Deliberately stored with NO TTL, unlike the vault and the response cache above. The
-// Pinecone memory vectors this mirrors are never deleted, so an expiring flag would
-// drift out of sync with them and silently switch memory retrieval off for older
-// reports - a degradation with no visible symptom. If memory pruning is ever added,
-// delete this key in the same place.
+// Stored with NO TTL, unlike the vault and the response cache above: the Pinecone memory
+// vectors this mirrors are never deleted, so an expiring flag would drift out of sync
+// and silently switch memory retrieval off for older reports. If memory pruning is ever
+// added, delete this key in the same place.
 
 function getMemoryFlagKey(documentId: string): string {
   return `medic_memory:${documentId}`;
@@ -188,15 +230,12 @@ export async function markConversationMemory(documentId: string): Promise<void> 
   try {
     await redis.set(getMemoryFlagKey(documentId), "1");
   } catch (error) {
-    // Best-effort: a lost flag costs a skipped retrieval on the next turn, not a
-    // broken answer.
+    // Best-effort, matching storeVault: a lost flag costs a skipped retrieval on the
+    // next turn, not a broken answer.
     console.error("Error setting conversation memory flag:", error);
   }
 }
 
-/**
- * Clear cache for a specific report
- */
 export async function clearCacheForReport(reportData: string): Promise<void> {
   try {
     const reportHash = generateReportHash(reportData);
@@ -205,16 +244,12 @@ export async function clearCacheForReport(reportData: string): Promise<void> {
 
     if (keys.length > 0) {
       await redis.del(...keys);
-      console.log(`Cleared ${keys.length} cache entries for report`);
     }
   } catch (error) {
     console.error("Error clearing cache:", error);
   }
 }
 
-/**
- * Get cache stats for monitoring
- */
 export async function getCacheStats(reportData: string) {
   try {
     const reportHash = generateReportHash(reportData);

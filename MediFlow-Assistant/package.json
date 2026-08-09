@@ -30,6 +30,7 @@
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.0",
     "dompurify": "^3.1.0",
+    "langsmith": "^0.8.8",
     "lucide-react": "^0.372.0",
     "markdown-it": "^14.1.0",
     "neo4j-driver": "^6.0.1",
