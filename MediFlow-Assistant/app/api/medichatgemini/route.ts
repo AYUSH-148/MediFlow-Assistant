@@ -9,8 +9,9 @@ import { redactUserQuestion, getVault, rehydrateText, queryNeo4jRelationships } 
 import { geminiModel } from "@/lib/gemini";
 import { Pinecone } from "@pinecone-database/pinecone";
 // import { Message, OpenAIStream, StreamData, StreamingTextResponse } from "ai";
-import { Message, StreamData, streamText, tool, formatStreamPart } from "ai";
+import { Message, StreamData, streamText, tool, formatStreamPart, type JSONValue } from "ai";
 import { z } from "zod";
+import { guardQuestion } from "@/lib/query-guard";
 
 // Allow streaming responses up to 30 seconds
 export const maxDuration = 60;
@@ -40,6 +41,54 @@ function createQueryKnowledgeGraphTool(documentId?: string) {
             return { entity, relationships };
         },
     });
+}
+
+// Emit a ready-made answer using the AI SDK data-stream protocol, so useChat (default
+// streamProtocol: "data") can parse it - the same framing the generation path produces
+// via toDataStreamResponse(). Returning raw text here means the client silently drops
+// the response.
+//
+// Shared by the cache-hit path and the query guard: both have their answer in hand and
+// nothing to stream from a model.
+function streamStaticAnswer(
+    text: string,
+    options: { annotation?: JSONValue; headers?: Record<string, string> } = {}
+): Response {
+    const encoder = new TextEncoder();
+
+    return new Response(
+        new ReadableStream({
+            start(controller) {
+                // Data annotation (code "2") - mirrors the generation path's data.append().
+                // Omitted for guard replies: there are no retrievals behind them, and the
+                // client pops open its "Relevant Info" accordion for any non-empty data.
+                if (options.annotation !== undefined) {
+                    controller.enqueue(
+                        encoder.encode(formatStreamPart("data", [options.annotation]))
+                    );
+                }
+                // Text part (code "0")
+                controller.enqueue(encoder.encode(formatStreamPart("text", text)));
+                // Finish message (code "d") so the client cleanly ends the turn
+                controller.enqueue(
+                    encoder.encode(
+                        formatStreamPart("finish_message", {
+                            finishReason: "stop",
+                            usage: { promptTokens: 0, completionTokens: 0 },
+                        })
+                    )
+                );
+                controller.close();
+            },
+        }),
+        {
+            headers: {
+                "Content-Type": "text/plain; charset=utf-8",
+                "X-Vercel-AI-Data-Stream": "v1",
+                ...options.headers,
+            },
+        }
+    );
 }
 
 function getMessageText(content: Message["content"]): string {
@@ -82,10 +131,50 @@ export async function POST(req: Request, res: Response) {
     console.log(`📝 Original: "${userQuestion}"`);
     console.log(`📝 Redacted: "${redactedQuestion}"`);
 
+    // Needed by the guard below, so it is built before anything else runs.
+    const recentConversationHistory = messages.length > 1
+        ? messages
+            .slice(-4)
+            .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${getMessageText(message.content)}`)
+            .join("\n")
+        : "No prior conversation history";
+
+    // ==================== QUERY GUARD ====================
+    // Deliberately ahead of the cache lookup, for two reasons.
+    //
+    // Refusals and clarifications return from here, which puts retrieval, the cache
+    // write and the memory write on an unreachable branch. Nothing downstream needs a
+    // flag threaded through it to suppress them - an off-topic question simply never
+    // gets that far.
+    //
+    // And the cache is keyed on question text alone, so a context-dependent follow-up
+    // like "is that bad?" was stored under a key that said nothing about what "that"
+    // referred to, then replayed for a later unrelated follow-up. Resolving the question
+    // to a standalone form FIRST makes the key self-describing, which fixes that
+    // collision without hashing conversation history into the key.
+    console.log("🧭 Routing question through the query guard...");
+    const guard = await guardQuestion({
+        question: redactedQuestion,
+        history: recentConversationHistory,
+        hasReport: !!reportData,
+    });
+    console.log(`🧭 intent=${guard.intent} resolved="${guard.resolvedQuestion}"`);
+
+    if (guard.intent !== "answer") {
+        return streamStaticAnswer(guard.reply, {
+            headers: { "X-Guard-Intent": guard.intent },
+        });
+    }
+
+    // Every downstream stage uses the resolved question rather than the raw one: the
+    // cache key, both retrieval queries, the prompt, and the stored memory. That is what
+    // stops "is that bad?" from being written to memory as a dangling pronoun.
+    const effectiveQuestion = guard.resolvedQuestion;
+
     // ==================== SEMANTIC CACHING ====================
-    // Step 1: Check if a similar question exists in cache (using redacted question)
+    // Step 1: Check if a similar question exists in cache (using resolved question)
     console.log("🔍 Checking semantic cache for similar questions...");
-    const cachedAnswer = await getCachedResponse(redactedQuestion, reportData, 0.95);
+    const cachedAnswer = await getCachedResponse(effectiveQuestion, reportData, 0.95);
 
     if (cachedAnswer) {
         // Cache HIT - return cached response (but re-hydrate it first)
@@ -95,61 +184,16 @@ export async function POST(req: Request, res: Response) {
         const vault = await getVault(vaultId);
         const rehydratedAnswer = vault ? rehydrateText(cachedAnswer, vault) : cachedAnswer;
 
-        // Emit using the AI SDK data-stream protocol so useChat (default
-        // streamProtocol: "data") can parse it — the same framing the
-        // cache-MISS path produces via toDataStreamResponse(). Returning raw
-        // text here means the client silently drops the response.
-        const encoder = new TextEncoder();
-        return new Response(
-            new ReadableStream({
-                start(controller) {
-                    // Data annotation (code "2") — mirrors the miss-path data.append()
-                    controller.enqueue(
-                        encoder.encode(
-                            formatStreamPart("data", [
-                                { retrievals: "[CACHED_RESPONSE]", cacheHit: true },
-                            ])
-                        )
-                    );
-                    // Text part (code "0")
-                    controller.enqueue(
-                        encoder.encode(formatStreamPart("text", rehydratedAnswer))
-                    );
-                    // Finish message (code "d") so the client cleanly ends the turn
-                    controller.enqueue(
-                        encoder.encode(
-                            formatStreamPart("finish_message", {
-                                finishReason: "stop",
-                                usage: { promptTokens: 0, completionTokens: 0 },
-                            })
-                        )
-                    );
-                    controller.close();
-                },
-            }),
-            {
-                headers: {
-                    "Content-Type": "text/plain; charset=utf-8",
-                    "X-Vercel-AI-Data-Stream": "v1",
-                    "X-Cache": "HIT",
-                },
-            }
-        );
+        return streamStaticAnswer(rehydratedAnswer, {
+            annotation: { retrievals: "[CACHED_RESPONSE]", cacheHit: true },
+            headers: { "X-Cache": "HIT" },
+        });
     }
 
     // Cache MISS - run normal flow
     console.log("❌ Cache MISS. Running full inference pipeline...");
     const data = new StreamData();
-    const query = `Represent this for searching relevant passages: patient medical report says: \n${reportData}. \n\n${redactedQuestion}`;
-
-    // Moved above the retrievals because the conversation-history query is built from
-    // it, and both retrievals now start at the same time.
-    const recentConversationHistory = messages.length > 1
-        ? messages
-            .slice(-4)
-            .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${getMessageText(message.content)}`)
-            .join("\n")
-        : "No prior conversation history";
+    const query = `Represent this for searching relevant passages: patient medical report says: \n${reportData}. \n\n${effectiveQuestion}`;
 
     // The conversation-history search is skipped unless this document actually has
     // stored memory to find. It used to run unconditionally, and in two common cases it
@@ -187,7 +231,7 @@ export async function POST(req: Request, res: Response) {
                 pinecone,
                 'medic',
                 "conversation-history",
-                `Find relevant prior conversation context for this follow-up question.\n\nCurrent question: ${redactedQuestion}\n\nRecent chat history:\n${recentConversationHistory}`,
+                `Find relevant prior conversation context for this follow-up question.\n\nCurrent question: ${effectiveQuestion}\n\nRecent chat history:\n${recentConversationHistory}`,
                 reportFilter
             )
             : Promise.resolve("<nomatches>"),
@@ -199,10 +243,12 @@ export async function POST(req: Request, res: Response) {
   Before answering you may enrich your knowledge by going through the provided clinical findings.
   The clinical findings are generic insights and not part of the patient's medical report. Do not include any clinical finding if it is not relevant for the patient's case.
 
+  \n\n**Today's date:** ${new Date().toISOString().slice(0, 10)}
+
   \n\n**Patient's Clinical report summary:** \n${reportData}.
   \n**end of patient's clinical report**
 
-  \n\n**User Query:**\n${redactedQuestion}?
+  \n\n**User Query:**\n${effectiveQuestion}
   \n**end of user query**
 
   \n\n**Generic Clinical findings:**
@@ -242,7 +288,7 @@ export async function POST(req: Request, res: Response) {
             data.close();
             // Cache the response after generation completes (cache redacted version, no tool-call noise)
             if (event.text) {
-                cacheResponse(redactedQuestion, event.text, reportData);
+                cacheResponse(effectiveQuestion, event.text, reportData);
             }
         }
     });
@@ -279,12 +325,15 @@ export async function POST(req: Request, res: Response) {
                     const cleanAnswerText = await result.text;
 
                     if (vaultId && cleanAnswerText) {
-                        const memoryText = `User question: ${redactedQuestion}\nAssistant answer: ${cleanAnswerText}`;
+                        // The resolved question, not the raw one: storing "is that bad?"
+                        // preserved the pronoun but lost its referent forever, leaving a
+                        // dangling reference to resurface in a later prompt.
+                        const memoryText = `User question: ${effectiveQuestion}\nAssistant answer: ${cleanAnswerText}`;
                         await upsertConversationMemory(
                             pinecone,
                             "medic",
                             {
-                                id: generateDocumentId(`${vaultId}:${redactedQuestion}:${cleanAnswerText}`),
+                                id: generateDocumentId(`${vaultId}:${effectiveQuestion}:${cleanAnswerText}`),
                                 documentId: vaultId,
                                 text: memoryText,
                             }
