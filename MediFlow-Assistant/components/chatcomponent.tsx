@@ -52,9 +52,12 @@ const ChatComponent = ({ reportData, onOpenReport }: Props) => {
             <MessageCircle className="h-8 w-8" />
             <p className="text-sm font-medium">Start the conversation</p>
             <p className="max-w-xs text-xs">
+              {/* Kept in step with the query guard, which turns away anything that is not
+                  health-related. Promising "anything else on your mind" here would set up
+                  a refusal the user was invited into. */}
               {reportData
-                ? "Ask a question about the uploaded report, or anything else on your mind."
-                : "Upload a medical report for tailored, private answers — or just ask a general question below."}
+                ? "Ask a question about the uploaded report — a medication, a biomarker, or what a result means."
+                : "Upload a medical report for tailored, private answers — or ask a general medical question below."}
             </p>
             {!reportData && (
               // Prominent CTA so mobile users know a report can be added; hidden on md+

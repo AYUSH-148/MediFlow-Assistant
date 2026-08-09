@@ -13,8 +13,9 @@ import {
     findVaultTokens,
 } from "@/lib/pii-redaction";
 import { geminiModel, GEMINI_MODEL_ID } from "@/lib/gemini";
-import { Message, StreamData, streamText, tool, formatStreamPart } from "ai";
+import { Message, StreamData, streamText, tool, formatStreamPart, type JSONValue } from "ai";
 import { z } from "zod";
+import { guardQuestion } from "@/lib/query-guard";
 import {
     span,
     setSpanMetadata,
@@ -29,6 +30,54 @@ import {
 } from "@/lib/tracing";
 
 export const maxDuration = 60;
+
+// Emit a ready-made answer in the AI SDK data-stream protocol so useChat (default
+// streamProtocol: "data") can parse it - the same framing toDataStreamResponse()
+// produces on the generation path. Returning raw text here makes the client silently
+// drop the response.
+//
+// Shared by the cache-hit path and the query guard: both have their answer in hand and
+// nothing to stream from a model.
+function streamStaticAnswer(
+    text: string,
+    options: { annotation?: JSONValue; headers?: Record<string, string> } = {}
+): Response {
+    const encoder = new TextEncoder();
+
+    return new Response(
+        new ReadableStream({
+            start(controller) {
+                // Data annotation (code "2"). Omitted for guard replies: there are no
+                // retrievals behind them, and the client opens its "Relevant Info"
+                // accordion for any non-empty data.
+                if (options.annotation !== undefined) {
+                    controller.enqueue(
+                        encoder.encode(formatStreamPart("data", [options.annotation]))
+                    );
+                }
+                // Text part (code "0")
+                controller.enqueue(encoder.encode(formatStreamPart("text", text)));
+                // Finish message (code "d") so the client cleanly ends the turn
+                controller.enqueue(
+                    encoder.encode(
+                        formatStreamPart("finish_message", {
+                            finishReason: "stop",
+                            usage: { promptTokens: 0, completionTokens: 0 },
+                        })
+                    )
+                );
+                controller.close();
+            },
+        }),
+        {
+            headers: {
+                "Content-Type": "text/plain; charset=utf-8",
+                "X-Vercel-AI-Data-Stream": "v1",
+                ...options.headers,
+            },
+        }
+    );
+}
 
 // Built per request so vault-token lookups (e.g. "[NAME_1]") can be scoped to this
 // document's vaultId. The model decides when to call it, mid-generation, rather than
@@ -219,7 +268,51 @@ async function handleChat({
         }
     );
 
-    const cachedAnswer = await getCachedResponse(redactedQuestion, reportData, 0.95);
+    // Needed by the guard below, so it is built before anything else runs.
+    const recentConversationHistory = messages.length > 1
+        ? messages
+            .slice(-4)
+            .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${getMessageText(message.content)}`)
+            .join("\n")
+        : "No prior conversation history";
+
+    // Deliberately ahead of the cache lookup, for two reasons.
+    //
+    // Refusals and clarifications return from here, which puts retrieval, the cache write
+    // and the memory write on an unreachable branch. Nothing downstream needs a flag
+    // threaded through it to suppress them - an off-topic question never gets that far.
+    //
+    // And the cache keys on question text alone, so a context-dependent follow-up like
+    // "is that bad?" was stored under a key that said nothing about what "that" referred
+    // to, then replayed for a later unrelated follow-up. Resolving the question to a
+    // standalone form FIRST makes the key self-describing, fixing that collision without
+    // hashing conversation history into the key.
+    const guard = await guardQuestion({
+        question: redactedQuestion,
+        history: recentConversationHistory,
+        hasReport: !!reportData,
+    });
+
+    if (guard.intent !== "answer") {
+        // Like the cache-hit path, this completes before the Response is returned, so the
+        // root span closes and flushes here rather than in the stream callback.
+        root?.setMetadata({ outcome: guard.intent, cacheHit: false, guardShortCircuit: true });
+        await root?.succeed(
+            phiGated({ reply: guard.reply }, { intent: guard.intent, ...textShape("reply", guard.reply) })
+        );
+        await flushTraces();
+
+        return streamStaticAnswer(guard.reply, {
+            headers: { "X-Guard-Intent": guard.intent },
+        });
+    }
+
+    // Every downstream stage uses the resolved question rather than the raw one: the cache
+    // key, both retrieval queries, the prompt, and the stored memory. That is what stops
+    // "is that bad?" being written to memory as a dangling pronoun.
+    const effectiveQuestion = guard.resolvedQuestion;
+
+    const cachedAnswer = await getCachedResponse(effectiveQuestion, reportData, 0.95);
 
     if (cachedAnswer) {
         const vault = await getVault(vaultId);
@@ -264,54 +357,15 @@ async function handleChat({
         );
         await flushTraces();
 
-        // Emitted in the AI SDK data-stream protocol so useChat (default streamProtocol:
-        // "data") can parse it - the same framing toDataStreamResponse() produces on the
-        // miss path. Returning raw text here makes the client silently drop the response.
-        const encoder = new TextEncoder();
-        return new Response(
-            new ReadableStream({
-                start(controller) {
-                    controller.enqueue(
-                        encoder.encode(
-                            formatStreamPart("data", [
-                                { retrievals: "[CACHED_RESPONSE]", cacheHit: true },
-                            ])
-                        )
-                    );
-                    controller.enqueue(
-                        encoder.encode(formatStreamPart("text", rehydratedAnswer))
-                    );
-                    controller.enqueue(
-                        encoder.encode(
-                            formatStreamPart("finish_message", {
-                                finishReason: "stop",
-                                usage: { promptTokens: 0, completionTokens: 0 },
-                            })
-                        )
-                    );
-                    controller.close();
-                },
-            }),
-            {
-                headers: {
-                    "Content-Type": "text/plain; charset=utf-8",
-                    "X-Vercel-AI-Data-Stream": "v1",
-                    "X-Cache": "HIT",
-                },
-            }
-        );
+        return streamStaticAnswer(rehydratedAnswer, {
+            annotation: { retrievals: "[CACHED_RESPONSE]", cacheHit: true },
+            headers: { "X-Cache": "HIT" },
+        });
     }
 
     root?.setMetadata({ cacheHit: false });
     const data = new StreamData();
-    const query = `Represent this for searching relevant passages: patient medical report says: \n${reportData}. \n\n${redactedQuestion}`;
-
-    const recentConversationHistory = messages.length > 1
-        ? messages
-            .slice(-4)
-            .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${getMessageText(message.content)}`)
-            .join("\n")
-        : "No prior conversation history";
+    const query = `Represent this for searching relevant passages: patient medical report says: \n${reportData}. \n\n${effectiveQuestion}`;
 
     // The conversation-history search is skipped unless this document actually has stored
     // memory to find, since it costs a HuggingFace embedding plus a topK 12 query and a
@@ -342,7 +396,7 @@ async function handleChat({
                 pinecone,
                 'medic',
                 "conversation-history",
-                `Find relevant prior conversation context for this follow-up question.\n\nCurrent question: ${redactedQuestion}\n\nRecent chat history:\n${recentConversationHistory}`,
+                `Find relevant prior conversation context for this follow-up question.\n\nCurrent question: ${effectiveQuestion}\n\nRecent chat history:\n${recentConversationHistory}`,
                 reportFilter
             )
             : Promise.resolve("<nomatches>"),
@@ -357,10 +411,12 @@ async function handleChat({
   Before answering you may enrich your knowledge by going through the provided clinical findings.
   The clinical findings are generic insights and not part of the patient's medical report. Do not include any clinical finding if it is not relevant for the patient's case.
 
+  \n\n**Today's date:** ${new Date().toISOString().slice(0, 10)}
+
   \n\n**Patient's Clinical report summary:** \n${reportData}.
   \n**end of patient's clinical report**
 
-  \n\n**User Query:**\n${redactedQuestion}?
+  \n\n**User Query:**\n${effectiveQuestion}
   \n**end of user query**
 
   \n\n**Generic Clinical findings:**
@@ -445,7 +501,7 @@ async function handleChat({
                 data.close();
                 // Cache the redacted text, without tool-call noise.
                 if (event.text) {
-                    cacheResponse(redactedQuestion, event.text, reportData);
+                    cacheResponse(effectiveQuestion, event.text, reportData);
                 }
             }
         });
@@ -501,12 +557,15 @@ async function handleChat({
                         );
 
                         if (vaultId && cleanAnswerText) {
-                            const memoryText = `User question: ${redactedQuestion}\nAssistant answer: ${cleanAnswerText}`;
+                            // The resolved question, not the raw one: storing "is that bad?"
+                            // preserved the pronoun but lost its referent forever, leaving a
+                            // dangling reference to resurface in a later prompt.
+                            const memoryText = `User question: ${effectiveQuestion}\nAssistant answer: ${cleanAnswerText}`;
                             const memoryResult = await upsertConversationMemory(
                                 pinecone,
                                 "medic",
                                 {
-                                    id: generateDocumentId(`${vaultId}:${redactedQuestion}:${cleanAnswerText}`),
+                                    id: generateDocumentId(`${vaultId}:${effectiveQuestion}:${cleanAnswerText}`),
                                     documentId: vaultId,
                                     text: memoryText,
                                 }
