@@ -14,7 +14,6 @@ import Link from "next/link";
 import { ModeToggle } from "@/components/modetoggle";
 import { useState } from "react";
 import ReportComponent from "@/components/ReportComponent";
-// import { toast } from "sonner";
 import { useToast } from "@/components/ui/use-toast"
 import ChatComponent from "@/components/chatcomponent";
 
@@ -25,7 +24,7 @@ const Home = () => {
   const [reportDrawerOpen, setReportDrawerOpen] = useState(false);
   const onReportConfirmation = (data: { redactedSummary: string; vaultId: string }) => {
     setreportData(data);
-    setReportDrawerOpen(false); // close the mobile drawer once a report is confirmed
+    setReportDrawerOpen(false);
     toast({
       description: "Report processed with PII protection!"
     });
@@ -84,7 +83,6 @@ const Home = () => {
             className="hidden md:flex flex-col min-h-0 overflow-y-auto"
           >
             <ReportComponent onReportConfirmation={onReportConfirmation} />
-            {/* <SideComponent onReportConfirmation={onReportConfirmation} /> */}
           </div>
           <div
             className="lg:col-span-2 min-h-0"
