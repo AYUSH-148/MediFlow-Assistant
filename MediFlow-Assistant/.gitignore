@@ -37,3 +37,9 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# eval harness run artifacts. The fixtures and gold sets are committed; what a given
+# run produced is not - the manifest describes one Pinecone namespace on one machine,
+# and the results are a log, not a source of truth.
+/eval/.corpus.json
+/eval/results/
