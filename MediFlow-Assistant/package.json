@@ -6,7 +6,12 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "eval:build": "tsx eval/build.ts",
+    "eval": "tsx eval/run.ts",
+    "eval:retrieval": "tsx eval/run.ts retrieval",
+    "eval:guard": "tsx eval/run.ts guard",
+    "eval:cache": "tsx eval/run.ts cache"
   },
   "dependencies": {
     "@ai-sdk/google": "^0.0.55",
@@ -56,6 +61,7 @@
     "eslint-config-next": "14.2.2",
     "postcss": "^8",
     "tailwindcss": "^3.4.1",
+    "tsx": "^4.23.12",
     "typescript": "^5"
   }
 }

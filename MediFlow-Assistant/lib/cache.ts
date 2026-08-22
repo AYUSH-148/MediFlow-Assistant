@@ -7,7 +7,10 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN!,
 });
 
-function cosineSimilarity(vecA: number[], vecB: number[]): number {
+// Exported for the eval harness, which sweeps candidate similarity thresholds over a
+// labelled set of question pairs. Recomputing cosine there would risk measuring a
+// slightly different function than the one the cache actually gates on.
+export function cosineSimilarity(vecA: number[], vecB: number[]): number {
   let dotProduct = 0;
   let normA = 0;
   let normB = 0;
