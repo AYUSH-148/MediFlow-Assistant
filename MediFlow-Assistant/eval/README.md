@@ -90,6 +90,14 @@ Two named failure directions: **off-topic leaked through** (the original bug —
 question answered from general knowledge, cached 24h, and written into long-term memory)
 and **in-scope over-refused** (how the guard becomes useless).
 
+A third direction sits inside `clarify`, and it produced a real user-facing bug: asking to
+clarify something that was never unclear. The guard is handed the report summary, so it can
+tell a broad question from an ambiguous one — with only a boolean, "what is the problem with
+the patient?" routed to `clarify`, and since the answer to every follow-up also lived in the
+report it could not see, the loop had no exit at temperature 0. The `answer-broad-*` cases
+cover breadth in both first and third person, and `answer-escapes-clarify-loop` checks that
+answering a clarifier makes progress.
+
 Rewriting is scored separately. A follow-up like "is that bad?" routed to `answer` but
 passed through verbatim still poisons the cache key, and intent accuracy alone would call
 that a pass. The suite checks that context-dependent questions get rewritten *and* that
@@ -131,13 +139,18 @@ Read these before quoting any number from a run.
    and neither is here.
 
 2. **The guard and the grader fail open by design.** On a Gemini error `guardQuestion`
-   returns `answer` and `gradeRetrieval` passes chunks through ungraded. The guard's
-   fail-open is indistinguishable from a genuine `answer` verdict, so a transient API
-   failure shows up as a misclassification and quietly understates guard accuracy. The
-   grader's is visible — that is what the `ungraded` count is for, and a non-zero value
-   means some grading figures reflect an unavailable API rather than a judgement.
+   returns `answer` and `gradeRetrieval` passes chunks through ungraded. Both are now
+   visible in the results: `guardFailed` per guard case and the `ungraded` count for the
+   grader, and a non-zero value on either means some figures reflect an unavailable API
+   rather than a judgement.
 
-3. **Sample sizes are small** — 61 retrieval cases, 26 guard cases, 20 cache pairs. Enough
+   The guard suite reports outages before its metrics and voids them, because a fully
+   failed run is not merely noisy — it is indistinguishable on paper from a permissive
+   guard. A 2026-08-14 run scored 46.2% intent accuracy with all eight refuse cases
+   "leaking through" while every one of its 26 calls had in fact failed and been waved
+   through. Read the outage row first; if it is non-zero, nothing below it means anything.
+
+3. **Sample sizes are small** — 61 retrieval cases, 33 guard cases, 20 cache pairs. Enough
    to catch a broken stage or a regression between runs; not enough to tune a threshold on.
    The sweep reports the most permissive threshold with zero false hits as an observation
    about this gold set, not a recommendation.

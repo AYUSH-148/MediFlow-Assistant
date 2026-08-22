@@ -1,5 +1,6 @@
 import { guardQuestion } from "@/lib/query-guard";
 import { GUARD_CASES, type GuardCase } from "../dataset/guard";
+import { getReport } from "../fixtures/reports";
 import { EVAL_CONCURRENCY, mapWithConcurrency } from "../lib/concurrency";
 import {
   Confusion,
@@ -25,6 +26,15 @@ export interface GuardCaseResult {
   rewritten: boolean;
   resolvedQuestion: string;
   reply: string;
+  /**
+   * Whether the guard call failed and fell through to its fail-open "answer".
+   *
+   * Recorded per case because without it an outage is unreadable from the results file.
+   * A run where every call 429s produces 26 rows saying `actualIntent: "answer"`, an
+   * accuracy figure around chance, and a confusion matrix blaming the prompt - identical
+   * on paper to a guard that is up and far too permissive.
+   */
+  guardFailed: boolean;
   latencyMs: number;
 }
 
@@ -49,12 +59,21 @@ function formatHistory(history: GuardCase["history"]): string {
     .join("\n");
 }
 
+/**
+ * The summary the guard sees, matching what the chat route passes: the redacted
+ * extraction summary for the loaded report, or "" when none is loaded.
+ */
+function reportSummaryFor(testCase: GuardCase): string {
+  if (!testCase.hasReport) return "";
+  return getReport(testCase.reportId ?? "metabolic-workup").summary;
+}
+
 async function runCase(testCase: GuardCase): Promise<GuardCaseResult> {
   const start = performance.now();
   const guard = await guardQuestion({
     question: testCase.message,
     history: formatHistory(testCase.history),
-    hasReport: testCase.hasReport,
+    reportSummary: reportSummaryFor(testCase),
   });
   const latencyMs = performance.now() - start;
 
@@ -70,6 +89,7 @@ async function runCase(testCase: GuardCase): Promise<GuardCaseResult> {
     rewritten: guard.resolvedQuestion !== testCase.message,
     resolvedQuestion: guard.resolvedQuestion,
     reply: guard.reply,
+    guardFailed: guard.guardFailed,
     latencyMs,
   };
 }
@@ -82,12 +102,20 @@ export async function runGuardSuite(
   const cases = await mapWithConcurrency(GUARD_CASES, EVAL_CONCURRENCY, async (testCase, index) => {
     const result = await runCase(testCase);
     log(
-      `  [${String(index + 1).padStart(2)}/${GUARD_CASES.length}] ${testCase.id.padEnd(30)} ` +
+      `  [${String(index + 1).padStart(2)}/${GUARD_CASES.length}] ${testCase.id.padEnd(34)} ` +
         `${result.actualIntent}` +
-        `${result.actualIntent === result.expectedIntent ? "" : ` (expected ${result.expectedIntent})`}`
+        `${result.actualIntent === result.expectedIntent ? "" : ` (expected ${result.expectedIntent})`}` +
+        // Called out inline as well as in the report: watching a run scroll past is when
+        // an operator can still kill it, and an outage makes every later figure junk.
+        `${result.guardFailed ? "  << GUARD OUTAGE, not a decision" : ""}`
     );
     return result;
   });
+
+  // Counted before anything else is derived, because every figure below is conditional on
+  // it. A case that never reached a decision is not evidence about routing quality, and a
+  // fully failed run scores like a permissive guard rather than like a broken one.
+  const outages = cases.filter((r) => r.guardFailed);
 
   const confusion = new Confusion<Intent>(INTENTS);
   for (const result of cases) confusion.record(result.expectedIntent, result.actualIntent);
@@ -127,11 +155,34 @@ export async function runGuardSuite(
       `(${cases.filter((c) => c.expectedIntent === "answer").length} answer, ` +
       `${cases.filter((c) => c.expectedIntent === "clarify").length} clarify, ` +
       `${cases.filter((c) => c.expectedIntent === "refuse").length} refuse).`,
+    // Printed before the metrics rather than beside them. A reader who takes the accuracy
+    // figure at face value during an outage draws exactly the wrong conclusion - that the
+    // prompt needs tuning - and spends the next hour tuning a guard that never ran.
+    outages.length
+      ? "\n" +
+        [
+          `!! ${outages.length} of ${cases.length} guard calls FAILED and fell through to fail-open "answer".`,
+          "",
+          "   Treat every figure below as void. A failed call is recorded as `answer` with no",
+          "   reply and no rewrite, so outages inflate answer recall, drive clarify and refuse",
+          "   recall toward zero, and read as a guard with poor judgement rather than one that",
+          "   was never asked. The usual cause is rate limiting or an expired key.",
+          "",
+          `   Affected: ${outages.map((r) => r.id).join(", ")}`,
+        ].join("\n")
+      : "",
     "",
     subheading("Routing"),
     formatTable(
       ["metric", "value", "detail"],
       [
+        [
+          "guard outages (fail-open)",
+          String(outages.length),
+          outages.length
+            ? `${outages.length} call(s) never decided - metrics below are void`
+            : "none - every case reached a decision",
+        ],
         ["intent accuracy", pct(confusion.accuracy()), `${cases.length} cases`],
         [
           "off-topic leaked through",

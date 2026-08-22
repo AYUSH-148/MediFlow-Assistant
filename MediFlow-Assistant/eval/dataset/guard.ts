@@ -17,6 +17,17 @@ export interface GuardCase {
   message: string;
   history: Array<{ role: "user" | "assistant"; content: string }>;
   hasReport: boolean;
+  /**
+   * Which fixture's summary to hand the guard when `hasReport` is true.
+   *
+   * The guard receives the report summary rather than a boolean, so the suite has to
+   * supply real text. It defaults to `metabolic-workup`, whose summary carries the LDL
+   * 172 mg/dL, ALT/AST and hepatic steatosis findings that the histories below refer to.
+   * Cases whose history quotes haematology values name `hematology-workup` instead, so
+   * the summary and the history describe the same patient - a mismatch would test a
+   * contradiction the app cannot produce.
+   */
+  reportId?: string;
   expectedIntent: "answer" | "clarify" | "refuse";
   /** Only meaningful when expectedIntent is "answer". */
   expectRewrite?: boolean;
@@ -86,6 +97,77 @@ export const GUARD_CASES: readonly GuardCase[] = [
     expectRewrite: false,
   },
 
+  // ------------------------------------------------- in scope, broad rather than vague
+  //
+  // The class this suite was missing, and the reason a real clarify loop shipped. Every
+  // "answer" case above is narrow and names its own target ("my LDL cholesterol"), so
+  // nothing here established that a question with a broad answer is still a clear
+  // question. Given only `hasReport: true`, the guard read breadth as ambiguity and
+  // asked which patient was meant - then asked again for each answer offered, since none
+  // of them were resolvable either.
+  {
+    id: "answer-broad-problem-third-person",
+    message: "what is the problem with patient?",
+    history: [],
+    hasReport: true,
+    expectedIntent: "answer",
+    expectRewrite: false,
+    note: "Reported verbatim, typos and all. One report is in scope, so 'patient' has exactly one referent and nothing needs clarifying.",
+  },
+  {
+    id: "answer-broad-problem-first-person",
+    message: "what is the problem with me?",
+    history: [],
+    hasReport: true,
+    expectedIntent: "answer",
+    expectRewrite: false,
+    note: "The same question in the first person, which also clarified - so the trigger was breadth, not third-person phrasing.",
+  },
+  {
+    id: "answer-broad-summarise-diagnoses",
+    message: "summarise the patient's diagnoses",
+    history: [],
+    hasReport: true,
+    expectedIntent: "answer",
+    expectRewrite: false,
+  },
+  {
+    id: "answer-broad-results-okay",
+    message: "are my results okay?",
+    history: [],
+    hasReport: true,
+    expectedIntent: "answer",
+    note: "Deliberately the same words as clarify-my-results, which expects clarify with no report. The report's presence is the whole difference.",
+  },
+  {
+    id: "answer-broad-anything-serious",
+    message: "is there anything serious in my report?",
+    history: [],
+    hasReport: true,
+    expectedIntent: "answer",
+    expectRewrite: false,
+  },
+  {
+    id: "answer-report-third-person-reference",
+    message: "what does the report say about cholesterol?",
+    history: [],
+    hasReport: true,
+    expectedIntent: "answer",
+    expectRewrite: false,
+    note: "'The report' rather than 'my report'. With one report loaded the phrase is not ambiguous and must not draw a 'which report?'.",
+  },
+  {
+    id: "answer-escapes-clarify-loop",
+    message: "the patient in the report",
+    history: [
+      { role: "user", content: "what is the problem with patient?" },
+      { role: "assistant", content: "Which patient are you asking about?" },
+    ],
+    hasReport: true,
+    expectedIntent: "answer",
+    note: "Turn two of the reported loop. Answering a clarifier must make progress; asking again is the failure, and it repeated indefinitely because temperature is pinned to 0.",
+  },
+
   // ------------------------------------------- in scope, resolvable only from history
   {
     id: "rewrite-is-that-bad",
@@ -123,6 +205,7 @@ export const GUARD_CASES: readonly GuardCase[] = [
       },
     ],
     hasReport: true,
+    reportId: "hematology-workup",
     expectedIntent: "answer",
     expectRewrite: true,
   },
@@ -139,6 +222,7 @@ export const GUARD_CASES: readonly GuardCase[] = [
       },
     ],
     hasReport: true,
+    reportId: "hematology-workup",
     expectedIntent: "answer",
     expectRewrite: true,
   },

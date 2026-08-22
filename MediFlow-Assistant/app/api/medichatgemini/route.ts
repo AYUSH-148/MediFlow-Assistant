@@ -294,11 +294,19 @@ async function handleChat({
     // to, then replayed for a later unrelated follow-up. Resolving the question to a
     // standalone form FIRST makes the key self-describing, fixing that collision without
     // hashing conversation history into the key.
+    // The summary itself goes in, not `!!reportData`. A boolean cannot distinguish an
+    // ambiguous question from a broad one, which is how "what is the problem with the
+    // patient?" ended up in a clarify loop with the answer sitting in this very variable.
     const guard = await guardQuestion({
         question: redactedQuestion,
         history: recentConversationHistory,
-        hasReport: !!reportData,
+        reportSummary: reportData,
     });
+
+    // Recorded on the root span, not just the guard's own, because a fail-open outage
+    // returns "answer" and is otherwise invisible from the top of the trace - the turn
+    // simply looks like an ordinary unguarded one.
+    root?.setMetadata({ guardIntent: guard.intent, guardFailed: guard.guardFailed });
 
     if (guard.intent !== "answer") {
         // Like the cache-hit path, this completes before the Response is returned, so the
