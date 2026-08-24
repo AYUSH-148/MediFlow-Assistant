@@ -4,6 +4,7 @@ import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { redactDocument, redactTriples, storeVault, storeTriplesInNeo4j, getVault } from "@/lib/pii-redaction";
 import { geminiModel, GEMINI_MODEL_ID } from "@/lib/gemini";
 import { generateEmbeddings } from "@/lib/embeddings";
+import { describePdfFigures, NO_FIGURES, type FigureExtraction } from "@/lib/pdf-figures";
 import { generateDocumentId, upsertVectors, pinecone } from "@/utils";
 import {
   span,
@@ -384,6 +385,9 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
   let fullText: string;
   let summary: string;
   let triples: Triple[];
+  let figures: FigureExtraction = NO_FIGURES;
+  // The document's own text, before any figure description is appended - see documentId.
+  let identityText: string | null = null;
 
   try {
     if (mimeType === "application/pdf") {
@@ -392,6 +396,16 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
         setSpanMetadata({ extractionPath: "pdf-text-layer" });
         fullText = textLayer;
         ({ summary, triples } = await analyzeText(fullText));
+
+        // Deliberately after analyzeText, so the summary and the graph triples are derived
+        // from the report's own words only. A figure description is the model's reading of
+        // a picture; promoting it into the summary that every prompt carries, or into the
+        // graph as an asserted relationship, would let inference travel as fact. The
+        // descriptions still reach the index below, which is what makes a question about a
+        // chart answerable at all.
+        figures = await describePdfFigures(buffer);
+        identityText = fullText;
+        fullText += figures.text;
       } else {
         setSpanMetadata({ extractionPath: "pdf-ocr-fallback" });
         ({ fullText, summary, triples } = await transcribeAndAnalyze(mimeType, buffer));
@@ -472,7 +486,11 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
   // vaultId, the second upload's vault would overwrite the first's and the first
   // patient's next answer would rehydrate with the second patient's name. Hashing the
   // raw text keeps dedup meaning what it should: the same bytes uploaded twice.
-  const documentId = generateDocumentId(fullText);
+  //
+  // Figure descriptions are excluded for a further reason: they are model output, so the
+  // same file uploaded twice can produce differently worded text. Hashing that would give
+  // one document two ids, defeating the dedup this is here to provide.
+  const documentId = generateDocumentId(identityText ?? fullText);
 
   let chunkCount = 0;
   let vectorStoreFailed = false;
@@ -624,6 +642,11 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
     piiCount,
     triplesStored: triples ? triples.length : 0,
     chunkCount,
+    // Reported rather than left to the trace: a figure the pipeline saw and could not read
+    // is exactly the kind of thing this codebase has silently swallowed before.
+    figuresDescribed: figures.described,
+    figuresSkipped: figures.skipped,
+    figuresFailed: figures.failed,
     duplicate: !!existingVault,
     vectorStoreFailed,
     graphStoreFailed,
@@ -640,6 +663,9 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
     vaultId: documentId,
     piiCount,
     chunkCount,
+    figuresDescribed: figures.described,
+    figuresSkipped: figures.skipped,
+    figuresFailed: figures.failed,
     triplesStored: triples ? triples.length : 0,
     vectorStoreFailed,
     graphStoreFailed,
