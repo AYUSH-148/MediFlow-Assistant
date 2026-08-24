@@ -96,6 +96,35 @@ Redaction runs over the **entire document** before chunking, not just the summar
 - The vault lives in Redis with a 24-hour TTL and is **never** sent to the trace backend; shipping it alongside the redacted text would hand over both the ciphertext and the key.
 - Rehydration is verified: the pipeline counts tokens that survive, including ones split across streaming chunk boundaries, and records that as an alertable metric.
 
+### ✂️ Chunking that keeps its headings
+
+`RecursiveCharacterTextSplitter` cuts on blank lines, then newlines, then spaces. It has no
+idea a clinical report is mostly tables, so a cut lands wherever the character budget runs
+out — and the rows after it are separated from the header row naming their columns.
+
+A chunk in that state is worse than useless as evidence. Retrieved alone,
+`172 mg/dL   < 100   HIGH` does not say which analyte it belongs to, or which number is the
+result and which the reference. The generator infers column meaning from position, and it
+will — sometimes wrongly, always confidently.
+
+The 150-character overlap was the existing mitigation, and it is probabilistic: it carries
+the header across only when the cut happens to fall within 150 characters of it. On a table
+long enough to span several chunks it stops helping. Measured on a synthetic 40-row panel,
+**2 of 4 chunks held rows with no header among them; after the fix, none do.**
+
+Each chunk is now prefixed with the headings in force where it starts — its section, and the
+column header of the table it sits inside — unless it already contains them. `chunksGivenContext`
+is recorded so the prefixing is measurable rather than assumed.
+
+This is deliberately independent of how the table was drawn. `pdf-parse` also exposes
+`getTable()`, but that detects tables through their **border geometry**: on a ruled table it
+returns structured rows, and on a whitespace-aligned one — how most lab reports are laid out
+— it finds nothing at all. Verified both ways before choosing this approach.
+
+The prefix helps beyond tables: a chunk lifted out of `SECTION 4 - LIVER` now says so, both
+to the model reading it as evidence and to the embedding that has to match a question about
+the liver.
+
 ### 🔎 Hybrid retrieval + RRF
 
 Semantic search alone misses exact clinical terms; keyword search alone misses paraphrase. Both arms run over the **same document-filtered corpus** and are fused:
