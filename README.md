@@ -106,6 +106,16 @@ Semantic search alone misses exact clinical terms; keyword search alone misses p
 
 Both arms reuse a **single embedding call** — the query vector is computed once and passed into the keyword corpus fetch rather than recomputed.
 
+**The query is the question alone**, behind the instruction prefix `mxbai` expects for retrieval queries (it is an asymmetric model — queries take a prefix, documents do not). The whole report summary used to be prepended to it, which cost three things at once:
+
+| Cost | Why |
+|---|---|
+| Cosine similarity was meaningless as a relevance signal | The query vector was dominated by the report, so every chunk scored high on report-to-report similarity whatever was asked |
+| The sparse arm scored against the report, not the question | `rankWithTfIdf` tokenises the same string, so every word of the summary became a query term — 33 terms instead of 14 on a representative question |
+| A long report silently deleted the question | The summary sat *ahead* of the question in a string with a 512-token ceiling. A multi-page summary pushed the question past it, and the question is what got cut |
+
+Prepending it was a way to give a context-free follow-up (*"is that bad?"*) something to match on. The query guard now rewrites such questions to stand alone **before** retrieval runs, so the context is already in the question and the prepend was redundant. Truncation is also now applied in `generateEmbedding` and **recorded** rather than left to the model, so a query that lost its tail is visible instead of looking like retrieval that merely performed badly.
+
 ### 🧭 The query guard — scope and ambiguity, before anything expensive
 
 Nothing in a RAG pipeline naturally refuses. Ask *"what is the capital of India"* and the old flow ran full retrieval, answered from the model's general knowledge, cached the answer for 24 hours, and — with a report loaded — wrote it into long-term conversation memory as clinical history.
@@ -144,7 +154,7 @@ A grading pass now judges the chunks **against the question** and returns a verd
 There is deliberately **no cheap numeric pre-filter**, because neither available score measures relevance to the question:
 
 - The **RRF score** is `1/(60+rank)` summed across arms — pure rank position. The top result of a completely irrelevant corpus scores exactly as well as the top result of a perfect one.
-- The **vector similarity** is measured against a query that has the entire report prepended, so report chunks score high on report-to-report similarity no matter what was asked.
+- The **vector similarity** is now measured against the question alone, so it *has* become a meaningful signal — but it is still not used as a gate. Retrieval **ranks**; it does not threshold. The cutoff separating "relevant" from "the closest thing in this document" is not a constant, and a wrong one fails silently in the direction that matters: dropping evidence the report does contain.
 
 Grading against the bare question is the one comparison the retrieval pipeline never makes. Empty retrievals still short-circuit without a model call, and surviving chunks are renumbered contiguously — a prompt listing "Finding 1, 4, 7" invites the model to wonder what it is not being shown.
 
@@ -155,6 +165,22 @@ Both non-relevant instructions send the model back to the report summary before 
 Extracted `(subject, predicate, object)` triples land in Neo4j. Rather than prefetching graph context for a fixed entity list on every request, the model gets a `queryKnowledgeGraph` tool and decides when to reach for it — following chains across up to 5 steps (e.g. *drug → interacting drug → contraindication*).
 
 The subtle part is **scoping the neighbour, not just the queried node**. Generic entities like `Atorvastatin` are deliberately unscoped so knowledge is shared across documents — which means traversing out of one would return the `[NAME_n]` nodes of every patient ever prescribed it. The chat route then rehydrates through the *current* document's vault, resolving another patient's token to this patient's name. The model would confidently state a relationship belonging to someone else, and nothing about the output would look wrong. A neighbour is therefore admitted only when it is genuinely generic or explicitly scoped to this document.
+
+### 🚨 Failing visibly on the generation path
+
+The guard fails open and the cache degrades quietly, but generation had no equivalent. A
+`streamText` rejection - quota, auth, a network blip - was re-thrown, so Next returned a
+bare 500 with no body. On the client that was worse than it sounds: `useChat` throws
+`new Error(await response.text())` on a non-ok response, so an empty body meant an empty
+message, and `keepLastMessageOnError` defaults to `false` in this version of the SDK, so
+the same failure **rolled the user's own question back out of the transcript**. The
+question disappeared with nothing on screen to explain it.
+
+The route now returns a status and a plain-text reason - 429 for rate limiting, 502 for an
+upstream fault, 500 otherwise - which `useChat` surfaces as `error.message`. Only the
+status is read from the provider's error, never its message: it can quote the prompt back,
+and on this route the prompt contains report text. The client keeps the failed message,
+renders the reason, and offers a retry.
 
 ### ⚡ Semantic caching
 
@@ -362,6 +388,8 @@ MediFlow-Assistant/
 - Redaction is **rule-based**, so a name written in free prose (`"my name is Rahul, is my LDL high?"`) has no label to anchor on and survives. This is why nothing downstream treats post-redaction text as safe by default.
 - The query guard and the retrieval grader are **model judgment, not deterministic rules**. Both can misclassify — a legitimate question refused, or irrelevant chunks kept — and both deliberately fail open, so an outage degrades to the older, less careful behaviour rather than blocking the chat. Their spans record `intent`, `verdict` and `ungraded` precisely so drift is measurable rather than anecdotal.
 - Answering a question now costs **three sequential Gemini calls** rather than one. Refusals and clarifications short-circuit before retrieval and grading, so the cheap paths stayed cheap, but the common case pays roughly two extra Flash round trips for the grounding.
+- An indexing failure still returns a usable summary rather than failing the upload, but the response now says so (`searchable: false`) and the UI stops reporting success. Before that, a Pinecone or HuggingFace outage produced "Report processed!" for a document the chat could not search, and every question about it was answered "this is not in your report".
+- A guard outage and a quota failure look the same from the user's chair, though they are distinguishable in a trace: the root span records `guardIntent` and `guardFailed`, and a generation failure closes with `outcome: "error"`.
 - Gemini safety filters are disabled — clinical prompts about dosages and treatments get blocked at default thresholds, and a blocked generation returns empty text rather than an error. Report contents are injected verbatim, so uploaded documents should be treated as untrusted input.
 - Uploads are capped at **4MB** and held in request memory for the lifetime of the request, so a large report is rejected rather than queued. Raising that ceiling means uploading to object storage instead — which for this pipeline would mean a durable copy of the *unredacted* document living outside the request, so it is deliberately not done: today the raw file is never persisted anywhere.
 - If a vault expires before its cached answers do, those answers come back with `[NAME_1]` placeholders intact. The pipeline detects and reports this rather than hiding it.

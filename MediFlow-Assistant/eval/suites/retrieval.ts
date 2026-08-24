@@ -1,4 +1,5 @@
 import { queryPineconeVectorStoreDetailed, pinecone } from "@/utils";
+import { buildRetrievalQuery } from "@/lib/embeddings";
 import { gradeRetrieval } from "@/lib/retrieval-grader";
 import { EVAL_INDEX, EVAL_NAMESPACE, findIngested, loadCorpus } from "../lib/corpus";
 import { getReport } from "../fixtures/reports";
@@ -57,18 +58,6 @@ export interface RetrievalSuiteResult {
   report: string;
 }
 
-/**
- * Rebuilds the retrieval query exactly as app/api/medichatgemini/route.ts does.
- *
- * The whole report summary is prepended to the question. That is the production
- * behaviour and it is also the reason the grader exists - it makes every chunk of the
- * report score highly on report-to-report similarity regardless of what was asked - so
- * measuring against the bare question would flatter retrieval and mean nothing.
- */
-function buildRetrievalQuery(summary: string, question: string): string {
-  return `Represent this for searching relevant passages: patient medical report says: \n${summary}. \n\n${question}`;
-}
-
 async function runCase(
   testCase: RetrievalCase,
   manifest: ReturnType<typeof loadCorpus>,
@@ -76,7 +65,10 @@ async function runCase(
 ): Promise<RetrievalCaseResult> {
   const ingested = findIngested(manifest, testCase.reportId);
   const report = getReport(testCase.reportId);
-  const query = buildRetrievalQuery(ingested.redactedSummary, testCase.question);
+  // Imported rather than reimplemented: this suite previously kept its own copy of the
+  // query format, so a change on one side could silently measure a query production never
+  // sends.
+  const query = buildRetrievalQuery(testCase.question);
 
   // Retrieval throws on an embedding or Pinecone failure, so it is retried. Grading is
   // not: gradeRetrieval catches its own errors and fails open, which means a transient
