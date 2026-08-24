@@ -20,7 +20,16 @@ import {
     findVaultTokens,
 } from "@/lib/pii-redaction";
 import { geminiModel, GEMINI_MODEL_ID } from "@/lib/gemini";
-import { Message, StreamData, streamText, tool, formatStreamPart, type JSONValue } from "ai";
+import {
+    APICallError,
+    Message,
+    RetryError,
+    StreamData,
+    streamText,
+    tool,
+    formatStreamPart,
+    type JSONValue,
+} from "ai";
 import { z } from "zod";
 import { guardQuestion } from "@/lib/query-guard";
 import {
@@ -189,6 +198,66 @@ function getMessageText(content: Message["content"]): string {
     return "";
 }
 
+/**
+ * Turn a failed turn into a response the client can actually show.
+ *
+ * Re-throwing left Next to return a bare 500 with no body. useChat throws
+ * `new Error(await response.text())` on a non-ok response, so an empty body produced an
+ * empty error message - and with `keepLastMessageOnError` defaulting to false in this
+ * version of the SDK, the same failure rolled the user's own message back out of the
+ * transcript. The question vanished with nothing on screen to explain it.
+ *
+ * A status plus a plain-text body fixes both halves: the text becomes `error.message` for
+ * the client to render, and the status stays honest so a failure is still a failure to
+ * anything watching the route. The generation path now degrades visibly, the way the
+ * guard path already did.
+ */
+function generationErrorResponse(error: unknown): Response {
+    // Only the upstream status is read, never the provider's message: it can quote the
+    // prompt back, and on this route the prompt contains report text.
+    const upstreamStatus = APICallError.isInstance(error)
+        ? error.statusCode
+        : RetryError.isInstance(error) && APICallError.isInstance(error.lastError)
+          ? error.lastError.statusCode
+          : undefined;
+
+    // 401/403 is a deployment misconfiguration - not something the reader did or can fix -
+    // so it reads as a generic outage rather than as "unauthorized".
+    const { status, reason, message } =
+        upstreamStatus === 429
+            ? {
+                  status: 429,
+                  reason: "rate-limited",
+                  message:
+                      "The assistant is over its request limit right now. Your question is " +
+                      "still here - try again in a minute.",
+              }
+            : upstreamStatus !== undefined && upstreamStatus >= 500
+              ? {
+                    status: 502,
+                    reason: "upstream",
+                    message:
+                        "The model provider is having trouble right now. Your question is " +
+                        "still here - try sending it again.",
+                }
+              : {
+                    status: 500,
+                    reason: "internal",
+                    message:
+                        "Something went wrong answering that. Your question is still here - " +
+                        "try sending it again.",
+                };
+
+    return new Response(message, {
+        status,
+        headers: {
+            "Content-Type": "text/plain; charset=utf-8",
+            // Lets a network tab or an uptime check tell the three apart without parsing prose.
+            "X-Chat-Error": reason,
+        },
+    });
+}
+
 export async function POST(req: Request, res: Response) {
     const reqBody = await req.json();
 
@@ -229,10 +298,14 @@ export async function POST(req: Request, res: Response) {
     } catch (error) {
         // Each success path closes the root span itself, at a different point in the
         // request, so this only handles an unexpected throw.
+        //
+        // The trace keeps the real error; only the client-facing body is sanitised.
+        // Returning rather than re-throwing is what makes the failure visible at all.
+        console.error("Chat request failed:", error);
         root?.setMetadata({ outcome: "error" });
         await root?.fail(error);
         await flushTraces();
-        throw error;
+        return generationErrorResponse(error);
     }
 }
 
