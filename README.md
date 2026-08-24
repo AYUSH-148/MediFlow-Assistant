@@ -160,6 +160,49 @@ The subtle part is **scoping the neighbour, not just the queried node**. Generic
 
 Answers are cached in Redis keyed by report hash, matched by **cosine similarity ≥ 0.95** rather than by exact string. The match runs against the guard's **resolved** question, not the raw one — that is what stops two identical-looking follow-ups from colliding on one key. Cache hits are re-emitted in the AI SDK data-stream protocol so the client parses them identically to a live generation. `bestSimilarity` is recorded on misses too — otherwise a threshold that never fires is indistinguishable from a cold cache.
 
+### 🖼️ Figures in born-digital reports
+
+The text-layer path reads a page's words exactly and its pictures not at all - and it is
+chosen precisely **because** the PDF has text, so an ECG trace or an echo sitting in a
+text-bearing report was dropped with nothing recorded to say so. `charsPerPage` looks
+healthy either way.
+
+Three local, free steps decide whether a paid one is warranted:
+
+| Step | Cost | Purpose |
+|---|---|---|
+| `getImage()` | free, local | which pages carry an image, and how big |
+| size filter (≥150px per edge, ≥40k px²) | free | drop letterhead logos, signatures, rules |
+| `getScreenshot({ partial })` | free, local | render only the surviving pages |
+| one batched Gemini call | **the only paid step** | describe every figure page at once |
+
+A report with no figures never reaches the vision model at all. Whole pages are rendered
+rather than the extracted image bytes, because a chart stripped of its caption and axis
+labels is materially harder to read.
+
+**The text layer stays authoritative.** Figures are added to it, never substituted for it -
+routing a whole document to vision because a chart appeared would trade exact lab values for
+a model's re-reading of them, which is the regression the text-layer-first design exists to
+prevent. Descriptions are appended under an explicit `--- FIGURES (described from page
+images, not transcribed text) ---` heading, and that label travels into the chunks and the
+answer prompt: a described figure is the model's reading of a picture, and if it arrived
+looking like transcribed text neither the grader nor the generator could tell evidence from
+inference.
+
+Two ordering decisions carry the design:
+
+- Descriptions are appended **after** `analyzeText`, so the summary every prompt carries and
+  the graph triples stay derived from the report's own words. The descriptions still reach
+  the index, which is what makes a question about a chart answerable.
+- `documentId` hashes the text **before** the figure block. Descriptions are model output, so
+  the same file uploaded twice can produce differently worded text - hashing that would give
+  one document two ids and defeat the dedup it exists to provide.
+
+Failures degrade rather than block: detection or description throwing leaves the text-layer
+result intact, and `figuresDescribed`, `figuresSkipped` and `figuresFailed` are returned to
+the client as well as traced, so a figure the pipeline saw and could not read is reported
+rather than swallowed.
+
 ### 📄 Two extraction paths
 
 Born-digital PDFs are read via their text layer (`pdf-parse`), which is faster, cheaper, and lossless. A PDF whose text layer yields too little (< 100 chars, or < 20 chars/page) is treated as scanned and falls back to Gemini vision OCR — as are all image uploads. Both paths use **Gemini structured output** with a Zod schema, so a malformed response fails loudly as a 422 instead of silently becoming an empty summary.
