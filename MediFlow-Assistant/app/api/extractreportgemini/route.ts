@@ -355,6 +355,23 @@ export async function POST(req: Request) {
         recordOutputs: (response) => ({ status: response.status }),
       }
     );
+  } catch (error) {
+    // Without this the throw became a bare 500 with no body, and the client fell back to a
+    // generic "couldn't process this report" - correct that something failed, silent on
+    // what. Anything reaching here is infrastructure (the vault write, an unhandled client
+    // error), not a document the model could not read, which is what the 422s cover.
+    //
+    // The message is fixed rather than derived from the error: a Redis or Pinecone failure
+    // can carry connection strings, and on this route it can carry report text.
+    console.error("Report ingest failed:", error);
+    return new Response(
+      JSON.stringify({
+        error:
+          "We couldn't finish processing this report. This is a problem on our side - " +
+          "please try again in a moment.",
+      }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
   } finally {
     // The trace client batches uploads in the background and a serverless host can freeze
     // the function the instant the response is returned, so the batch has to be pushed on
@@ -469,8 +486,14 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
     await storeVault(documentId, vault);
 
     // Errors here are swallowed so a Pinecone or HuggingFace outage still returns a
-    // usable summary. The cost is a 200 carrying chunkCount: 0 - a document that is
-    // silently unsearchable - so the span records the failure as an error.
+    // usable summary. The cost is a 200 for a document that cannot be searched, so the
+    // span records the failure as an error and `vectorStoreFailed` is reported to the
+    // client rather than left for it to infer.
+    //
+    // It cannot be inferred from `chunkCount`, which is why that flag exists. The count is
+    // assigned as soon as the split succeeds, so an embedding or upsert failure leaves it
+    // non-zero with nothing indexed; and a duplicate upload skips this block entirely,
+    // leaving it zero with everything indexed. It is wrong in both directions.
     await span(
       "index_document",
       { documentId, chars: redactedFullText.length },
@@ -585,12 +608,28 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
     }
   }
 
+  // `vectorStoreFailed` and `graphStoreFailed` are reported to the client, not only to the
+  // trace. Swallowing an indexing failure keeps the upload usable, but a 200 that says
+  // nothing about it told the user "Report processed!" while the document was unsearchable
+  // - and the chat that followed answered every question with "this is not in your
+  // report". A false success is worse than a visible failure: nothing prompts a retry.
+  //
+  // `duplicate` has to travel too. It is why the client cannot just test `chunkCount === 0`:
+  // a re-upload skips indexing because the vectors already exist, leaving the count at 0 on
+  // a perfectly healthy path. The count alone cannot tell "already indexed" from "failed to
+  // index", so the route states which it was instead of leaving the client to guess.
   const response = {
     redactedSummary,
     vaultId: documentId,
     piiCount,
     triplesStored: triples ? triples.length : 0,
     chunkCount,
+    duplicate: !!existingVault,
+    vectorStoreFailed,
+    graphStoreFailed,
+    // Only the vector store gates retrieval. A missing graph costs the model some optional
+    // context; a missing index means the report cannot be searched at all.
+    searchable: !vectorStoreFailed,
   };
 
   // Rolled onto the root span so one trace answers "did this upload actually land?".
