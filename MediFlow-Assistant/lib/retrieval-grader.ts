@@ -131,14 +131,31 @@ export async function gradeRetrieval({
                     prompt: buildPrompt(question, retrievalText),
                 });
 
-                // Indices are 1-based and model-supplied, so anything out of range is
-                // dropped rather than trusted into an undefined lookup.
+                // Indices are 1-based and model-supplied, so all three properties the
+                // lookup depends on are established here rather than assumed:
+                //
+                //   range - out of bounds would index undefined into the prompt.
+                //   unique - a repeated index selects one chunk twice. RRF fuses by id so
+                //     `chunks` cannot contain duplicates, but nothing stops the model
+                //     naming the same one more than once, and formatChunks would then
+                //     renumber it into two findings that read as two separate pieces of
+                //     evidence for the same thing.
+                //   ascending - `chunks` arrives in RRF rank order, so mapping in the
+                //     model's order silently discards the ranking. Sorting keeps the
+                //     best-ranked survivor first, which is where the generator weights
+                //     attention.
                 const kept =
                     object.verdict === "none"
                         ? []
-                        : object.usefulExcerpts
-                            .filter((n) => Number.isInteger(n) && n >= 1 && n <= chunks.length)
-                            .map((n) => chunks[n - 1]);
+                        : Array.from(
+                              new Set(
+                                  object.usefulExcerpts.filter(
+                                      (n) => Number.isInteger(n) && n >= 1 && n <= chunks.length
+                                  )
+                              )
+                          )
+                              .sort((left, right) => left - right)
+                              .map((n) => chunks[n - 1]);
 
                 // A "relevant"/"partial" verdict that kept nothing is self-contradictory.
                 // Treat it as "none" rather than sending an empty evidence section that
