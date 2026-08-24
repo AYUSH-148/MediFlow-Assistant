@@ -5,6 +5,7 @@ import {
     pinecone,
     upsertConversationMemory,
 } from "@/utils";
+import { buildRetrievalQuery } from "@/lib/embeddings";
 import { gradeRetrieval, buildGroundingInstruction } from "@/lib/retrieval-grader";
 import {
     getCachedResponse,
@@ -453,7 +454,11 @@ async function handleChat({
 
     root?.setMetadata({ cacheHit: false });
     const data = new StreamData();
-    const query = `Represent this for searching relevant passages: patient medical report says: \n${reportData}. \n\n${effectiveQuestion}`;
+    // Question only. The report summary used to be prepended here, which drowned the
+    // question in the query vector, fed the whole summary to the TF-IDF arm as query
+    // terms, and pushed the question past the embedding model's 512-token ceiling on a
+    // long report. See buildRetrievalQuery.
+    const query = buildRetrievalQuery(effectiveQuestion);
 
     // The conversation-history search is skipped unless this document actually has stored
     // memory to find, since it costs a HuggingFace embedding plus a topK 12 query and a
