@@ -72,12 +72,61 @@ const VISION_PROMPT = `Attached is a clinical report (image or scanned PDF).
 2. Identify biomarkers that show slight or large abnormalities and summarize in about 100 words (you may exceed this for multi-page reports). Include numerical values, key details, and the report title.
 3. Extract entity relationships as triples. Focus on medical entities like drugs, conditions, symptoms, and treatments.`;
 
-function parseDataUrl(dataUrl: string): { mimeType: string; buffer: Buffer } {
-  const commaIndex = dataUrl.indexOf(",");
-  const meta = dataUrl.substring(0, commaIndex);
-  const b64 = dataUrl.substring(commaIndex + 1);
-  const mimeType = meta.substring(meta.indexOf(":") + 1, meta.indexOf(";"));
-  return { mimeType, buffer: Buffer.from(b64, "base64") };
+// Mirrors the client's accept filter. The MIME type decides the extraction path, so an
+// unrecognised one has nowhere to go - reject it here rather than sending arbitrary bytes
+// to the vision model.
+const ACCEPTED_MIME_TYPES = new Set([
+  "application/pdf",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+]);
+
+// Vercel caps a serverless request body at ~4.5MB. The client refuses anything larger
+// first, with a clearer message; this is the server-side backstop for a request that did
+// not come from the client.
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024;
+
+class InvalidUploadError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidUploadError";
+  }
+}
+
+// The upload arrives as multipart/form-data rather than a base64 data URL in JSON. JSON
+// cannot carry binary, so the old shape cost 33% in transport and forced the whole file
+// through memory as a string - which is why images were being re-encoded at JPEG quality
+// 0.1 to fit, degrading the very pixels the OCR path has to read.
+async function readUpload(req: Request): Promise<{ mimeType: string; buffer: Buffer }> {
+  let form: FormData;
+  try {
+    form = await req.formData();
+  } catch {
+    throw new InvalidUploadError("Expected a multipart/form-data upload.");
+  }
+
+  const file = form.get("file");
+  if (!(file instanceof File)) {
+    throw new InvalidUploadError("No file was included in the upload.");
+  }
+  if (file.size === 0) {
+    throw new InvalidUploadError("The uploaded file is empty.");
+  }
+  if (file.size > MAX_UPLOAD_BYTES) {
+    throw new InvalidUploadError(
+      `File is too large (${Math.round(file.size / 1024 / 1024)}MB). The limit is ${
+        MAX_UPLOAD_BYTES / 1024 / 1024
+      }MB.`
+    );
+  }
+  // A browser sends the type it inferred from the file; it is not authoritative, but the
+  // extraction paths are only defined for these four and Gemini re-reads the bytes itself.
+  if (!ACCEPTED_MIME_TYPES.has(file.type)) {
+    throw new InvalidUploadError(`Unsupported file type: ${file.type || "unknown"}.`);
+  }
+
+  return { mimeType: file.type, buffer: Buffer.from(await file.arrayBuffer()) };
 }
 
 // Carries a developer-facing detail; the route turns it into a 422 with a
@@ -279,8 +328,21 @@ async function transcribeAndAnalyze(
 }
 
 export async function POST(req: Request) {
-  const { base64 } = await req.json();
-  const { mimeType, buffer } = parseDataUrl(base64);
+  let mimeType: string;
+  let buffer: Buffer;
+  try {
+    ({ mimeType, buffer } = await readUpload(req));
+  } catch (error) {
+    if (error instanceof InvalidUploadError) {
+      // A 400 rather than the 422 used for "read the file but couldn't understand it":
+      // the request itself is malformed, and nothing was extracted to fail at.
+      return new Response(JSON.stringify({ error: error.message }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    throw error;
+  }
 
   try {
     return await span(

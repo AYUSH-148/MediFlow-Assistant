@@ -1,4 +1,4 @@
-import React, { ChangeEvent, DragEvent, useRef, useState } from 'react'
+import React, { ChangeEvent, DragEvent, useEffect, useRef, useState } from 'react'
 import { Button } from './ui/button'
 import { Textarea } from './ui/textarea'
 import { Label } from './ui/label'
@@ -15,12 +15,32 @@ type Props = {
 
 const STEPS = [{ label: 'Upload' }, { label: 'Review' }, { label: 'Ask' }]
 
+// Vercel caps a serverless request body at ~4.5MB. Multipart sends the bytes as-is, so
+// unlike the previous base64 body there is no 33% inflation to budget for; the margin is
+// for the multipart envelope itself.
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024
+
+// Photos are downscaled rather than quality-crushed. The previous JPEG quality of 0.1
+// existed only to fit a base64 body, and it destroyed exactly the fine print - decimal
+// points in lab values - that the OCR path has to read. Capping the long edge keeps
+// characters legible at a far smaller size than aggressive requantisation does.
+const MAX_IMAGE_EDGE = 2000
+const JPEG_QUALITY = 0.85
+
+function formatMb(bytes: number): string {
+    return (bytes / 1024 / 1024).toFixed(1)
+}
+
 const ReportComponent = ({ onReportConfirmation }: Props) => {
     const { toast } = useToast()
     const fileInputRef = useRef<HTMLInputElement>(null)
     const dragCounter = useRef(0)
 
-    const [base64Data, setBase64Data] = useState('')
+    // The bytes actually uploaded: the original file for PDFs, the downscaled JPEG for
+    // images. Kept separate from `selectedFile` so the preview still shows the file the
+    // user picked, at its real name and size.
+    const [uploadFile, setUploadFile] = useState<File | null>(null)
+    const [previewUrl, setPreviewUrl] = useState('')
     const [selectedFile, setSelectedFile] = useState<File | null>(null)
     const [isDragging, setIsDragging] = useState(false)
     const [isLoading, setIsLoading] = useState(false);
@@ -30,6 +50,18 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
     const [confirmed, setConfirmed] = useState(false);
 
     const currentStep = confirmed ? 3 : reportData ? 2 : 1;
+
+    // An object URL holds its blob alive until revoked, so each new preview has to release
+    // the previous one - otherwise picking several files in a row leaks every one of them.
+    useEffect(() => {
+        if (!selectedFile) {
+            setPreviewUrl('');
+            return;
+        }
+        const url = URL.createObjectURL(selectedFile);
+        setPreviewUrl(url);
+        return () => URL.revokeObjectURL(url);
+    }, [selectedFile]);
 
     function processFile(file: File) {
         let isValidImage = false;
@@ -50,36 +82,62 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
             return;
         }
 
+        // A PDF is sent untouched, so its size can be checked now. An image is checked
+        // after downscaling instead - a 12MP phone photo routinely exceeds the limit as
+        // shot and comes in well under it once resized, so rejecting it here would turn a
+        // working upload into an error.
+        if (isValidDoc && file.size > MAX_UPLOAD_BYTES) {
+            toast({
+                variant: 'destructive',
+                description: `PDF is too large (${formatMb(file.size)}MB). The limit is ${formatMb(MAX_UPLOAD_BYTES)}MB.`,
+            });
+            return;
+        }
+
         setSelectedFile(file);
         // Drop anything extracted from the previous file.
+        setUploadFile(null);
         setReportData("");
         setVaultId("");
         setPiiCount(0);
         setConfirmed(false);
 
         if (isValidImage) {
-            compressImage(file, (compressedFile) => {
-                const reader = new FileReader();
-
-                reader.onloadend = () => {
-                    const base64String = reader.result as string;
-                    setBase64Data(base64String);
-                };
-
-                reader.readAsDataURL(compressedFile);
-            });
+            // An image that already fits, at a resolution the vision model can read, is sent
+            // untouched. Re-encoding it would be a lossy round trip for nothing - and a PNG
+            // screenshot of a report picks up JPEG ringing around exactly the small text the
+            // OCR path depends on.
+            if (file.size <= MAX_UPLOAD_BYTES) {
+                measureImage(file, (withinEdgeCap) => {
+                    if (withinEdgeCap) {
+                        setUploadFile(file);
+                    } else {
+                        downscaleAndSet(file);
+                    }
+                });
+            } else {
+                downscaleAndSet(file);
+            }
         }
 
         if (isValidDoc) {
-            // PDFs are sent uncompressed; the route handles the text-layer/OCR split.
-            const reader = new FileReader();
-            reader.onloadend = () => {
-                const base64String = reader.result as string;
-                setBase64Data(base64String);
-            };
-
-            reader.readAsDataURL(file);
+            // PDFs go up as-is; the route handles the text-layer/OCR split.
+            setUploadFile(file);
         }
+    }
+
+    function downscaleAndSet(file: File) {
+        downscaleImage(file, (downscaled) => {
+            if (downscaled.size > MAX_UPLOAD_BYTES) {
+                toast({
+                    variant: 'destructive',
+                    description: `Image is still too large after resizing (${formatMb(downscaled.size)}MB). Try a smaller photo.`,
+                });
+                handleRemoveFile();
+                return;
+            }
+            setUploadFile(downscaled);
+        });
     }
 
     function handleReportSelection(event: ChangeEvent<HTMLInputElement>): void {
@@ -117,7 +175,7 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
 
     function handleRemoveFile(): void {
         setSelectedFile(null);
-        setBase64Data('');
+        setUploadFile(null);
         setReportData('');
         setVaultId('');
         setPiiCount(0);
@@ -127,42 +185,69 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
         }
     }
 
-    // Images are re-encoded as JPEG in the browser before upload: the route takes a
-    // base64 data URL, so a raw phone photo would otherwise blow past the body limit.
-    function compressImage(file: File, callback: (compressedFile: File) => void) {
-        const JPEG_QUALITY = 0.1;
-        const reader = new FileReader();
+    // Decode just far enough to read the dimensions, to decide whether a re-encode is
+    // needed at all. An image that fails to decode is reported as within the cap so the
+    // caller uploads it as-is and the server owns the rejection - the browser refusing to
+    // render a file is not proof the vision model cannot read it.
+    function measureImage(file: File, callback: (withinEdgeCap: boolean) => void) {
+        const url = URL.createObjectURL(file);
+        const img = new Image();
+        img.onload = () => {
+            URL.revokeObjectURL(url);
+            callback(Math.max(img.width, img.height) <= MAX_IMAGE_EDGE);
+        };
+        img.onerror = () => {
+            URL.revokeObjectURL(url);
+            callback(true);
+        };
+        img.src = url;
+    }
 
-        reader.onload = (e) => {
-            const img = new Image();
-            img.onload = () => {
-                const canvas = document.createElement('canvas');
-                const ctx = canvas.getContext('2d');
+    // Re-encode a photo as a JPEG that is bounded by its longest edge rather than by
+    // quality. `canvas.toBlob` hands back the bytes directly - the old path went through a
+    // base64 data URL and an atob loop only because the request body needed base64 anyway.
+    function downscaleImage(file: File, callback: (resized: File) => void) {
+        const url = URL.createObjectURL(file);
+        const img = new Image();
 
-                canvas.width = img.width;
-                canvas.height = img.height;
-                ctx!.drawImage(img, 0, 0);
+        img.onload = () => {
+            URL.revokeObjectURL(url);
 
-                const dataURL = canvas.toDataURL('image/jpeg', JPEG_QUALITY);
+            const scale = Math.min(1, MAX_IMAGE_EDGE / Math.max(img.width, img.height));
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.round(img.width * scale);
+            canvas.height = Math.round(img.height * scale);
+            canvas.getContext('2d')!.drawImage(img, 0, 0, canvas.width, canvas.height);
 
-                const byteString = atob(dataURL.split(',')[1]);
-                const ab = new ArrayBuffer(byteString.length);
-                const ia = new Uint8Array(ab);
-                for (let i = 0; i < byteString.length; i++) {
-                    ia[i] = byteString.charCodeAt(i);
-                }
-                const compressedFile = new File([ab], file.name, { type: 'image/jpeg' });
-
-                callback(compressedFile);
-            };
-            img.src = e.target!.result as string;
+            canvas.toBlob(
+                (blob) => {
+                    if (!blob) {
+                        toast({
+                            variant: 'destructive',
+                            description: "Couldn't read that image. Try a different file.",
+                        });
+                        return;
+                    }
+                    callback(new File([blob], file.name, { type: 'image/jpeg' }));
+                },
+                'image/jpeg',
+                JPEG_QUALITY
+            );
         };
 
-        reader.readAsDataURL(file);
+        img.onerror = () => {
+            URL.revokeObjectURL(url);
+            toast({
+                variant: 'destructive',
+                description: "Couldn't read that image. Try a different file.",
+            });
+        };
+
+        img.src = url;
     }
 
     async function extractDetails(): Promise<void> {
-        if (!base64Data) {
+        if (!uploadFile) {
             toast({
                 variant: 'destructive',
                 description: "Upload a valid report!",
@@ -172,14 +257,15 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
         setIsLoading(true);
 
         try {
+            const body = new FormData();
+            body.append("file", uploadFile);
+
+            // No Content-Type header: the browser has to set it, because multipart needs a
+            // generated boundary token appended to the media type. Setting it by hand omits
+            // the boundary and the server cannot parse the body.
             const response = await fetch("api/extractreportgemini", {
                 method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                },
-                body: JSON.stringify({
-                    base64: base64Data,
-                }),
+                body,
             });
 
             if (response.ok) {
@@ -192,8 +278,9 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
                     description: `Report processed! ${data.piiCount} PII entities redacted.`,
                 });
             } else {
-                // The route returns a 422 with a human-readable `error` for a document it
-                // couldn't read; surface that rather than a generic failure.
+                // The route returns a human-readable `error` for a rejected upload (400) or
+                // a document it couldn't read (422); surface that rather than a generic
+                // failure.
                 const message = await response
                     .json()
                     .then((body) => body?.error)
@@ -262,11 +349,11 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
                             />
                         </div>
                     ) : (
-                        <FilePreview file={selectedFile} previewUrl={base64Data} onRemove={handleRemoveFile} />
+                        <FilePreview file={selectedFile} previewUrl={previewUrl} onRemove={handleRemoveFile} />
                     )}
                 </div>
 
-                <Button onClick={extractDetails} disabled={!selectedFile || isLoading}>
+                <Button onClick={extractDetails} disabled={!uploadFile || isLoading}>
                     {isLoading ? (
                         <>
                             <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Extracting...
