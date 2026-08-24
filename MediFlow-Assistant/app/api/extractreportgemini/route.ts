@@ -1,6 +1,6 @@
 import { generateObject, NoObjectGeneratedError, TypeValidationError } from "ai";
 import { z } from "zod";
-import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+import { chunkWithContext } from "@/lib/chunking";
 import { redactDocument, redactTriples, storeVault, storeTriplesInNeo4j, getVault } from "@/lib/pii-redaction";
 import { geminiModel, GEMINI_MODEL_ID } from "@/lib/gemini";
 import { generateEmbeddings } from "@/lib/embeddings";
@@ -521,13 +521,17 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
             "chunk_document",
             { chars: redactedFullText.length, chunkSize: CHUNK_SIZE, chunkOverlap: CHUNK_OVERLAP },
             async () => {
-              const splitter = new RecursiveCharacterTextSplitter({
+              const contextual = await chunkWithContext(redactedFullText, {
                 chunkSize: CHUNK_SIZE,
                 chunkOverlap: CHUNK_OVERLAP,
               });
-              const split = await splitter.splitText(redactedFullText);
+              const split = contextual.map((chunk) => chunk.text);
               setSpanMetadata({
                 chunkCount: split.length,
+                // A chunk cut out of the middle of a table carries rows without the header
+                // naming their columns. This counts how often a heading had to be restored,
+                // which is the only way to tell the prefixing is doing anything.
+                chunksGivenContext: contextual.filter((chunk) => chunk.contextAdded).length,
                 avgChunkChars: split.length
                   ? Math.round(split.reduce((sum, c) => sum + c.length, 0) / split.length)
                   : 0,
