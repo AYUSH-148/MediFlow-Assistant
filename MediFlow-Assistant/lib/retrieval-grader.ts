@@ -16,19 +16,24 @@ import { formatChunks, type RetrievedChunk } from "@/utils";
  * findings. This replaces that request with an actual filter, and tells the generator to
  * say so out loud when the report does not cover what was asked.
  *
- * Note on why there is no cheap numeric pre-filter here. The obvious optimisation is to
- * skip grading when the top retrieval score is high, but neither score available is a
- * relevance signal for this question:
+ * Note on why there is still no cheap numeric pre-filter here.
  *
- *   - The RRF score is 1/(60+rank) summed across arms. It encodes rank position only, so
- *     the top result of a completely irrelevant corpus scores exactly as well as the top
- *     result of a perfect one.
- *   - The vector similarity is measured against a query that has the entire report text
- *     prepended to it, so report chunks score high on report-to-report similarity no
- *     matter what the user actually asked.
+ *   - The RRF score, which is what the chunks arrive ranked by, is 1/(60+rank) summed
+ *     across arms. It encodes rank position only, so the top result of a completely
+ *     irrelevant corpus scores exactly as well as the top result of a perfect one. This
+ *     has not changed and is the reason a threshold on the fused ranking cannot work.
+ *   - The per-arm vector similarity used to be unusable for a second reason: the query had
+ *     the entire report prepended, so chunks scored high on report-to-report similarity
+ *     regardless of the question. That is no longer true - the query is the question alone
+ *     now - so cosine against the question has become a meaningful signal. It is
+ *     deliberately still not used as a gate: retrieval RANKS, it does not threshold, and
+ *     the cutoff separating "relevant" from "merely the closest thing in this document"
+ *     is not a constant. Picking one would need the eval suite to establish it per corpus,
+ *     and a wrong constant fails silently in the direction that matters - dropping
+ *     evidence the report does contain.
  *
- * Grading against the bare question is the point: it is the one comparison the retrieval
- * pipeline never makes.
+ * Grading against the bare question remains the point: retrieval orders chunks, and this
+ * is the only stage that decides whether any of them should be believed.
  */
 
 const GradeSchema = z.object({

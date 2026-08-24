@@ -106,6 +106,16 @@ Semantic search alone misses exact clinical terms; keyword search alone misses p
 
 Both arms reuse a **single embedding call** — the query vector is computed once and passed into the keyword corpus fetch rather than recomputed.
 
+**The query is the question alone**, behind the instruction prefix `mxbai` expects for retrieval queries (it is an asymmetric model — queries take a prefix, documents do not). The whole report summary used to be prepended to it, which cost three things at once:
+
+| Cost | Why |
+|---|---|
+| Cosine similarity was meaningless as a relevance signal | The query vector was dominated by the report, so every chunk scored high on report-to-report similarity whatever was asked |
+| The sparse arm scored against the report, not the question | `rankWithTfIdf` tokenises the same string, so every word of the summary became a query term — 33 terms instead of 14 on a representative question |
+| A long report silently deleted the question | The summary sat *ahead* of the question in a string with a 512-token ceiling. A multi-page summary pushed the question past it, and the question is what got cut |
+
+Prepending it was a way to give a context-free follow-up (*"is that bad?"*) something to match on. The query guard now rewrites such questions to stand alone **before** retrieval runs, so the context is already in the question and the prepend was redundant. Truncation is also now applied in `generateEmbedding` and **recorded** rather than left to the model, so a query that lost its tail is visible instead of looking like retrieval that merely performed badly.
+
 ### 🧭 The query guard — scope and ambiguity, before anything expensive
 
 Nothing in a RAG pipeline naturally refuses. Ask *"what is the capital of India"* and the old flow ran full retrieval, answered from the model's general knowledge, cached the answer for 24 hours, and — with a report loaded — wrote it into long-term conversation memory as clinical history.
@@ -144,7 +154,7 @@ A grading pass now judges the chunks **against the question** and returns a verd
 There is deliberately **no cheap numeric pre-filter**, because neither available score measures relevance to the question:
 
 - The **RRF score** is `1/(60+rank)` summed across arms — pure rank position. The top result of a completely irrelevant corpus scores exactly as well as the top result of a perfect one.
-- The **vector similarity** is measured against a query that has the entire report prepended, so report chunks score high on report-to-report similarity no matter what was asked.
+- The **vector similarity** is now measured against the question alone, so it *has* become a meaningful signal — but it is still not used as a gate. Retrieval **ranks**; it does not threshold. The cutoff separating "relevant" from "the closest thing in this document" is not a constant, and a wrong one fails silently in the direction that matters: dropping evidence the report does contain.
 
 Grading against the bare question is the one comparison the retrieval pipeline never makes. Empty retrievals still short-circuit without a model call, and surviving chunks are renumbered contiguously — a prompt listing "Finding 1, 4, 7" invites the model to wonder what it is not being shown.
 
