@@ -2,7 +2,7 @@ import React from 'react'
 import { Textarea } from './ui/textarea'
 import { useChat } from 'ai/react';
 import { Button } from './ui/button';
-import { CornerDownLeft, Loader2, MessageCircle, TextSearch, UploadCloud } from 'lucide-react';
+import { AlertTriangle, CornerDownLeft, Loader2, MessageCircle, RotateCcw, TextSearch, UploadCloud } from 'lucide-react';
 import { Badge } from './ui/badge';
 import Messages from './messages';
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from './ui/accordion';
@@ -17,9 +17,13 @@ type Props = {
 }
 
 const ChatComponent = ({ reportData, onOpenReport }: Props) => {
-  const { messages, input, handleInputChange, handleSubmit, isLoading, data } =
+  const { messages, input, handleInputChange, handleSubmit, isLoading, data, error, reload } =
     useChat({
       api: "api/medichatgemini",
+      // Without this the SDK rolls the user's own message back out of the transcript when
+      // a request fails, so a failed turn erased the question that caused it. The default
+      // is false in this version and is documented as changing in the next major.
+      keepLastMessageOnError: true,
     });
   return (
     <div className="h-full bg-muted/50 relative flex flex-col min-h-0 rounded-xl p-4 gap-4">
@@ -87,6 +91,37 @@ const ChatComponent = ({ reportData, onOpenReport }: Props) => {
             </AccordionContent>
           </AccordionItem>
         </Accordion>
+      )}
+      {error && (
+        // The route sends a plain-text reason with a real status, and useChat surfaces it
+        // as error.message - so this shows what actually failed rather than a generic
+        // "something went wrong". `reload` re-sends the last user message, which is still
+        // in the transcript thanks to keepLastMessageOnError.
+        <div
+          role="alert"
+          className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-sm"
+        >
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+          <div className="min-w-0 flex-1">
+            <p className="text-destructive">{error.message || "Couldn't get an answer. Try again."}</p>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="mt-2 gap-1.5"
+              onClick={() => reload({
+                data: {
+                  reportData: reportData?.redactedSummary as string,
+                  vaultId: reportData?.vaultId as string,
+                },
+              })}
+              disabled={isLoading}
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+              Retry
+            </Button>
+          </div>
+        </div>
       )}
       <form
         className="relative overflow-hidden rounded-lg border bg-background"

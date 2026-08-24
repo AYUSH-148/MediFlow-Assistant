@@ -156,6 +156,22 @@ Extracted `(subject, predicate, object)` triples land in Neo4j. Rather than pref
 
 The subtle part is **scoping the neighbour, not just the queried node**. Generic entities like `Atorvastatin` are deliberately unscoped so knowledge is shared across documents — which means traversing out of one would return the `[NAME_n]` nodes of every patient ever prescribed it. The chat route then rehydrates through the *current* document's vault, resolving another patient's token to this patient's name. The model would confidently state a relationship belonging to someone else, and nothing about the output would look wrong. A neighbour is therefore admitted only when it is genuinely generic or explicitly scoped to this document.
 
+### 🚨 Failing visibly on the generation path
+
+The guard fails open and the cache degrades quietly, but generation had no equivalent. A
+`streamText` rejection - quota, auth, a network blip - was re-thrown, so Next returned a
+bare 500 with no body. On the client that was worse than it sounds: `useChat` throws
+`new Error(await response.text())` on a non-ok response, so an empty body meant an empty
+message, and `keepLastMessageOnError` defaults to `false` in this version of the SDK, so
+the same failure **rolled the user's own question back out of the transcript**. The
+question disappeared with nothing on screen to explain it.
+
+The route now returns a status and a plain-text reason - 429 for rate limiting, 502 for an
+upstream fault, 500 otherwise - which `useChat` surfaces as `error.message`. Only the
+status is read from the provider's error, never its message: it can quote the prompt back,
+and on this route the prompt contains report text. The client keeps the failed message,
+renders the reason, and offers a retry.
+
 ### ⚡ Semantic caching
 
 Answers are cached in Redis keyed by report hash, matched by **cosine similarity ≥ 0.95** rather than by exact string. The match runs against the guard's **resolved** question, not the raw one — that is what stops two identical-looking follow-ups from colliding on one key. Cache hits are re-emitted in the AI SDK data-stream protocol so the client parses them identically to a live generation. `bestSimilarity` is recorded on misses too — otherwise a threshold that never fires is indistinguishable from a cold cache.
@@ -319,6 +335,7 @@ MediFlow-Assistant/
 - Redaction is **rule-based**, so a name written in free prose (`"my name is Rahul, is my LDL high?"`) has no label to anchor on and survives. This is why nothing downstream treats post-redaction text as safe by default.
 - The query guard and the retrieval grader are **model judgment, not deterministic rules**. Both can misclassify — a legitimate question refused, or irrelevant chunks kept — and both deliberately fail open, so an outage degrades to the older, less careful behaviour rather than blocking the chat. Their spans record `intent`, `verdict` and `ungraded` precisely so drift is measurable rather than anecdotal.
 - Answering a question now costs **three sequential Gemini calls** rather than one. Refusals and clarifications short-circuit before retrieval and grading, so the cheap paths stayed cheap, but the common case pays roughly two extra Flash round trips for the grounding.
+- A guard outage and a quota failure look the same from the user's chair, though they are distinguishable in a trace: the root span records `guardIntent` and `guardFailed`, and a generation failure closes with `outcome: "error"`.
 - Gemini safety filters are disabled — clinical prompts about dosages and treatments get blocked at default thresholds, and a blocked generation returns empty text rather than an error. Report contents are injected verbatim, so uploaded documents should be treated as untrusted input.
 - Uploads are capped at **4MB** and held in request memory for the lifetime of the request, so a large report is rejected rather than queued. Raising that ceiling means uploading to object storage instead — which for this pipeline would mean a durable copy of the *unredacted* document living outside the request, so it is deliberately not done: today the raw file is never persisted anywhere.
 - If a vault expires before its cached answers do, those answers come back with `[NAME_1]` placeholders intact. The pipeline detects and reports this rather than hiding it.

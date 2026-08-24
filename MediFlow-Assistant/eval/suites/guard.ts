@@ -2,6 +2,7 @@ import { guardQuestion } from "@/lib/query-guard";
 import { GUARD_CASES, type GuardCase } from "../dataset/guard";
 import { getReport } from "../fixtures/reports";
 import { EVAL_CONCURRENCY, mapWithConcurrency } from "../lib/concurrency";
+import { createRetryCounter, withRetry } from "../lib/retry";
 import {
   Confusion,
   formatTable,
@@ -35,6 +36,12 @@ export interface GuardCaseResult {
    * on paper to a guard that is up and far too permissive.
    */
   guardFailed: boolean;
+  /**
+   * How many guard calls this case took. Above 1 means an earlier attempt failed open and
+   * was retried, which the other suites already do for thrown 429s - the guard needed its
+   * own path because it never throws.
+   */
+  attempts: number;
   latencyMs: number;
 }
 
@@ -68,13 +75,36 @@ function reportSummaryFor(testCase: GuardCase): string {
   return getReport(testCase.reportId ?? "metabolic-workup").summary;
 }
 
-async function runCase(testCase: GuardCase): Promise<GuardCaseResult> {
+async function runCase(
+  testCase: GuardCase,
+  onRetry: (attempt: number, error: unknown) => void
+): Promise<GuardCaseResult> {
   const start = performance.now();
-  const guard = await guardQuestion({
-    question: testCase.message,
-    history: formatHistory(testCase.history),
-    reportSummary: reportSummaryFor(testCase),
-  });
+  let attempts = 0;
+
+  // The guard fails open rather than throwing, so a transient 429 resolves as a perfectly
+  // well-formed `intent: "answer"` carrying `guardFailed: true`. withRetry's error path
+  // cannot see that - hence `retryResult`. Without it a rate limit during a run is scored
+  // as a routing decision the guard never made, and quietly contaminates the accuracy
+  // figure instead of being retried away.
+  const guard = await withRetry(
+    () => {
+      attempts += 1;
+      return guardQuestion({
+        question: testCase.message,
+        history: formatHistory(testCase.history),
+        reportSummary: reportSummaryFor(testCase),
+      });
+    },
+    {
+      label: `guard ${testCase.id}`,
+      retryResult: (result) => result.guardFailed,
+      onRetry,
+    }
+  );
+
+  // Measured across retries on purpose: the latency figures describe what the run
+  // actually cost, and a case that needed three attempts did take that long.
   const latencyMs = performance.now() - start;
 
   return {
@@ -90,6 +120,7 @@ async function runCase(testCase: GuardCase): Promise<GuardCaseResult> {
     resolvedQuestion: guard.resolvedQuestion,
     reply: guard.reply,
     guardFailed: guard.guardFailed,
+    attempts,
     latencyMs,
   };
 }
@@ -99,14 +130,17 @@ export async function runGuardSuite(
 ): Promise<GuardSuiteResult> {
   log(`Running ${GUARD_CASES.length} guard cases (concurrency ${EVAL_CONCURRENCY})...`);
 
+  const retries = createRetryCounter();
+
   const cases = await mapWithConcurrency(GUARD_CASES, EVAL_CONCURRENCY, async (testCase, index) => {
-    const result = await runCase(testCase);
+    const result = await runCase(testCase, retries.onRetry);
     log(
       `  [${String(index + 1).padStart(2)}/${GUARD_CASES.length}] ${testCase.id.padEnd(34)} ` +
         `${result.actualIntent}` +
         `${result.actualIntent === result.expectedIntent ? "" : ` (expected ${result.expectedIntent})`}` +
         // Called out inline as well as in the report: watching a run scroll past is when
         // an operator can still kill it, and an outage makes every later figure junk.
+        `${result.attempts > 1 ? `  (${result.attempts} attempts)` : ""}` +
         `${result.guardFailed ? "  << GUARD OUTAGE, not a decision" : ""}`
     );
     return result;
@@ -161,7 +195,8 @@ export async function runGuardSuite(
     outages.length
       ? "\n" +
         [
-          `!! ${outages.length} of ${cases.length} guard calls FAILED and fell through to fail-open "answer".`,
+          `!! ${outages.length} of ${cases.length} guard calls FAILED and fell through to fail-open "answer",`,
+          `   after exhausting retries.`,
           "",
           "   Treat every figure below as void. A failed call is recorded as `answer` with no",
           "   reply and no rewrite, so outages inflate answer recall, drive clarify and refuse",
@@ -180,8 +215,15 @@ export async function runGuardSuite(
           "guard outages (fail-open)",
           String(outages.length),
           outages.length
-            ? `${outages.length} call(s) never decided - metrics below are void`
+            ? `${outages.length} call(s) never decided after retries - metrics below are void`
             : "none - every case reached a decision",
+        ],
+        [
+          "fail-open retries",
+          String(retries.count()),
+          retries.count()
+            ? `${cases.filter((r) => r.attempts > 1).length} case(s) needed a retry - latency figures include them`
+            : "none",
         ],
         ["intent accuracy", pct(confusion.accuracy()), `${cases.length} cases`],
         [
