@@ -168,6 +168,38 @@ Born-digital PDFs are read via their text layer (`pdf-parse`), which is faster, 
 
 The whole pipeline is instrumented with LangSmith spans (`retriever`, `llm`, `tool`, `parser`), including token usage for cost attribution. Because the most useful spans sit on the *unredacted* side of the boundary, raw text capture is gated behind `LANGSMITH_TRACE_PHI`, which **defaults to off** — a deploy that forgets the flag degrades to metadata-only rather than streaming patient records to a third party.
 
+### 📦 Upload transport
+
+The file goes up as `multipart/form-data`, not as a base64 data URL in a JSON body.
+
+The original shape was JSON — one `JSON.stringify` on the client, one `req.json()` on the
+server, no parsing to write. The cost showed up two layers away. Base64 encodes 3 bytes as 4
+characters, so every upload paid **33% in transport** and the whole file passed through memory
+as a string on both sides. To fit phone photos under that inflated ceiling, images were
+re-encoded at **JPEG quality 0.1** — which degrades exactly the fine print, decimal points in
+lab values, that the OCR path then has to read. A transport convenience was corrupting
+extraction input.
+
+Multipart carries the bytes as-is:
+
+| | Base64 in JSON | `multipart/form-data` |
+|---|---|---|
+| Wire overhead | +33% | ~0% |
+| Image handling | JPEG quality 0.1 | downscale to 2000px long edge, quality 0.85 |
+| Server memory | file as a JS string, then a Buffer | Buffer directly |
+| Size guard | none — opaque platform failure | explicit 400, client and server |
+
+Images are now bounded by **resolution rather than quality**, which is the right axis: halving
+the long edge of an oversized scan costs far less legibility than requantising every pixel of
+it. The size check is also two-sided — the client rejects an oversized PDF before reading it,
+and the route rejects one that did not come from the client, with a 400 rather than the 422
+used for "read the document but could not understand it".
+
+One hop still uses base64: Gemini's `generateContent` takes inline binary as
+`inlineData.data`, because that endpoint is JSON too. The AI SDK encodes it there. That one is
+a provider constraint rather than a local choice — and it only applies on the OCR path, so a
+born-digital PDF now travels as raw bytes end to end.
+
 ### 🏎️ Latency work
 
 - Report retrieval and conversation-memory retrieval run **concurrently** instead of sequentially.
@@ -288,7 +320,7 @@ MediFlow-Assistant/
 - The query guard and the retrieval grader are **model judgment, not deterministic rules**. Both can misclassify — a legitimate question refused, or irrelevant chunks kept — and both deliberately fail open, so an outage degrades to the older, less careful behaviour rather than blocking the chat. Their spans record `intent`, `verdict` and `ungraded` precisely so drift is measurable rather than anecdotal.
 - Answering a question now costs **three sequential Gemini calls** rather than one. Refusals and clarifications short-circuit before retrieval and grading, so the cheap paths stayed cheap, but the common case pays roughly two extra Flash round trips for the grounding.
 - Gemini safety filters are disabled — clinical prompts about dosages and treatments get blocked at default thresholds, and a blocked generation returns empty text rather than an error. Report contents are injected verbatim, so uploaded documents should be treated as untrusted input.
-- Documents are uploaded as base64 data URLs, which caps practical file size. Large reports would want a multipart upload to object storage.
+- Uploads are capped at **4MB** and held in request memory for the lifetime of the request, so a large report is rejected rather than queued. Raising that ceiling means uploading to object storage instead — which for this pipeline would mean a durable copy of the *unredacted* document living outside the request, so it is deliberately not done: today the raw file is never persisted anywhere.
 - If a vault expires before its cached answers do, those answers come back with `[NAME_1]` placeholders intact. The pipeline detects and reports this rather than hiding it.
 
 ---
