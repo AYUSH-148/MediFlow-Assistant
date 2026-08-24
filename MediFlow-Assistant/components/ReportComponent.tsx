@@ -6,7 +6,7 @@ import SocialMediaLinks from './social-links'
 import { useToast } from "@/components/ui/use-toast"
 import FilePreview from './FilePreview'
 import StepIndicator from './StepIndicator'
-import { Loader2, ShieldCheck, UploadCloud } from 'lucide-react'
+import { AlertTriangle, Loader2, ShieldAlert, ShieldCheck, UploadCloud } from 'lucide-react'
 import { Badge } from './ui/badge'
 
 type Props = {
@@ -47,6 +47,10 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
     const [reportData, setReportData] = useState("");
     const [vaultId, setVaultId] = useState("");
     const [piiCount, setPiiCount] = useState(0);
+    // Set when the route reports it read the document but could not index it. The report is
+    // still worth showing - the summary is real - but retrieval has nothing to search, so
+    // the chat would answer every question with "this is not in your report".
+    const [unsearchable, setUnsearchable] = useState(false);
     const [confirmed, setConfirmed] = useState(false);
 
     const currentStep = confirmed ? 3 : reportData ? 2 : 1;
@@ -100,6 +104,7 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
         setReportData("");
         setVaultId("");
         setPiiCount(0);
+        setUnsearchable(false);
         setConfirmed(false);
 
         if (isValidImage) {
@@ -179,6 +184,7 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
         setReportData('');
         setVaultId('');
         setPiiCount(0);
+        setUnsearchable(false);
         setConfirmed(false);
         if (fileInputRef.current) {
             fileInputRef.current.value = '';
@@ -273,10 +279,22 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
                 setReportData(data.redactedSummary);
                 setVaultId(data.vaultId);
                 setPiiCount(data.piiCount);
+                // `searchable: false` means indexing failed, which the route used to swallow
+                // into an unqualified 200. Note this is not `chunkCount === 0`: a re-upload
+                // skips indexing because the vectors already exist, so the count is 0 on a
+                // healthy path too. The route says which case it was.
+                const searchable = data.searchable !== false;
+                setUnsearchable(!searchable);
 
-                toast({
-                    description: `Report processed! ${data.piiCount} PII entities redacted.`,
-                });
+                toast(
+                    searchable
+                        ? { description: `Report processed! ${data.piiCount} PII entities redacted.` }
+                        : {
+                              variant: 'destructive',
+                              description:
+                                  "Report read, but it couldn't be indexed for search. Asking about it won't work yet - please upload it again.",
+                          }
+                );
             } else {
                 // The route returns a human-readable `error` for a rejected upload (400) or
                 // a document it couldn't read (422); surface that rather than a generic
@@ -366,12 +384,40 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
                 <div className="grid gap-2">
                     <div className="flex items-center justify-between">
                         <Label className="text-xs text-muted-foreground">Step 2 &middot; Review summary</Label>
-                        {piiCount > 0 && (
-                            <Badge variant="outline" className="gap-1 text-[11px] font-normal">
-                                <ShieldCheck className="h-3 w-3 text-[#00B612]" /> {piiCount} PII redacted
-                            </Badge>
+                        {reportData && (
+                            piiCount > 0 ? (
+                                <Badge variant="outline" className="gap-1 text-[11px] font-normal">
+                                    <ShieldCheck className="h-3 w-3 text-[#00B612]" /> {piiCount} PII redacted
+                                </Badge>
+                            ) : (
+                                // Previously this rendered nothing, so "redaction matched
+                                // nothing" looked the same as "no report yet". The rules are
+                                // label-anchored, so a report whose identifiers are in prose
+                                // rather than under a `Patient:` label produces this - and it
+                                // is the one case where the summary below may still carry a
+                                // name. Worth saying out loud rather than leaving as a 0.
+                                <Badge variant="outline" className="gap-1 text-[11px] font-normal">
+                                    <ShieldAlert className="h-3 w-3 text-amber-500" /> No PII detected — check the summary
+                                </Badge>
+                            )
                         )}
                     </div>
+                    {unsearchable && (
+                        // Persistent, not just a toast: the toast is gone in seconds and the
+                        // consequence is not - confirming from here leads to a chat that
+                        // denies every question about a report it cannot search.
+                        <div
+                            role="alert"
+                            className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-2.5 text-xs"
+                        >
+                            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
+                            <p className="text-destructive">
+                                This report was read but not indexed for search, so the chat
+                                won&apos;t be able to look anything up in it. The summary below is
+                                still accurate — upload the report again to enable questions.
+                            </p>
+                        </div>
+                    )}
                     <Textarea
                         value={reportData}
                         onChange={(e) => {
@@ -398,7 +444,11 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
                             onReportConfirmation({ redactedSummary: reportData, vaultId });
                         }}
                     >
-                        Looks Good, Start Chatting
+                        {/* Not disabled: the summary is real and worth reading, and blocking
+                            would take that away over a failure the user did not cause. But the
+                            label has to carry the consequence, so the choice is not made blind
+                            by someone who scrolled past the warning above. */}
+                        {unsearchable ? "Continue without search" : "Looks Good, Start Chatting"}
                     </Button>
                 </div>
 
