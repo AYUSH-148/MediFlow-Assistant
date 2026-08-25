@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { Redis } from "@upstash/redis";
 import { generateEmbedding } from "@/lib/embeddings";
 import { span, setSpanMetadata, textShape } from "@/lib/tracing";
@@ -50,16 +51,27 @@ function getCacheIndexKey(reportHash: string): string {
   return `medic_cache_idx:${reportHash}`;
 }
 
+ * Namespace key for a cache entry.
+ *
+ * Two things share this function: the report summary, which separates one document's
+ * cached answers from another's, and the question, which is the entry's own key. A
+ * collision in either mixes answers belonging to different things - one report's answer
+ * served under another's namespace, or one question's entry overwritten by another's.
+ *
+ * It used to be a 32-bit string hash folded through Math.abs(), which halves the space by
+ * mapping +n and -n onto the same string. Searching random inputs, a mirror pair turned up
+ * after ~19k samples and a true collision after ~119k - far beyond this app's traffic, but
+ * the codebase already hashes document identity with SHA-256 and there is no reason for
+ * the cache to be the weak link.
+ *
+ * Truncated to 32 hex characters: 128 bits puts collisions out of reach while keeping keys
+ * readable in redis-cli and in a trace. `generateDocumentId` in @/utils is the same
+ * algorithm, but importing it here would pull in that module's Pinecone client - and with
+ * it a PINECONE_API_KEY requirement - for the sake of one hash.
+ */
 function generateReportHash(reportData?: string): string {
   // With no report uploaded, chats share one namespace instead of crashing on undefined.
-  const source = reportData ?? "";
-  let hash = 0;
-  for (let i = 0; i < source.length; i++) {
-    const char = source.charCodeAt(i);
-    hash = (hash << 5) - hash + char;
-    hash = hash & hash;
-  }
-  return Math.abs(hash).toString(36);
+  return createHash("sha256").update(reportData ?? "").digest("hex").slice(0, 32);
 }
 
 interface CacheEntry {
@@ -276,6 +288,70 @@ export async function markConversationMemory(documentId: string): Promise<void> 
     // Best-effort, matching storeVault: a lost flag costs a skipped retrieval on the
     // next turn, not a broken answer.
     console.error("Error setting conversation memory flag:", error);
+  }
+}
+
+/**
+ * The parts of an ingest result that cannot be recomputed cheaply.
+ *
+ * Deliberately not the document text or the vectors: those already live in Pinecone, chunk
+ * by chunk, and copying them here would give the same bytes two homes that can drift. The
+ * summary is the one output with nowhere else to live - it comes from a Gemini call with no
+ * temperature pinned, so re-uploading the same file produced a differently worded summary
+ * every time.
+ *
+ * That mattered beyond the wasted call: the response cache namespaces on a hash of the
+ * summary, so a reworded summary orphaned every answer cached under the previous one. The
+ * counters ride along so a duplicate upload can return a byte-identical response.
+ */
+export interface StoredIngestResult {
+  redactedSummary: string;
+  piiCount: number;
+  triplesStored: number;
+  chunkCount: number;
+  figuresDescribed: number;
+  figuresSkipped: number;
+  figuresFailed: boolean;
+  vectorStoreFailed: boolean;
+  graphStoreFailed: boolean;
+}
+
+function getIngestKey(documentId: string): string {
+  return `medic_ingest:${documentId}`;
+}
+
+/**
+ * Same 24h TTL as the vault, and written next to it, so the two expire together. A stored
+ * result outliving its vault would hand back a summary that rehydrates to nothing; a vault
+ * outliving its result just costs one re-ingest.
+ */
+export async function storeIngestResult(
+  documentId: string,
+  result: StoredIngestResult,
+  ttlSeconds: number = 86400
+): Promise<void> {
+  if (!documentId) return;
+  try {
+    await redis.setex(getIngestKey(documentId), ttlSeconds, JSON.stringify(result));
+  } catch (error) {
+    // Best-effort: losing this costs a re-ingest next time, never a failed upload.
+    console.error("Error storing ingest result:", error);
+  }
+}
+
+export async function getIngestResult(documentId: string): Promise<StoredIngestResult | null> {
+  if (!documentId) return null;
+  try {
+    // Upstash auto-deserializes stored JSON, so a string and an object both arrive here.
+    const raw = await redis.get<StoredIngestResult | string>(getIngestKey(documentId));
+    if (!raw) return null;
+    const parsed = typeof raw === "string" ? (JSON.parse(raw) as StoredIngestResult) : raw;
+    // A blank summary would hand the chat route an empty report, so treat it as absent
+    // rather than short-circuiting into a worse result than a re-ingest would give.
+    return parsed?.redactedSummary ? parsed : null;
+  } catch (error) {
+    console.error("Error reading ingest result:", error);
+    return null;
   }
 }
 

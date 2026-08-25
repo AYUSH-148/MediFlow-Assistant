@@ -211,9 +211,42 @@ status is read from the provider's error, never its message: it can quote the pr
 and on this route the prompt contains report text. The client keeps the failed message,
 renders the reason, and offers a retry.
 
+### ♻️ Re-uploading the same report
+
+Document identity is a SHA-256 of the text layer, which `pdf-parse` produces locally and
+deterministically — so it is known **before** any model call. The dedup check used to run
+99 lines later, after both Gemini calls had already been paid for, and only ever saved the
+indexing.
+
+Checking it early saves the calls, and fixes something worse than their cost. `analyzeText`
+pins no temperature, so every re-upload produced a **differently worded summary** — and the
+response cache namespaces on a hash of that summary. A reworded summary started an empty
+namespace, so a user re-uploading their report silently lost every cached answer.
+
+The summary and its counters are therefore stored beside the vault, under the same 24h TTL,
+and a duplicate upload returns them unchanged:
+
+| | Cold upload | Duplicate |
+|---|---|---|
+| Gemini calls | 2 | **0** |
+| Embedding calls | 1 per chunk | **0** |
+| Pinecone writes | yes | **0** |
+| Summary | freshly generated | **byte-identical to the first** |
+
+Deliberately stored: the summary and the counters. Deliberately **not** stored: the document
+text or the vectors — those already live in Pinecone chunk by chunk, and copying them here
+would give the same bytes two homes that can drift. The rule is to store what would have to
+be *recomputed*, not everything that was *touched*.
+
+Only the text-layer path can use this. The OCR paths get their text out of the model, so
+there is no identity to hash until the call has already been made. And both keys are
+required: a stored result without its vault would hand back a summary whose tokens no longer
+resolve, so it falls back to a full re-ingest.
+
 ### ⚡ Semantic caching
 
 Answers are cached in Redis keyed by report hash, matched by **cosine similarity ≥ 0.95** rather than by exact string. The match runs against the guard's **resolved** question, not the raw one — that is what stops two identical-looking follow-ups from colliding on one key. Cache hits are re-emitted in the AI SDK data-stream protocol so the client parses them identically to a live generation. Entries for a report are enumerated through a **per-report index set** (`SMEMBERS`), not `KEYS`. `KEYS` reads as one call and is not: it walks the *entire* keyspace — every report, vault and flag for every user — and filters by prefix afterwards, so its cost grows with traffic unrelated to the request making it. The similarity scan that follows is O(N) and was never the bottleneck — measured under 2 ms at 1000 entries, against the ~100-300 ms embedding call every lookup makes first. Entries expire on their own TTL while set members do not, so stale members are pruned as they are noticed. `bestSimilarity` is recorded on misses too — otherwise a threshold that never fires is indistinguishable from a cold cache.
+Answers are cached in Redis keyed by report hash, matched by **cosine similarity ≥ 0.95** rather than by exact string. The match runs against the guard's **resolved** question, not the raw one — that is what stops two identical-looking follow-ups from colliding on one key. Cache hits are re-emitted in the AI SDK data-stream protocol so the client parses them identically to a live generation. The report hash keying those namespaces is **SHA-256** (truncated to 128 bits), not the 32-bit string hash it started as: that one folded `+n` and `-n` onto the same key through `Math.abs`, and searching random inputs turned up a mirror pair after ~19k samples and a true collision after ~119k. Well beyond this app's traffic, but a collision means one report's cached answers served under another's namespace, and document identity was already hashed properly five lines away. `bestSimilarity` is recorded on misses too — otherwise a threshold that never fires is indistinguishable from a cold cache.
 
 ### 🖼️ Figures in born-digital reports
 
