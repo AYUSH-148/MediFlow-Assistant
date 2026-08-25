@@ -213,7 +213,7 @@ renders the reason, and offers a retry.
 
 ### ⚡ Semantic caching
 
-Answers are cached in Redis keyed by report hash, matched by **cosine similarity ≥ 0.95** rather than by exact string. The match runs against the guard's **resolved** question, not the raw one — that is what stops two identical-looking follow-ups from colliding on one key. Cache hits are re-emitted in the AI SDK data-stream protocol so the client parses them identically to a live generation. `bestSimilarity` is recorded on misses too — otherwise a threshold that never fires is indistinguishable from a cold cache.
+Answers are cached in Redis keyed by report hash, matched by **cosine similarity ≥ 0.95** rather than by exact string. The match runs against the guard's **resolved** question, not the raw one — that is what stops two identical-looking follow-ups from colliding on one key. Cache hits are re-emitted in the AI SDK data-stream protocol so the client parses them identically to a live generation. The report hash keying those namespaces is **SHA-256** (truncated to 128 bits), not the 32-bit string hash it started as: that one folded `+n` and `-n` onto the same key through `Math.abs`, and searching random inputs turned up a mirror pair after ~19k samples and a true collision after ~119k. Well beyond this app's traffic, but a collision means one report's cached answers served under another's namespace, and document identity was already hashed properly five lines away. `bestSimilarity` is recorded on misses too — otherwise a threshold that never fires is indistinguishable from a cold cache.
 
 ### 🖼️ Figures in born-digital reports
 
