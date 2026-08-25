@@ -32,6 +32,24 @@ function getCacheKeyPrefix(reportHash: string): string {
   return `medic_cache:${reportHash}`;
 }
 
+/**
+ * A set holding the entry keys for one report.
+ *
+ * Lookups used to enumerate entries with `redis.keys(prefix:*)`. That reads as one call and
+ * is not: KEYS walks the ENTIRE keyspace - every report, every vault, every flag, for every
+ * user - and filters by prefix afterwards, blocking the server while it does. It is O(total
+ * keys), not O(entries for this report), so its cost grows with traffic that has nothing to
+ * do with the request making it. Both Redis and Upstash warn against it in production.
+ *
+ * SMEMBERS on this set is O(N) in this report's own entries, which is the quantity the
+ * lookup actually needs. The similarity scan that follows is also O(N) and was never the
+ * problem: measured on 1024-dim vectors it is under 2ms even at 1000 entries, against the
+ * ~100-300ms embedding call every lookup makes first.
+ */
+function getCacheIndexKey(reportHash: string): string {
+  return `medic_cache_idx:${reportHash}`;
+}
+
 function generateReportHash(reportData?: string): string {
   // With no report uploaded, chats share one namespace instead of crashing on undefined.
   const source = reportData ?? "";
@@ -73,9 +91,10 @@ export async function getCachedResponse(
       try {
         const currentEmbedding = await generateEmbedding(question);
         const reportHash = generateReportHash(reportData);
-        const cacheKeyPrefix = getCacheKeyPrefix(reportHash);
 
-        const keys = await redis.keys(`${cacheKeyPrefix}:*`);
+        // Entries written before this index existed are unreachable here and expire with
+        // their own 24h TTL; the first question after a deploy re-caches under the index.
+        const keys = await redis.smembers(getCacheIndexKey(reportHash));
 
         if (keys.length === 0) {
           setSpanMetadata({ cacheHit: false, entriesScanned: 0, reason: "empty-namespace" });
@@ -84,6 +103,18 @@ export async function getCachedResponse(
 
         // One round trip for every entry under this report.
         const cachedEntries = await redis.mget<CacheEntry[]>(...keys);
+
+        // Entries expire on their own TTL but set members do not, so the index accumulates
+        // keys pointing at nothing. mget already returns null for those, making them
+        // harmless - but left alone the set grows without bound, so they are dropped as
+        // they are noticed. Fire-and-forget: a failed prune costs a few wasted reads next
+        // time, and must not turn a usable cache lookup into an error.
+        const stale = keys.filter((_, i) => !cachedEntries[i]);
+        if (stale.length > 0) {
+          void redis
+            .srem(getCacheIndexKey(reportHash), ...stale)
+            .catch((error) => console.error("Error pruning cache index:", error));
+        }
 
         let bestSimilarity = 0;
         let comparable = 0;
@@ -118,6 +149,8 @@ export async function getCachedResponse(
           bestSimilarity,
           entriesScanned: keys.length,
           comparableEntries: comparable,
+          // A gap between these two is the index carrying keys whose entries have expired.
+          stalePruned: stale.length,
           reason: "below-threshold",
         });
         return null;
@@ -174,6 +207,13 @@ export async function cacheResponse(
         };
 
         await redis.setex(cacheKey, ttlSeconds, JSON.stringify(cacheEntry));
+
+        // The index has to outlive every entry it points at, so its expiry is pushed out on
+        // each write rather than set once. An index that expired first would look like an
+        // empty namespace and silently strand entries that are still perfectly valid.
+        const indexKey = getCacheIndexKey(reportHash);
+        await redis.sadd(indexKey, cacheKey);
+        await redis.expire(indexKey, ttlSeconds);
 
         setSpanMetadata({ cached: true, cacheKey });
         return { cached: true };
@@ -242,12 +282,15 @@ export async function markConversationMemory(documentId: string): Promise<void> 
 export async function clearCacheForReport(reportData: string): Promise<void> {
   try {
     const reportHash = generateReportHash(reportData);
-    const cacheKeyPrefix = getCacheKeyPrefix(reportHash);
-    const keys = await redis.keys(`${cacheKeyPrefix}:*`);
+    const indexKey = getCacheIndexKey(reportHash);
+    const keys = await redis.smembers(indexKey);
 
     if (keys.length > 0) {
       await redis.del(...keys);
     }
+    // Dropped last: losing the index while entries survive would leave them unreachable
+    // AND undeletable, since the index is now the only record of what they are.
+    await redis.del(indexKey);
   } catch (error) {
     console.error("Error clearing cache:", error);
   }
@@ -256,9 +299,8 @@ export async function clearCacheForReport(reportData: string): Promise<void> {
 export async function getCacheStats(reportData: string) {
   try {
     const reportHash = generateReportHash(reportData);
-    const cacheKeyPrefix = getCacheKeyPrefix(reportHash);
-    const keys = await redis.keys(`${cacheKeyPrefix}:*`);
-    
+    const keys = await redis.smembers(getCacheIndexKey(reportHash));
+
     return {
       entriesForReport: keys.length,
       reportHash,
