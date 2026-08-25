@@ -252,6 +252,70 @@ export async function markConversationMemory(documentId: string): Promise<void> 
   }
 }
 
+/**
+ * The parts of an ingest result that cannot be recomputed cheaply.
+ *
+ * Deliberately not the document text or the vectors: those already live in Pinecone, chunk
+ * by chunk, and copying them here would give the same bytes two homes that can drift. The
+ * summary is the one output with nowhere else to live - it comes from a Gemini call with no
+ * temperature pinned, so re-uploading the same file produced a differently worded summary
+ * every time.
+ *
+ * That mattered beyond the wasted call: the response cache namespaces on a hash of the
+ * summary, so a reworded summary orphaned every answer cached under the previous one. The
+ * counters ride along so a duplicate upload can return a byte-identical response.
+ */
+export interface StoredIngestResult {
+  redactedSummary: string;
+  piiCount: number;
+  triplesStored: number;
+  chunkCount: number;
+  figuresDescribed: number;
+  figuresSkipped: number;
+  figuresFailed: boolean;
+  vectorStoreFailed: boolean;
+  graphStoreFailed: boolean;
+}
+
+function getIngestKey(documentId: string): string {
+  return `medic_ingest:${documentId}`;
+}
+
+/**
+ * Same 24h TTL as the vault, and written next to it, so the two expire together. A stored
+ * result outliving its vault would hand back a summary that rehydrates to nothing; a vault
+ * outliving its result just costs one re-ingest.
+ */
+export async function storeIngestResult(
+  documentId: string,
+  result: StoredIngestResult,
+  ttlSeconds: number = 86400
+): Promise<void> {
+  if (!documentId) return;
+  try {
+    await redis.setex(getIngestKey(documentId), ttlSeconds, JSON.stringify(result));
+  } catch (error) {
+    // Best-effort: losing this costs a re-ingest next time, never a failed upload.
+    console.error("Error storing ingest result:", error);
+  }
+}
+
+export async function getIngestResult(documentId: string): Promise<StoredIngestResult | null> {
+  if (!documentId) return null;
+  try {
+    // Upstash auto-deserializes stored JSON, so a string and an object both arrive here.
+    const raw = await redis.get<StoredIngestResult | string>(getIngestKey(documentId));
+    if (!raw) return null;
+    const parsed = typeof raw === "string" ? (JSON.parse(raw) as StoredIngestResult) : raw;
+    // A blank summary would hand the chat route an empty report, so treat it as absent
+    // rather than short-circuiting into a worse result than a re-ingest would give.
+    return parsed?.redactedSummary ? parsed : null;
+  } catch (error) {
+    console.error("Error reading ingest result:", error);
+    return null;
+  }
+}
+
 export async function clearCacheForReport(reportData: string): Promise<void> {
   try {
     const reportHash = generateReportHash(reportData);

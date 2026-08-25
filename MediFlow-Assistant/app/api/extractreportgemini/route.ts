@@ -6,6 +6,7 @@ import { geminiModel, GEMINI_MODEL_ID } from "@/lib/gemini";
 import { generateEmbeddings } from "@/lib/embeddings";
 import { describePdfFigures, NO_FIGURES, type FigureExtraction } from "@/lib/pdf-figures";
 import { generateDocumentId, upsertVectors, pinecone } from "@/utils";
+import { getIngestResult, storeIngestResult } from "@/lib/cache";
 import {
   span,
   setSpanMetadata,
@@ -381,6 +382,48 @@ export async function POST(req: Request) {
   }
 }
 
+/**
+ * Return the stored result for a document already ingested, or null.
+ *
+ * Only reachable from the text-layer path. The OCR paths cannot use it: their text comes
+ * out of the model, so there is no identity to hash until the call has already been made.
+ *
+ * Both the vault and the stored result are required. A result without its vault would hand
+ * the client a summary whose tokens no longer resolve to anything, which is a worse outcome
+ * than simply re-ingesting.
+ */
+async function reuseIngestedReport(documentId: string): Promise<Response | null> {
+  const [stored, vault] = await Promise.all([getIngestResult(documentId), getVault(documentId)]);
+  if (!stored || !vault) return null;
+
+  // Re-uploading is the user saying they still want this report, so both keys get their
+  // 24h window back - matching what the existing duplicate path does for the vault.
+  await Promise.all([storeVault(documentId, vault), storeIngestResult(documentId, stored)]);
+
+  setSpanMetadata({
+    outcome: "ok",
+    extractionPath: "duplicate-reuse",
+    vaultId: documentId,
+    duplicate: true,
+    reusedStoredResult: true,
+    // The point of the whole branch: a re-upload now costs two Redis reads instead of an
+    // extraction call and a figure call.
+    geminiCallsSaved: 2,
+    piiCount: stored.piiCount,
+    chunkCount: stored.chunkCount,
+  });
+
+  return new Response(
+    JSON.stringify({
+      ...stored,
+      vaultId: documentId,
+      duplicate: true,
+      searchable: !stored.vectorStoreFailed,
+    }),
+    { status: 200, headers: { "Content-Type": "application/json" } }
+  );
+}
+
 async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response> {
   let fullText: string;
   let summary: string;
@@ -395,6 +438,21 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
       if (textLayer) {
         setSpanMetadata({ extractionPath: "pdf-text-layer" });
         fullText = textLayer;
+
+        // Identity is known here, before a single model call: documentId hashes the text
+        // layer, which pdf-parse produced locally and deterministically.
+        //
+        // The dedup check further down runs 99 lines later, after both Gemini calls have
+        // already been paid for - it only ever saved the indexing. Checking here saves the
+        // calls themselves, and fixes something worse than the cost: analyzeText pins no
+        // temperature, so every re-upload produced a differently worded summary, and the
+        // response cache namespaces on a hash of that summary. A reworded summary orphaned
+        // every answer cached under the previous one, so a user re-uploading their report
+        // silently lost their cache.
+        const knownId = generateDocumentId(textLayer);
+        const shortCircuit = await reuseIngestedReport(knownId);
+        if (shortCircuit) return shortCircuit;
+
         ({ summary, triples } = await analyzeText(fullText));
 
         // Deliberately after analyzeText, so the summary and the graph triples are derived
@@ -658,6 +716,24 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
     // context; a missing index means the report cannot be searched at all.
     searchable: !vectorStoreFailed,
   };
+
+  // Stored so the next upload of this document can skip both model calls - and, more to the
+  // point, reuse this exact summary. The response cache keys on a hash of it, so a
+  // regenerated wording would start an empty namespace and lose every cached answer.
+  //
+  // A degraded ingest is stored too: the flags travel with it, so the reused response
+  // reports the same "not searchable" state rather than looking like a clean success.
+  await storeIngestResult(documentId, {
+    redactedSummary,
+    piiCount,
+    triplesStored: triples ? triples.length : 0,
+    chunkCount,
+    figuresDescribed: figures.described,
+    figuresSkipped: figures.skipped,
+    figuresFailed: figures.failed,
+    vectorStoreFailed,
+    graphStoreFailed,
+  });
 
   // Rolled onto the root span so one trace answers "did this upload actually land?".
   // A 200 with degraded: true is the case worth alerting on - the user saw success
