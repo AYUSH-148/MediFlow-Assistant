@@ -35,10 +35,37 @@ const SESSION_TTL_SECONDS = 86400;
 // paired with another's summary.
 const MAX_SUMMARY_CHARS = 20_000;
 
+export interface StoredTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
 export interface DocumentSession {
   documentId: string;
   summary: string;
+  /**
+   * The conversation so far, oldest first.
+   *
+   * Held server-side so a page refresh does not start an empty chat. `useChat` keeps the
+   * transcript in React state and posts it on every request, which is enough while the tab
+   * lives; a reload loses it, and the client would then send an empty array while the user
+   * still sees a report loaded.
+   *
+   * Stored as plain turns rather than embedded, because retrieving a conversation by
+   * similarity was the wrong tool: it returns the top k out of order, so "what did I ask
+   * before that?" is unanswerable by construction, and the whole transcript costs a
+   * fraction of the context window anyway.
+   */
+  transcript?: StoredTurn[];
 }
+
+// A conversation this long has other problems, but an unbounded array in one Redis value
+// is a memory and payload risk, so the oldest turns are dropped. At roughly 250 tokens a
+// turn this is ~50k tokens, still a few percent of a 1M-token window.
+const MAX_STORED_TURNS = 200;
+
+// Guards one pathological message from making the whole session value unwritable.
+const MAX_TURN_CHARS = 8_000;
 
 function sessionKey(sessionId: string): string {
   return `medic_session:${sessionId}`;
@@ -56,9 +83,44 @@ export async function createDocumentSession(
   await redis.setex(
     sessionKey(sessionId),
     SESSION_TTL_SECONDS,
-    JSON.stringify({ documentId, summary } satisfies DocumentSession)
+    JSON.stringify({ documentId, summary, transcript: [] } satisfies DocumentSession)
   );
   return sessionId;
+}
+
+/**
+ * Append one completed exchange to the stored transcript.
+ *
+ * Written after the answer has finished streaming, so a turn the model never completed is
+ * not recorded as one that happened. Best-effort throughout: losing a turn costs some
+ * history on a refresh, and must never fail a request whose answer already reached the
+ * user.
+ */
+export async function appendSessionTurns(
+  sessionId: string | null,
+  turns: StoredTurn[]
+): Promise<void> {
+  if (!sessionId || turns.length === 0) return;
+  try {
+    const session = await getDocumentSession(sessionId);
+    if (!session) return;
+
+    const trimmed = turns.map((turn) => ({
+      role: turn.role,
+      content: turn.content.slice(0, MAX_TURN_CHARS),
+    }));
+    const transcript = [...(session.transcript ?? []), ...trimmed].slice(-MAX_STORED_TURNS);
+
+    // The TTL is refreshed rather than preserved: an active conversation should not expire
+    // out from under itself 24h after the upload that started it.
+    await redis.setex(
+      sessionKey(sessionId),
+      SESSION_TTL_SECONDS,
+      JSON.stringify({ ...session, transcript } satisfies DocumentSession)
+    );
+  } catch (error) {
+    console.error("Error appending session turns:", error);
+  }
 }
 
 export async function getDocumentSession(
@@ -91,7 +153,13 @@ export async function updateSessionSummary(
   if (!session || !sessionId) return null;
 
   const trimmed = summary.slice(0, MAX_SUMMARY_CHARS);
-  const updated: DocumentSession = { documentId: session.documentId, summary: trimmed };
+  // Keeps the transcript: confirming a summary is a step in the same conversation, not the
+  // start of a new one.
+  const updated: DocumentSession = {
+    documentId: session.documentId,
+    summary: trimmed,
+    transcript: session.transcript ?? [],
+  };
   await redis.setex(sessionKey(sessionId), SESSION_TTL_SECONDS, JSON.stringify(updated));
   return updated;
 }

@@ -278,6 +278,41 @@ there is no identity to hash until the call has already been made. And both keys
 required: a stored result without its vault would hand back a summary whose tokens no longer
 resolve, so it falls back to a full re-ingest.
 
+### 💬 Conversation memory is the transcript, not a vector search
+
+Chat history used to be a second Pinecone namespace: embed each completed turn, retrieve by
+similarity, search it in parallel with the report. That cost an embedding call plus a
+`topK 12` query and a `topK 500` corpus pull **on every turn** — to recover turns the request
+body already contained. `useChat` posts the entire transcript with each message, and the
+route kept the last four and discarded the rest.
+
+It was also the wrong retrieval shape. Vector search returns the top *k* ranked by
+similarity, so the model received turn 3 and turn 17 with no indication of order — *"what did
+I ask before that?"* was unanswerable however good the recall was.
+
+The whole conversation is now passed verbatim. At roughly 250 tokens per turn against a
+1M-token window it costs a fraction of a percent, and it is **lossless and ordered** where
+the vector search was neither.
+
+| | Vector memory | Transcript |
+|---|---|---|
+| Cost per turn | 1 embedding + 2 Pinecone queries | **0** |
+| Recall | top *k* | **everything** |
+| Order | by similarity | **chronological** |
+| Failure modes | unbounded growth, no pruning, TTL skew against the vault, once searched unfiltered across documents | none |
+
+The transcript is also stored server-side against the session, because `useChat` keeps it in
+React state and a refresh empties it — the client would then post an empty array while the
+user still sees a report loaded. Whichever copy is longer wins, so no merge is needed, and
+`transcriptRestored` is traced when the server's copy carried the conversation. It is capped
+at 200 turns with each turn truncated to 8k characters, so one pathological message cannot
+make a session unwritable.
+
+Summarising older turns is the right fallback, and is deliberately **not built**: at ~250
+tokens a turn, staying under even a tenth of the window means roughly 400 turns. A rolling
+summary would add an LLM call, a lossy compaction, and errors that compound across
+compactions — real costs against a threshold this app will not reach.
+
 ### ⚡ Semantic caching
 
 Answers are cached in Redis keyed by report hash, matched by **cosine similarity ≥ 0.95** rather than by exact string. The match runs against the guard's **resolved** question, not the raw one — that is what stops two identical-looking follow-ups from colliding on one key. Cache hits are re-emitted in the AI SDK data-stream protocol so the client parses them identically to a live generation. Entries for a report are enumerated through a **per-report index set** (`SMEMBERS`), not `KEYS`. `KEYS` reads as one call and is not: it walks the *entire* keyspace — every report, vault and flag for every user — and filters by prefix afterwards, so its cost grows with traffic unrelated to the request making it. The similarity scan that follows is O(N) and was never the bottleneck — measured under 2 ms at 1000 entries, against the ~100-300 ms embedding call every lookup makes first. Entries expire on their own TTL while set members do not, so stale members are pruned as they are noticed. `bestSimilarity` is recorded on misses too — otherwise a threshold that never fires is indistinguishable from a cold cache.
@@ -426,7 +461,7 @@ LANGSMITH_ENDPOINT=https://api.smith.langchain.com
 | Namespace | Contents |
 |---|---|
 | `diagnosis2` | Redacted report chunks |
-| `conversation-history` | Per-document chat memory |
+
 
 Then:
 
