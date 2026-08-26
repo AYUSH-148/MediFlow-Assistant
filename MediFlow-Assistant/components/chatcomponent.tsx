@@ -11,7 +11,6 @@ import Markdown from './markdown';
 type Props = {
   reportData?: {
     redactedSummary: string;
-    vaultId: string;
   }
   onOpenReport?: () => void
 }
@@ -109,12 +108,7 @@ const ChatComponent = ({ reportData, onOpenReport }: Props) => {
               variant="outline"
               size="sm"
               className="mt-2 gap-1.5"
-              onClick={() => reload({
-                data: {
-                  reportData: reportData?.redactedSummary as string,
-                  vaultId: reportData?.vaultId as string,
-                },
-              })}
+              onClick={() => reload()}
               disabled={isLoading}
             >
               <RotateCcw className="h-3.5 w-3.5" />
@@ -127,12 +121,9 @@ const ChatComponent = ({ reportData, onOpenReport }: Props) => {
         className="relative overflow-hidden rounded-lg border bg-background"
         onSubmit={(event) => {
           event.preventDefault();
-          handleSubmit(event, {
-            data: {
-              reportData: reportData?.redactedSummary as string,
-              vaultId: reportData?.vaultId as string,
-            },
-          });
+          // No document id and no summary: the server resolves both from the session
+          // cookie, so a chat request carries nothing that names a document.
+          handleSubmit(event);
         }}
       >
         <Textarea

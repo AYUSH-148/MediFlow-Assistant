@@ -252,46 +252,6 @@ export async function cacheResponse(
   );
 }
 
-// Records whether the `conversation-history` Pinecone namespace holds anything for a
-// document, so the chat route can skip that retrieval when it could only ever miss. A
-// Redis EXISTS is orders of magnitude cheaper than an embedding plus two Pinecone
-// queries.
-//
-// Stored with NO TTL, unlike the vault and the response cache above: the Pinecone memory
-// vectors this mirrors are never deleted, so an expiring flag would drift out of sync
-// and silently switch memory retrieval off for older reports. If memory pruning is ever
-// added, delete this key in the same place.
-
-function getMemoryFlagKey(documentId: string): string {
-  return `medic_memory:${documentId}`;
-}
-
-export async function hasConversationMemory(documentId: string): Promise<boolean> {
-  if (!documentId) return false;
-
-  try {
-    return (await redis.exists(getMemoryFlagKey(documentId))) === 1;
-  } catch (error) {
-    // Fail OPEN. Answering "true" wrongly costs one wasted retrieval; answering
-    // "false" wrongly would disable conversation memory for every request during a
-    // Redis outage, which shows up only as quietly worse answers.
-    console.error("Error checking conversation memory flag:", error);
-    return true;
-  }
-}
-
-export async function markConversationMemory(documentId: string): Promise<void> {
-  if (!documentId) return;
-
-  try {
-    await redis.set(getMemoryFlagKey(documentId), "1");
-  } catch (error) {
-    // Best-effort, matching storeVault: a lost flag costs a skipped retrieval on the
-    // next turn, not a broken answer.
-    console.error("Error setting conversation memory flag:", error);
-  }
-}
-
 /**
  * The parts of an ingest result that cannot be recomputed cheaply.
  *
