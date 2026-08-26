@@ -10,7 +10,7 @@ import { AlertTriangle, Loader2, ShieldAlert, ShieldCheck, UploadCloud } from 'l
 import { Badge } from './ui/badge'
 
 type Props = {
-    onReportConfirmation: (data: { redactedSummary: string; vaultId: string }) => void
+    onReportConfirmation: (data: { redactedSummary: string }) => void
 }
 
 const STEPS = [{ label: 'Upload' }, { label: 'Review' }, { label: 'Ask' }]
@@ -45,7 +45,9 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
     const [isDragging, setIsDragging] = useState(false)
     const [isLoading, setIsLoading] = useState(false);
     const [reportData, setReportData] = useState("");
-    const [vaultId, setVaultId] = useState("");
+    // The upload sets an HttpOnly session cookie naming the document; the id itself never
+    // reaches this component, so `hasReport` is all the client needs to track.
+    const [hasReport, setHasReport] = useState(false);
     const [piiCount, setPiiCount] = useState(0);
     // Set when the route reports it read the document but could not index it. The report is
     // still worth showing - the summary is real - but retrieval has nothing to search, so
@@ -102,7 +104,7 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
         // Drop anything extracted from the previous file.
         setUploadFile(null);
         setReportData("");
-        setVaultId("");
+        setHasReport(false);
         setPiiCount(0);
         setUnsearchable(false);
         setConfirmed(false);
@@ -182,7 +184,7 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
         setSelectedFile(null);
         setUploadFile(null);
         setReportData('');
-        setVaultId('');
+        setHasReport(false);
         setPiiCount(0);
         setUnsearchable(false);
         setConfirmed(false);
@@ -277,7 +279,7 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
             if (response.ok) {
                 const data = await response.json();
                 setReportData(data.redactedSummary);
-                setVaultId(data.vaultId);
+                setHasReport(true);
                 setPiiCount(data.piiCount);
                 // `searchable: false` means indexing failed, which the route used to swallow
                 // into an unqualified 200. Note this is not `chunkCount === 0`: a re-upload
@@ -432,16 +434,41 @@ const ReportComponent = ({ onReportConfirmation }: Props) => {
                     <Button
                         variant="destructive"
                         className="bg-[#D90013]"
-                        onClick={() => {
-                            if (!reportData || !vaultId) {
+                        onClick={async () => {
+                            if (!reportData || !hasReport) {
                                 toast({
                                     variant: 'destructive',
                                     description: "Please upload and process a report first!",
                                 });
                                 return;
                             }
+                            // The summary the user may have edited is bound to the session
+                            // here, once, rather than travelling with every chat message.
+                            // Chat requests then carry only the question.
+                            try {
+                                const res = await fetch("api/session/report", {
+                                    method: "POST",
+                                    headers: { "Content-Type": "application/json" },
+                                    body: JSON.stringify({ summary: reportData }),
+                                });
+                                if (!res.ok) {
+                                    const message = await res.json().then((b) => b?.error).catch(() => null);
+                                    toast({
+                                        variant: 'destructive',
+                                        description: message ?? "Couldn't start the chat session. Try uploading again.",
+                                    });
+                                    return;
+                                }
+                            } catch (error) {
+                                console.error("Failed to confirm report session:", error);
+                                toast({
+                                    variant: 'destructive',
+                                    description: "Couldn't reach the server. Check your connection and try again.",
+                                });
+                                return;
+                            }
                             setConfirmed(true);
-                            onReportConfirmation({ redactedSummary: reportData, vaultId });
+                            onReportConfirmation({ redactedSummary: reportData });
                         }}
                     >
                         {/* Not disabled: the summary is real and worth reading, and blocking

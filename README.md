@@ -86,6 +86,41 @@ Most RAG demos stop at "chunk a PDF, embed it, stuff it in a prompt." The hard p
 
 ## Engineering deep dives
 
+### 🔑 Session-scoped documents
+
+The chat route used to take `vaultId` straight out of the request body. That one string
+unlocked the document's chunks in Pinecone, its nodes in Neo4j, and — the part that matters
+— its **vault**, where the real name, MRN and date of birth live. No ownership check
+existed, because there was nothing to check against: no users, no accounts, no sessions.
+
+It was not guessable (a SHA-256 of the report text), but it was derived from *content*
+rather than being a per-request secret, so the same file always produced the same id — and
+it travelled in every chat body, where any request log would capture it.
+
+The id no longer reaches the browser. Upload sets an **`HttpOnly` cookie** holding 32 random
+bytes; the mapping to a document lives in Redis under the same 24h TTL as the vault:
+
+| | Before | After |
+|---|---|---|
+| Client knows the document id | yes | **no** |
+| Chat request names a document | `vaultId` in the body | **nothing** |
+| Readable by page JavaScript | yes | **no** (`HttpOnly`) |
+| Leaks through request-body logs | yes | **no** (it is a header) |
+| Session id derived from | — | `randomBytes(32)`, not content |
+
+The client cannot name a document, so there is no field to tamper with — a stronger
+guarantee than validating one.
+
+The summary is bound to the session too, but it still comes from the client, because the
+review step deliberately lets the user edit it and add their own history and symptoms. What
+changed is that it is written **once**, at confirmation, against a session that already
+names a document — so one report's id can no longer be paired with another's summary. It
+remains user-controlled text reaching a prompt, and is treated as untrusted downstream.
+
+This is not authentication: there are still no accounts, and a stolen cookie still works.
+It removes forgery and the id's presence in every request body, which is what the previous
+design gave away for free.
+
 ### 🔒 PII redaction with a token vault
 
 Redaction runs over the **entire document** before chunking, not just the summary — so no identifier ever reaches Pinecone.
@@ -451,6 +486,7 @@ MediFlow-Assistant/
 - The query guard and the retrieval grader are **model judgment, not deterministic rules**. Both can misclassify — a legitimate question refused, or irrelevant chunks kept — and both deliberately fail open, so an outage degrades to the older, less careful behaviour rather than blocking the chat. Their spans record `intent`, `verdict` and `ungraded` precisely so drift is measurable rather than anecdotal.
 - Answering a question now costs **three sequential Gemini calls** rather than one. Refusals and clarifications short-circuit before retrieval and grading, so the cheap paths stayed cheap, but the common case pays roughly two extra Flash round trips for the grounding.
 - An indexing failure still returns a usable summary rather than failing the upload, but the response now says so (`searchable: false`) and the UI stops reporting success. Before that, a Pinecone or HuggingFace outage produced "Report processed!" for a document the chat could not search, and every question about it was answered "this is not in your report".
+- There is still no user account model. A session cookie binds a browser to the document it uploaded, which stops one client naming another's document, but a stolen cookie is a working key until it expires.
 - A guard outage and a quota failure look the same from the user's chair, though they are distinguishable in a trace: the root span records `guardIntent` and `guardFailed`, and a generation failure closes with `outcome: "error"`.
 - Gemini safety filters are disabled — clinical prompts about dosages and treatments get blocked at default thresholds, and a blocked generation returns empty text rather than an error. Report contents are injected verbatim, so uploaded documents should be treated as untrusted input.
 - Uploads are capped at **4MB** and held in request memory for the lifetime of the request, so a large report is rejected rather than queued. Raising that ceiling means uploading to object storage instead — which for this pipeline would mean a durable copy of the *unredacted* document living outside the request, so it is deliberately not done: today the raw file is never persisted anywhere.

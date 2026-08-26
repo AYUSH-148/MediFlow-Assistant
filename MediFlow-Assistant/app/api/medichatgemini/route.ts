@@ -6,6 +6,7 @@ import {
     upsertConversationMemory,
 } from "@/utils";
 import { buildRetrievalQuery } from "@/lib/embeddings";
+import { getDocumentSession, readSessionId } from "@/lib/session";
 import { gradeRetrieval, buildGroundingInstruction } from "@/lib/retrieval-grader";
 import {
     getCachedResponse,
@@ -267,8 +268,13 @@ export async function POST(req: Request, res: Response) {
     const userQuestion = getMessageText(latestMessage?.content ?? "");
 
     // `data` is {} when the user chats without uploading a report.
-    const reportData: string = reqBody.data?.reportData ?? "";
-    const vaultId: string = reqBody.data?.vaultId ?? "";
+    // Both used to arrive in the request body. The document id is now resolved from an
+    // HttpOnly session cookie the client cannot read or forge, and the summary comes with
+    // it - so a request can no longer pair one document's id with another's summary, and
+    // there is no document field for a caller to supply at all.
+    const session = await getDocumentSession(readSessionId(req));
+    const reportData: string = session?.summary ?? "";
+    const vaultId: string = session?.documentId ?? "";
 
     // Managed by hand because the request does not finish when the Response is returned:
     // on a cache miss the remaining work (buffering, memory write, rehydration) runs in a

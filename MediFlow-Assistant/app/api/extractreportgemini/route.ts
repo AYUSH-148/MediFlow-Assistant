@@ -7,6 +7,7 @@ import { generateEmbeddings } from "@/lib/embeddings";
 import { describePdfFigures, NO_FIGURES, type FigureExtraction } from "@/lib/pdf-figures";
 import { generateDocumentId, upsertVectors, pinecone } from "@/utils";
 import { getIngestResult, storeIngestResult } from "@/lib/cache";
+import { createDocumentSession, sessionCookieHeader } from "@/lib/session";
 import {
   span,
   setSpanMetadata,
@@ -413,14 +414,23 @@ async function reuseIngestedReport(documentId: string): Promise<Response | null>
     chunkCount: stored.chunkCount,
   });
 
+  // A duplicate upload is still a fresh browser asking for this document, so it gets its
+  // own session rather than reusing whatever the last one was.
+  const sessionId = await createDocumentSession(documentId, stored.redactedSummary);
+
   return new Response(
     JSON.stringify({
       ...stored,
-      vaultId: documentId,
       duplicate: true,
       searchable: !stored.vectorStoreFailed,
     }),
-    { status: 200, headers: { "Content-Type": "application/json" } }
+    {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json",
+        "Set-Cookie": sessionCookieHeader(sessionId),
+      },
+    }
   );
 }
 
@@ -698,9 +708,13 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
   // a re-upload skips indexing because the vectors already exist, leaving the count at 0 on
   // a perfectly healthy path. The count alone cannot tell "already indexed" from "failed to
   // index", so the route states which it was instead of leaving the client to guess.
+  // The document id stays server-side from here. It used to be returned as `vaultId` and
+  // sent back on every chat request, which made it a bearer key to the vault for anyone
+  // who saw a request body.
+  const sessionId = await createDocumentSession(documentId, redactedSummary);
+
   const response = {
     redactedSummary,
-    vaultId: documentId,
     piiCount,
     triplesStored: triples ? triples.length : 0,
     chunkCount,
@@ -754,6 +768,9 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
 
   return new Response(JSON.stringify(response), {
     status: 200,
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "Set-Cookie": sessionCookieHeader(sessionId),
+    },
   });
 }
