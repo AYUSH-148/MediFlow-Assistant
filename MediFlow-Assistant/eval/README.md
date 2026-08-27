@@ -22,6 +22,21 @@ rather than silently re-ingesting, because a fixture edited without a rebuild pr
 gold labels describing text the index does not contain — which looks exactly like a
 retrieval regression.
 
+### Retries
+
+Suites retry transient failures with exponential backoff and report how many they needed,
+because a run that needed fifteen produced its latency figures under conditions worth
+knowing about.
+
+The guard suite needs a second mechanism. `guardQuestion` fails open rather than throwing,
+so a rate limit resolves as a well-formed `intent: "answer"` carrying `guardFailed: true` -
+invisible to a retry that watches for exceptions. It therefore retries on that flag via
+`withRetry`'s `retryResult`, and a case that still fails open after its retries is counted
+as an outage that voids the run's metrics rather than scored as a routing decision.
+
+Note that the AI SDK already retries a 429 twice inside a single `generateObject` call, so
+`guardFailed` means the failure survived those too.
+
 ### Environment
 
 Reads `.env.local` then `.env`, same precedence as Next. Each suite requires only what it

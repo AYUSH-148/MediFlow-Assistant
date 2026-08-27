@@ -68,11 +68,23 @@ export interface GuardDecision extends QueryGuard {
     guardFailed: boolean;
 }
 
-// Used when the model routes to clarify/refuse but returns nothing to say. Better a
+// Used when the model routes to clarify or refuse but returns nothing to say. Better a
 // generic prompt than an empty chat bubble.
-const FALLBACK_REPLY =
+//
+// One message used to cover both, and it fitted only one of them: "Could you rephrase
+// that?" is the right thing to say to an ambiguous question and the wrong thing to say to
+// an out-of-scope one, where rephrasing leads to a second refusal. They are separate now.
+const CLARIFY_FALLBACK =
     "Could you rephrase that? I can help with questions about your medical report - " +
     "a medication, a biomarker, a diagnosis, or what a result means.";
+
+// Deliberately does not say "questions about your report". General medical questions are
+// in scope with or without one - "what does hs-CRP measure" is answered - so implying the
+// assistant is useless without an upload would turn one refusal into a wrong belief about
+// what it can do.
+const REFUSE_FALLBACK =
+    "That one is outside what I cover. I can help with health and medicine - what a " +
+    "biomarker measures, what a medication does, or anything in a report you upload.";
 
 function buildPrompt(question: string, history: string, reportSummary: string): string {
     const hasReport = reportSummary.trim().length > 0;
@@ -102,9 +114,18 @@ ${reportSummary}
     return `You are the intake filter for a medical report assistant. Classify the user's message into exactly one intent.
 
 "refuse" - not about health, medicine, the user's medical report, or how to use this
-assistant. General trivia, the current date or time, coding help, small talk. Put a
-one-sentence redirect in "reply" that says what this assistant does cover. Do not
+assistant. General trivia, the current date or time, coding help, small talk. Do not
 answer the question itself, even if you know the answer.
+
+Write "reply" as one or two plain sentences that redirect rather than scold: state
+briefly that this is outside what you cover, then name something concrete the user could
+ask instead. Do not apologise repeatedly, do not explain your restrictions, and do not
+invite them to rephrase - the question was clear, it was simply out of scope, so
+rephrasing only earns a second refusal.
+
+Say the scope is health and medicine, NOT "questions about your report". General medical
+questions are answered with or without an upload, so describing the assistant as
+report-only would leave the user with a wrong idea of what it can do.
 
 "clarify" - the message carries a reference you cannot resolve, so you cannot tell what is
 being asked: a pronoun or back-reference ("is that bad?", "what about the other one?")
@@ -190,7 +211,11 @@ export async function guardQuestion({
                 const resolvedQuestion = object.resolvedQuestion?.trim()
                     ? object.resolvedQuestion
                     : question;
-                const reply = object.reply?.trim() ? object.reply : FALLBACK_REPLY;
+                const reply = object.reply?.trim()
+                    ? object.reply
+                    : object.intent === "refuse"
+                      ? REFUSE_FALLBACK
+                      : CLARIFY_FALLBACK;
 
                 setSpanMetadata({
                     intent: object.intent,

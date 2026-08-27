@@ -1,16 +1,19 @@
 import {
     generateDocumentId,
-    queryPineconeVectorStore,
     queryPineconeVectorStoreDetailed,
     pinecone,
-    upsertConversationMemory,
 } from "@/utils";
+import { buildRetrievalQuery } from "@/lib/embeddings";
+import {
+    getDocumentSession,
+    readSessionId,
+    appendSessionTurns,
+    type StoredTurn,
+} from "@/lib/session";
 import { gradeRetrieval, buildGroundingInstruction } from "@/lib/retrieval-grader";
 import {
     getCachedResponse,
     cacheResponse,
-    hasConversationMemory,
-    markConversationMemory,
 } from "@/lib/cache";
 import {
     redactUserQuestion,
@@ -20,7 +23,16 @@ import {
     findVaultTokens,
 } from "@/lib/pii-redaction";
 import { geminiModel, GEMINI_MODEL_ID } from "@/lib/gemini";
-import { Message, StreamData, streamText, tool, formatStreamPart, type JSONValue } from "ai";
+import {
+    APICallError,
+    Message,
+    RetryError,
+    StreamData,
+    streamText,
+    tool,
+    formatStreamPart,
+    type JSONValue,
+} from "ai";
 import { z } from "zod";
 import { guardQuestion } from "@/lib/query-guard";
 import {
@@ -189,6 +201,66 @@ function getMessageText(content: Message["content"]): string {
     return "";
 }
 
+/**
+ * Turn a failed turn into a response the client can actually show.
+ *
+ * Re-throwing left Next to return a bare 500 with no body. useChat throws
+ * `new Error(await response.text())` on a non-ok response, so an empty body produced an
+ * empty error message - and with `keepLastMessageOnError` defaulting to false in this
+ * version of the SDK, the same failure rolled the user's own message back out of the
+ * transcript. The question vanished with nothing on screen to explain it.
+ *
+ * A status plus a plain-text body fixes both halves: the text becomes `error.message` for
+ * the client to render, and the status stays honest so a failure is still a failure to
+ * anything watching the route. The generation path now degrades visibly, the way the
+ * guard path already did.
+ */
+function generationErrorResponse(error: unknown): Response {
+    // Only the upstream status is read, never the provider's message: it can quote the
+    // prompt back, and on this route the prompt contains report text.
+    const upstreamStatus = APICallError.isInstance(error)
+        ? error.statusCode
+        : RetryError.isInstance(error) && APICallError.isInstance(error.lastError)
+          ? error.lastError.statusCode
+          : undefined;
+
+    // 401/403 is a deployment misconfiguration - not something the reader did or can fix -
+    // so it reads as a generic outage rather than as "unauthorized".
+    const { status, reason, message } =
+        upstreamStatus === 429
+            ? {
+                  status: 429,
+                  reason: "rate-limited",
+                  message:
+                      "The assistant is over its request limit right now. Your question is " +
+                      "still here - try again in a minute.",
+              }
+            : upstreamStatus !== undefined && upstreamStatus >= 500
+              ? {
+                    status: 502,
+                    reason: "upstream",
+                    message:
+                        "The model provider is having trouble right now. Your question is " +
+                        "still here - try sending it again.",
+                }
+              : {
+                    status: 500,
+                    reason: "internal",
+                    message:
+                        "Something went wrong answering that. Your question is still here - " +
+                        "try sending it again.",
+                };
+
+    return new Response(message, {
+        status,
+        headers: {
+            "Content-Type": "text/plain; charset=utf-8",
+            // Lets a network tab or an uptime check tell the three apart without parsing prose.
+            "X-Chat-Error": reason,
+        },
+    });
+}
+
 export async function POST(req: Request, res: Response) {
     const reqBody = await req.json();
 
@@ -197,8 +269,14 @@ export async function POST(req: Request, res: Response) {
     const userQuestion = getMessageText(latestMessage?.content ?? "");
 
     // `data` is {} when the user chats without uploading a report.
-    const reportData: string = reqBody.data?.reportData ?? "";
-    const vaultId: string = reqBody.data?.vaultId ?? "";
+    // Both used to arrive in the request body. The document id is now resolved from an
+    // HttpOnly session cookie the client cannot read or forge, and the summary comes with
+    // it - so a request can no longer pair one document's id with another's summary, and
+    // there is no document field for a caller to supply at all.
+    const sessionId = readSessionId(req);
+    const session = await getDocumentSession(sessionId);
+    const reportData: string = session?.summary ?? "";
+    const vaultId: string = session?.documentId ?? "";
 
     // Managed by hand because the request does not finish when the Response is returned:
     // on a cache miss the remaining work (buffering, memory write, rehydration) runs in a
@@ -224,15 +302,27 @@ export async function POST(req: Request, res: Response) {
 
     try {
         return await runInSpan(root, () =>
-            handleChat({ root, messages, userQuestion, reportData, vaultId })
+            handleChat({
+                root,
+                messages,
+                userQuestion,
+                reportData,
+                vaultId,
+                sessionId,
+                storedTurns: session?.transcript ?? [],
+            })
         );
     } catch (error) {
         // Each success path closes the root span itself, at a different point in the
         // request, so this only handles an unexpected throw.
+        //
+        // The trace keeps the real error; only the client-facing body is sanitised.
+        // Returning rather than re-throwing is what makes the failure visible at all.
+        console.error("Chat request failed:", error);
         root?.setMetadata({ outcome: "error" });
         await root?.fail(error);
         await flushTraces();
-        throw error;
+        return generationErrorResponse(error);
     }
 }
 
@@ -242,12 +332,17 @@ async function handleChat({
     userQuestion,
     reportData,
     vaultId,
+    sessionId,
+    storedTurns,
 }: {
     root: ManualSpan | null;
     messages: Message[];
     userQuestion: string;
     reportData: string;
     vaultId: string;
+    /** Null when no session cookie was sent; the transcript is then not persisted. */
+    sessionId: string | null;
+    storedTurns: StoredTurn[];
 }): Promise<Response> {
     const reportFilter = vaultId ? { documentId: { $eq: vaultId } } : undefined;
 
@@ -275,13 +370,37 @@ async function handleChat({
         }
     );
 
-    // Needed by the guard below, so it is built before anything else runs.
-    const recentConversationHistory = messages.length > 1
-        ? messages
-            .slice(-4)
-            .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${getMessageText(message.content)}`)
+    // The whole conversation, not a four-message tail.
+    //
+    // `useChat` posts the entire transcript on every request, so the route already had all
+    // of it, kept the last four, and then spent an embedding call plus two Pinecone queries
+    // recovering a lossy, out-of-order approximation of what it had just discarded. At
+    // roughly 250 tokens a turn against a 1M-token window, the whole thing costs a fraction
+    // of a percent - so it is passed verbatim, which is both cheaper and lossless.
+    //
+    // The stored transcript wins when it is longer: a page refresh empties `useChat`'s
+    // state, and the client would then post an empty array while the user still sees a
+    // report loaded. Comparing lengths keeps whichever side actually has the conversation
+    // without needing to merge them.
+    const clientTurns = messages.map((message) => ({
+        role: message.role === "user" ? ("user" as const) : ("assistant" as const),
+        content: getMessageText(message.content),
+    }));
+    const conversationTurns = storedTurns.length > clientTurns.length ? storedTurns : clientTurns;
+
+    const recentConversationHistory = conversationTurns.length > 1
+        ? conversationTurns
+            .map((turn) => `${turn.role === "user" ? "User" : "Assistant"}: ${turn.content}`)
             .join("\n")
         : "No prior conversation history";
+
+    root?.setMetadata({
+        clientTurns: clientTurns.length,
+        storedTurns: storedTurns.length,
+        // True when a refresh emptied the client's state and the server's copy carried the
+        // conversation - the case this persistence exists for.
+        transcriptRestored: storedTurns.length > clientTurns.length,
+    });
 
     // Deliberately ahead of the cache lookup, for two reasons.
     //
@@ -380,45 +499,24 @@ async function handleChat({
 
     root?.setMetadata({ cacheHit: false });
     const data = new StreamData();
-    const query = `Represent this for searching relevant passages: patient medical report says: \n${reportData}. \n\n${effectiveQuestion}`;
+    // Question only. The report summary used to be prepended here, which drowned the
+    // question in the query vector, fed the whole summary to the TF-IDF arm as query
+    // terms, and pushed the question past the embedding model's 512-token ceiling on a
+    // long report. See buildRetrievalQuery.
+    const query = buildRetrievalQuery(effectiveQuestion);
 
-    // The conversation-history search is skipped unless this document actually has stored
-    // memory to find, since it costs a HuggingFace embedding plus a topK 12 query and a
-    // topK 500 corpus pull to return "<nomatches>". Two cases where it can only ever miss:
-    // the first turn on a freshly ingested report (memory is written only after an answer
-    // completes), and a chat with no report at all (memory is only ever written when
-    // vaultId is set, and without one reportFilter is undefined - so the search ran
-    // unfiltered across every document's chat memory).
-    //
-    // `messages.length > 1` short-circuits the Redis lookup after the first turn, since a
-    // prior turn in this session already wrote memory.
-    const shouldRetrieveMemory =
-        !!vaultId && (messages.length > 1 || (await hasConversationMemory(vaultId)));
-
-    // Independent, so they run concurrently; awaiting them in sequence doubled retrieval
-    // wall-clock for nothing. "<nomatches>" is the same sentinel queryPineconeVectorStore
-    // returns on an empty result, so the prompt sees an identical memory section either way.
-    const [reportRetrieval, chatHistoryRetrievals] = await Promise.all([
-        queryPineconeVectorStoreDetailed(
-            pinecone,
-            'medic',
-            "diagnosis2",
-            query,
-            reportFilter
-        ),
-        shouldRetrieveMemory
-            ? queryPineconeVectorStore(
-                pinecone,
-                'medic',
-                "conversation-history",
-                `Find relevant prior conversation context for this follow-up question.\n\nCurrent question: ${effectiveQuestion}\n\nRecent chat history:\n${recentConversationHistory}`,
-                reportFilter
-            )
-            : Promise.resolve("<nomatches>"),
-    ]);
-
-    // A skipped retrieval simply has no span, so the skip is otherwise invisible.
-    root?.setMetadata({ memoryRetrievalSkipped: !shouldRetrieveMemory });
+    // Only the report is retrieved now. Conversation history used to be a second Pinecone
+    // namespace searched in parallel here - an embedding call plus a topK 12 query and a
+    // topK 500 corpus pull, every turn, to fetch turns the request body already carried.
+    // It also returned them ranked by similarity rather than in order, which made "what did
+    // I ask before that?" unanswerable however good the recall was.
+    const reportRetrieval = await queryPineconeVectorStoreDetailed(
+        pinecone,
+        'medic',
+        "diagnosis2",
+        query,
+        reportFilter
+    );
 
     // Corrective-RAG grading. Retrieval hands back its top 10 chunks whether or not they
     // bear on the question, so without this the generator receives padding labelled as
@@ -461,13 +559,9 @@ async function handleChat({
   \n\n${retrievals}.
   \n\n**end of report excerpts**
 
-  \n\n**Relevant conversation memory:**
-  \n\n${chatHistoryRetrievals}
-  \n\n**end of relevant conversation memory**
-
-  \n\n**Recent conversation history from this session:**
+  \n\n**Conversation so far:**
   \n\n${recentConversationHistory}
-  \n\n**end of recent conversation history**
+  \n\n**end of conversation**
 
   \n\nYou also have a queryKnowledgeGraph tool that looks up known relationships for a medical entity in the patient's knowledge graph. Call it when an entity mentioned in the report or query would benefit from that context, and call it again with a new entity if a result reveals something else worth following (e.g. an interacting drug). Skip it entirely if the question doesn't need graph context.
 
@@ -596,27 +690,18 @@ async function handleChat({
                             endLlmSpan(llmSpan, generation ?? { text: cleanAnswerText })
                         );
 
-                        if (vaultId && cleanAnswerText) {
-                            // The resolved question, not the raw one: storing "is that bad?"
-                            // preserved the pronoun but lost its referent forever, leaving a
-                            // dangling reference to resurface in a later prompt.
-                            const memoryText = `User question: ${effectiveQuestion}\nAssistant answer: ${cleanAnswerText}`;
-                            const memoryResult = await upsertConversationMemory(
-                                pinecone,
-                                "medic",
-                                {
-                                    id: generateDocumentId(`${vaultId}:${effectiveQuestion}:${cleanAnswerText}`),
-                                    documentId: vaultId,
-                                    text: memoryText,
-                                }
-                            );
-                            // Marks this document as having memory worth searching, so the
-                            // next turn's retrieval is not skipped. Gated on a confirmed
-                            // write because upsertConversationMemory swallows its own
-                            // failures and reports them via `stored`.
-                            if (memoryResult.stored) {
-                                await markConversationMemory(vaultId);
-                            }
+                        if (cleanAnswerText) {
+                            // Appended only once the answer has finished streaming, so a
+                            // turn the model never completed is not recorded as one that
+                            // happened.
+                            //
+                            // The resolved question is stored rather than the raw one:
+                            // "is that bad?" preserves a pronoun whose referent is gone,
+                            // and a later prompt would inherit the dangling reference.
+                            await appendSessionTurns(sessionId, [
+                                { role: "user", content: effectiveQuestion },
+                                { role: "assistant", content: cleanAnswerText },
+                            ]);
                         }
 
                         // With no text (safety block, tool-only turn) the data stream has no

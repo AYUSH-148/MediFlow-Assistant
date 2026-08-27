@@ -20,9 +20,9 @@ import ChatComponent from "@/components/chatcomponent";
 const Home = () => {
   const { toast } = useToast()
 
-  const [reportData, setreportData] = useState<{ redactedSummary: string; vaultId: string } | undefined>(undefined);
+  const [reportData, setreportData] = useState<{ redactedSummary: string } | undefined>(undefined);
   const [reportDrawerOpen, setReportDrawerOpen] = useState(false);
-  const onReportConfirmation = (data: { redactedSummary: string; vaultId: string }) => {
+  const onReportConfirmation = (data: { redactedSummary: string }) => {
     setreportData(data);
     setReportDrawerOpen(false);
     toast({

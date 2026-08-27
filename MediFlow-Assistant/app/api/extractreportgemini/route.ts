@@ -1,10 +1,13 @@
 import { generateObject, NoObjectGeneratedError, TypeValidationError } from "ai";
 import { z } from "zod";
-import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+import { chunkWithContext } from "@/lib/chunking";
 import { redactDocument, redactTriples, storeVault, storeTriplesInNeo4j, getVault } from "@/lib/pii-redaction";
 import { geminiModel, GEMINI_MODEL_ID } from "@/lib/gemini";
 import { generateEmbeddings } from "@/lib/embeddings";
+import { describePdfFigures, NO_FIGURES, type FigureExtraction } from "@/lib/pdf-figures";
 import { generateDocumentId, upsertVectors, pinecone } from "@/utils";
+import { getIngestResult, storeIngestResult } from "@/lib/cache";
+import { createDocumentSession, sessionCookieHeader } from "@/lib/session";
 import {
   span,
   setSpanMetadata,
@@ -365,6 +368,23 @@ export async function POST(req: Request) {
         recordOutputs: (response) => ({ status: response.status }),
       }
     );
+  } catch (error) {
+    // Without this the throw became a bare 500 with no body, and the client fell back to a
+    // generic "couldn't process this report" - correct that something failed, silent on
+    // what. Anything reaching here is infrastructure (the vault write, an unhandled client
+    // error), not a document the model could not read, which is what the 422s cover.
+    //
+    // The message is fixed rather than derived from the error: a Redis or Pinecone failure
+    // can carry connection strings, and on this route it can carry report text.
+    console.error("Report ingest failed:", error);
+    return new Response(
+      JSON.stringify({
+        error:
+          "We couldn't finish processing this report. This is a problem on our side - " +
+          "please try again in a moment.",
+      }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
   } finally {
     // The trace client batches uploads in the background and a serverless host can freeze
     // the function the instant the response is returned, so the batch has to be pushed on
@@ -373,10 +393,64 @@ export async function POST(req: Request) {
   }
 }
 
+/**
+ * Return the stored result for a document already ingested, or null.
+ *
+ * Only reachable from the text-layer path. The OCR paths cannot use it: their text comes
+ * out of the model, so there is no identity to hash until the call has already been made.
+ *
+ * Both the vault and the stored result are required. A result without its vault would hand
+ * the client a summary whose tokens no longer resolve to anything, which is a worse outcome
+ * than simply re-ingesting.
+ */
+async function reuseIngestedReport(documentId: string): Promise<Response | null> {
+  const [stored, vault] = await Promise.all([getIngestResult(documentId), getVault(documentId)]);
+  if (!stored || !vault) return null;
+
+  // Re-uploading is the user saying they still want this report, so both keys get their
+  // 24h window back - matching what the existing duplicate path does for the vault.
+  await Promise.all([storeVault(documentId, vault), storeIngestResult(documentId, stored)]);
+
+  setSpanMetadata({
+    outcome: "ok",
+    extractionPath: "duplicate-reuse",
+    vaultId: documentId,
+    duplicate: true,
+    reusedStoredResult: true,
+    // The point of the whole branch: a re-upload now costs two Redis reads instead of an
+    // extraction call and a figure call.
+    geminiCallsSaved: 2,
+    piiCount: stored.piiCount,
+    chunkCount: stored.chunkCount,
+  });
+
+  // A duplicate upload is still a fresh browser asking for this document, so it gets its
+  // own session rather than reusing whatever the last one was.
+  const sessionId = await createDocumentSession(documentId, stored.redactedSummary);
+
+  return new Response(
+    JSON.stringify({
+      ...stored,
+      duplicate: true,
+      searchable: !stored.vectorStoreFailed,
+    }),
+    {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json",
+        "Set-Cookie": sessionCookieHeader(sessionId),
+      },
+    }
+  );
+}
+
 async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response> {
   let fullText: string;
   let summary: string;
   let triples: Triple[];
+  let figures: FigureExtraction = NO_FIGURES;
+  // The document's own text, before any figure description is appended - see documentId.
+  let identityText: string | null = null;
 
   try {
     if (mimeType === "application/pdf") {
@@ -384,7 +458,32 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
       if (textLayer) {
         setSpanMetadata({ extractionPath: "pdf-text-layer" });
         fullText = textLayer;
+
+        // Identity is known here, before a single model call: documentId hashes the text
+        // layer, which pdf-parse produced locally and deterministically.
+        //
+        // The dedup check further down runs 99 lines later, after both Gemini calls have
+        // already been paid for - it only ever saved the indexing. Checking here saves the
+        // calls themselves, and fixes something worse than the cost: analyzeText pins no
+        // temperature, so every re-upload produced a differently worded summary, and the
+        // response cache namespaces on a hash of that summary. A reworded summary orphaned
+        // every answer cached under the previous one, so a user re-uploading their report
+        // silently lost their cache.
+        const knownId = generateDocumentId(textLayer);
+        const shortCircuit = await reuseIngestedReport(knownId);
+        if (shortCircuit) return shortCircuit;
+
         ({ summary, triples } = await analyzeText(fullText));
+
+        // Deliberately after analyzeText, so the summary and the graph triples are derived
+        // from the report's own words only. A figure description is the model's reading of
+        // a picture; promoting it into the summary that every prompt carries, or into the
+        // graph as an asserted relationship, would let inference travel as fact. The
+        // descriptions still reach the index below, which is what makes a question about a
+        // chart answerable at all.
+        figures = await describePdfFigures(buffer);
+        identityText = fullText;
+        fullText += figures.text;
       } else {
         setSpanMetadata({ extractionPath: "pdf-ocr-fallback" });
         ({ fullText, summary, triples } = await transcribeAndAnalyze(mimeType, buffer));
@@ -465,7 +564,11 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
   // vaultId, the second upload's vault would overwrite the first's and the first
   // patient's next answer would rehydrate with the second patient's name. Hashing the
   // raw text keeps dedup meaning what it should: the same bytes uploaded twice.
-  const documentId = generateDocumentId(fullText);
+  //
+  // Figure descriptions are excluded for a further reason: they are model output, so the
+  // same file uploaded twice can produce differently worded text. Hashing that would give
+  // one document two ids, defeating the dedup this is here to provide.
+  const documentId = generateDocumentId(identityText ?? fullText);
 
   let chunkCount = 0;
   let vectorStoreFailed = false;
@@ -479,8 +582,14 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
     await storeVault(documentId, vault);
 
     // Errors here are swallowed so a Pinecone or HuggingFace outage still returns a
-    // usable summary. The cost is a 200 carrying chunkCount: 0 - a document that is
-    // silently unsearchable - so the span records the failure as an error.
+    // usable summary. The cost is a 200 for a document that cannot be searched, so the
+    // span records the failure as an error and `vectorStoreFailed` is reported to the
+    // client rather than left for it to infer.
+    //
+    // It cannot be inferred from `chunkCount`, which is why that flag exists. The count is
+    // assigned as soon as the split succeeds, so an embedding or upsert failure leaves it
+    // non-zero with nothing indexed; and a duplicate upload skips this block entirely,
+    // leaving it zero with everything indexed. It is wrong in both directions.
     await span(
       "index_document",
       { documentId, chars: redactedFullText.length },
@@ -490,13 +599,17 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
             "chunk_document",
             { chars: redactedFullText.length, chunkSize: CHUNK_SIZE, chunkOverlap: CHUNK_OVERLAP },
             async () => {
-              const splitter = new RecursiveCharacterTextSplitter({
+              const contextual = await chunkWithContext(redactedFullText, {
                 chunkSize: CHUNK_SIZE,
                 chunkOverlap: CHUNK_OVERLAP,
               });
-              const split = await splitter.splitText(redactedFullText);
+              const split = contextual.map((chunk) => chunk.text);
               setSpanMetadata({
                 chunkCount: split.length,
+                // A chunk cut out of the middle of a table carries rows without the header
+                // naming their columns. This counts how often a heading had to be restored,
+                // which is the only way to tell the prefixing is doing anything.
+                chunksGivenContext: contextual.filter((chunk) => chunk.contextAdded).length,
                 avgChunkChars: split.length
                   ? Math.round(split.reduce((sum, c) => sum + c.length, 0) / split.length)
                   : 0,
@@ -595,13 +708,56 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
     }
   }
 
+  // `vectorStoreFailed` and `graphStoreFailed` are reported to the client, not only to the
+  // trace. Swallowing an indexing failure keeps the upload usable, but a 200 that says
+  // nothing about it told the user "Report processed!" while the document was unsearchable
+  // - and the chat that followed answered every question with "this is not in your
+  // report". A false success is worse than a visible failure: nothing prompts a retry.
+  //
+  // `duplicate` has to travel too. It is why the client cannot just test `chunkCount === 0`:
+  // a re-upload skips indexing because the vectors already exist, leaving the count at 0 on
+  // a perfectly healthy path. The count alone cannot tell "already indexed" from "failed to
+  // index", so the route states which it was instead of leaving the client to guess.
+  // The document id stays server-side from here. It used to be returned as `vaultId` and
+  // sent back on every chat request, which made it a bearer key to the vault for anyone
+  // who saw a request body.
+  const sessionId = await createDocumentSession(documentId, redactedSummary);
+
   const response = {
     redactedSummary,
-    vaultId: documentId,
     piiCount,
     triplesStored: triples ? triples.length : 0,
     chunkCount,
+    // Reported rather than left to the trace: a figure the pipeline saw and could not read
+    // is exactly the kind of thing this codebase has silently swallowed before.
+    figuresDescribed: figures.described,
+    figuresSkipped: figures.skipped,
+    figuresFailed: figures.failed,
+    duplicate: !!existingVault,
+    vectorStoreFailed,
+    graphStoreFailed,
+    // Only the vector store gates retrieval. A missing graph costs the model some optional
+    // context; a missing index means the report cannot be searched at all.
+    searchable: !vectorStoreFailed,
   };
+
+  // Stored so the next upload of this document can skip both model calls - and, more to the
+  // point, reuse this exact summary. The response cache keys on a hash of it, so a
+  // regenerated wording would start an empty namespace and lose every cached answer.
+  //
+  // A degraded ingest is stored too: the flags travel with it, so the reused response
+  // reports the same "not searchable" state rather than looking like a clean success.
+  await storeIngestResult(documentId, {
+    redactedSummary,
+    piiCount,
+    triplesStored: triples ? triples.length : 0,
+    chunkCount,
+    figuresDescribed: figures.described,
+    figuresSkipped: figures.skipped,
+    figuresFailed: figures.failed,
+    vectorStoreFailed,
+    graphStoreFailed,
+  });
 
   // Rolled onto the root span so one trace answers "did this upload actually land?".
   // A 200 with degraded: true is the case worth alerting on - the user saw success
@@ -611,6 +767,9 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
     vaultId: documentId,
     piiCount,
     chunkCount,
+    figuresDescribed: figures.described,
+    figuresSkipped: figures.skipped,
+    figuresFailed: figures.failed,
     triplesStored: triples ? triples.length : 0,
     vectorStoreFailed,
     graphStoreFailed,
@@ -619,6 +778,9 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
 
   return new Response(JSON.stringify(response), {
     status: 200,
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "Set-Cookie": sessionCookieHeader(sessionId),
+    },
   });
 }

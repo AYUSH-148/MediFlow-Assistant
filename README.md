@@ -86,6 +86,41 @@ Most RAG demos stop at "chunk a PDF, embed it, stuff it in a prompt." The hard p
 
 ## Engineering deep dives
 
+### 🔑 Session-scoped documents
+
+The chat route used to take `vaultId` straight out of the request body. That one string
+unlocked the document's chunks in Pinecone, its nodes in Neo4j, and — the part that matters
+— its **vault**, where the real name, MRN and date of birth live. No ownership check
+existed, because there was nothing to check against: no users, no accounts, no sessions.
+
+It was not guessable (a SHA-256 of the report text), but it was derived from *content*
+rather than being a per-request secret, so the same file always produced the same id — and
+it travelled in every chat body, where any request log would capture it.
+
+The id no longer reaches the browser. Upload sets an **`HttpOnly` cookie** holding 32 random
+bytes; the mapping to a document lives in Redis under the same 24h TTL as the vault:
+
+| | Before | After |
+|---|---|---|
+| Client knows the document id | yes | **no** |
+| Chat request names a document | `vaultId` in the body | **nothing** |
+| Readable by page JavaScript | yes | **no** (`HttpOnly`) |
+| Leaks through request-body logs | yes | **no** (it is a header) |
+| Session id derived from | — | `randomBytes(32)`, not content |
+
+The client cannot name a document, so there is no field to tamper with — a stronger
+guarantee than validating one.
+
+The summary is bound to the session too, but it still comes from the client, because the
+review step deliberately lets the user edit it and add their own history and symptoms. What
+changed is that it is written **once**, at confirmation, against a session that already
+names a document — so one report's id can no longer be paired with another's summary. It
+remains user-controlled text reaching a prompt, and is treated as untrusted downstream.
+
+This is not authentication: there are still no accounts, and a stolen cookie still works.
+It removes forgery and the id's presence in every request body, which is what the previous
+design gave away for free.
+
 ### 🔒 PII redaction with a token vault
 
 Redaction runs over the **entire document** before chunking, not just the summary — so no identifier ever reaches Pinecone.
@@ -96,6 +131,35 @@ Redaction runs over the **entire document** before chunking, not just the summar
 - The vault lives in Redis with a 24-hour TTL and is **never** sent to the trace backend; shipping it alongside the redacted text would hand over both the ciphertext and the key.
 - Rehydration is verified: the pipeline counts tokens that survive, including ones split across streaming chunk boundaries, and records that as an alertable metric.
 
+### ✂️ Chunking that keeps its headings
+
+`RecursiveCharacterTextSplitter` cuts on blank lines, then newlines, then spaces. It has no
+idea a clinical report is mostly tables, so a cut lands wherever the character budget runs
+out — and the rows after it are separated from the header row naming their columns.
+
+A chunk in that state is worse than useless as evidence. Retrieved alone,
+`172 mg/dL   < 100   HIGH` does not say which analyte it belongs to, or which number is the
+result and which the reference. The generator infers column meaning from position, and it
+will — sometimes wrongly, always confidently.
+
+The 150-character overlap was the existing mitigation, and it is probabilistic: it carries
+the header across only when the cut happens to fall within 150 characters of it. On a table
+long enough to span several chunks it stops helping. Measured on a synthetic 40-row panel,
+**2 of 4 chunks held rows with no header among them; after the fix, none do.**
+
+Each chunk is now prefixed with the headings in force where it starts — its section, and the
+column header of the table it sits inside — unless it already contains them. `chunksGivenContext`
+is recorded so the prefixing is measurable rather than assumed.
+
+This is deliberately independent of how the table was drawn. `pdf-parse` also exposes
+`getTable()`, but that detects tables through their **border geometry**: on a ruled table it
+returns structured rows, and on a whitespace-aligned one — how most lab reports are laid out
+— it finds nothing at all. Verified both ways before choosing this approach.
+
+The prefix helps beyond tables: a chunk lifted out of `SECTION 4 - LIVER` now says so, both
+to the model reading it as evidence and to the embedding that has to match a question about
+the liver.
+
 ### 🔎 Hybrid retrieval + RRF
 
 Semantic search alone misses exact clinical terms; keyword search alone misses paraphrase. Both arms run over the **same document-filtered corpus** and are fused:
@@ -105,6 +169,16 @@ Semantic search alone misses exact clinical terms; keyword search alone misses p
 - **Fusion:** Reciprocal Rank Fusion (`k = 60`), final `topK 10`.
 
 Both arms reuse a **single embedding call** — the query vector is computed once and passed into the keyword corpus fetch rather than recomputed.
+
+**The query is the question alone**, behind the instruction prefix `mxbai` expects for retrieval queries (it is an asymmetric model — queries take a prefix, documents do not). The whole report summary used to be prepended to it, which cost three things at once:
+
+| Cost | Why |
+|---|---|
+| Cosine similarity was meaningless as a relevance signal | The query vector was dominated by the report, so every chunk scored high on report-to-report similarity whatever was asked |
+| The sparse arm scored against the report, not the question | `rankWithTfIdf` tokenises the same string, so every word of the summary became a query term — 33 terms instead of 14 on a representative question |
+| A long report silently deleted the question | The summary sat *ahead* of the question in a string with a 512-token ceiling. A multi-page summary pushed the question past it, and the question is what got cut |
+
+Prepending it was a way to give a context-free follow-up (*"is that bad?"*) something to match on. The query guard now rewrites such questions to stand alone **before** retrieval runs, so the context is already in the question and the prepend was redundant. Truncation is also now applied in `generateEmbedding` and **recorded** rather than left to the model, so a query that lost its tail is visible instead of looking like retrieval that merely performed badly.
 
 ### 🧭 The query guard — scope and ambiguity, before anything expensive
 
@@ -144,7 +218,7 @@ A grading pass now judges the chunks **against the question** and returns a verd
 There is deliberately **no cheap numeric pre-filter**, because neither available score measures relevance to the question:
 
 - The **RRF score** is `1/(60+rank)` summed across arms — pure rank position. The top result of a completely irrelevant corpus scores exactly as well as the top result of a perfect one.
-- The **vector similarity** is measured against a query that has the entire report prepended, so report chunks score high on report-to-report similarity no matter what was asked.
+- The **vector similarity** is now measured against the question alone, so it *has* become a meaningful signal — but it is still not used as a gate. Retrieval **ranks**; it does not threshold. The cutoff separating "relevant" from "the closest thing in this document" is not a constant, and a wrong one fails silently in the direction that matters: dropping evidence the report does contain.
 
 Grading against the bare question is the one comparison the retrieval pipeline never makes. Empty retrievals still short-circuit without a model call, and surviving chunks are renumbered contiguously — a prompt listing "Finding 1, 4, 7" invites the model to wonder what it is not being shown.
 
@@ -156,9 +230,136 @@ Extracted `(subject, predicate, object)` triples land in Neo4j. Rather than pref
 
 The subtle part is **scoping the neighbour, not just the queried node**. Generic entities like `Atorvastatin` are deliberately unscoped so knowledge is shared across documents — which means traversing out of one would return the `[NAME_n]` nodes of every patient ever prescribed it. The chat route then rehydrates through the *current* document's vault, resolving another patient's token to this patient's name. The model would confidently state a relationship belonging to someone else, and nothing about the output would look wrong. A neighbour is therefore admitted only when it is genuinely generic or explicitly scoped to this document.
 
+### 🚨 Failing visibly on the generation path
+
+The guard fails open and the cache degrades quietly, but generation had no equivalent. A
+`streamText` rejection - quota, auth, a network blip - was re-thrown, so Next returned a
+bare 500 with no body. On the client that was worse than it sounds: `useChat` throws
+`new Error(await response.text())` on a non-ok response, so an empty body meant an empty
+message, and `keepLastMessageOnError` defaults to `false` in this version of the SDK, so
+the same failure **rolled the user's own question back out of the transcript**. The
+question disappeared with nothing on screen to explain it.
+
+The route now returns a status and a plain-text reason - 429 for rate limiting, 502 for an
+upstream fault, 500 otherwise - which `useChat` surfaces as `error.message`. Only the
+status is read from the provider's error, never its message: it can quote the prompt back,
+and on this route the prompt contains report text. The client keeps the failed message,
+renders the reason, and offers a retry.
+
+### ♻️ Re-uploading the same report
+
+Document identity is a SHA-256 of the text layer, which `pdf-parse` produces locally and
+deterministically — so it is known **before** any model call. The dedup check used to run
+99 lines later, after both Gemini calls had already been paid for, and only ever saved the
+indexing.
+
+Checking it early saves the calls, and fixes something worse than their cost. `analyzeText`
+pins no temperature, so every re-upload produced a **differently worded summary** — and the
+response cache namespaces on a hash of that summary. A reworded summary started an empty
+namespace, so a user re-uploading their report silently lost every cached answer.
+
+The summary and its counters are therefore stored beside the vault, under the same 24h TTL,
+and a duplicate upload returns them unchanged:
+
+| | Cold upload | Duplicate |
+|---|---|---|
+| Gemini calls | 2 | **0** |
+| Embedding calls | 1 per chunk | **0** |
+| Pinecone writes | yes | **0** |
+| Summary | freshly generated | **byte-identical to the first** |
+
+Deliberately stored: the summary and the counters. Deliberately **not** stored: the document
+text or the vectors — those already live in Pinecone chunk by chunk, and copying them here
+would give the same bytes two homes that can drift. The rule is to store what would have to
+be *recomputed*, not everything that was *touched*.
+
+Only the text-layer path can use this. The OCR paths get their text out of the model, so
+there is no identity to hash until the call has already been made. And both keys are
+required: a stored result without its vault would hand back a summary whose tokens no longer
+resolve, so it falls back to a full re-ingest.
+
+### 💬 Conversation memory is the transcript, not a vector search
+
+Chat history used to be a second Pinecone namespace: embed each completed turn, retrieve by
+similarity, search it in parallel with the report. That cost an embedding call plus a
+`topK 12` query and a `topK 500` corpus pull **on every turn** — to recover turns the request
+body already contained. `useChat` posts the entire transcript with each message, and the
+route kept the last four and discarded the rest.
+
+It was also the wrong retrieval shape. Vector search returns the top *k* ranked by
+similarity, so the model received turn 3 and turn 17 with no indication of order — *"what did
+I ask before that?"* was unanswerable however good the recall was.
+
+The whole conversation is now passed verbatim. At roughly 250 tokens per turn against a
+1M-token window it costs a fraction of a percent, and it is **lossless and ordered** where
+the vector search was neither.
+
+| | Vector memory | Transcript |
+|---|---|---|
+| Cost per turn | 1 embedding + 2 Pinecone queries | **0** |
+| Recall | top *k* | **everything** |
+| Order | by similarity | **chronological** |
+| Failure modes | unbounded growth, no pruning, TTL skew against the vault, once searched unfiltered across documents | none |
+
+The transcript is also stored server-side against the session, because `useChat` keeps it in
+React state and a refresh empties it — the client would then post an empty array while the
+user still sees a report loaded. Whichever copy is longer wins, so no merge is needed, and
+`transcriptRestored` is traced when the server's copy carried the conversation. It is capped
+at 200 turns with each turn truncated to 8k characters, so one pathological message cannot
+make a session unwritable.
+
+Summarising older turns is the right fallback, and is deliberately **not built**: at ~250
+tokens a turn, staying under even a tenth of the window means roughly 400 turns. A rolling
+summary would add an LLM call, a lossy compaction, and errors that compound across
+compactions — real costs against a threshold this app will not reach.
+
 ### ⚡ Semantic caching
 
-Answers are cached in Redis keyed by report hash, matched by **cosine similarity ≥ 0.95** rather than by exact string. The match runs against the guard's **resolved** question, not the raw one — that is what stops two identical-looking follow-ups from colliding on one key. Cache hits are re-emitted in the AI SDK data-stream protocol so the client parses them identically to a live generation. `bestSimilarity` is recorded on misses too — otherwise a threshold that never fires is indistinguishable from a cold cache.
+Answers are cached in Redis keyed by report hash, matched by **cosine similarity ≥ 0.95** rather than by exact string. The match runs against the guard's **resolved** question, not the raw one — that is what stops two identical-looking follow-ups from colliding on one key. Cache hits are re-emitted in the AI SDK data-stream protocol so the client parses them identically to a live generation. Entries for a report are enumerated through a **per-report index set** (`SMEMBERS`), not `KEYS`. `KEYS` reads as one call and is not: it walks the *entire* keyspace — every report, vault and flag for every user — and filters by prefix afterwards, so its cost grows with traffic unrelated to the request making it. The similarity scan that follows is O(N) and was never the bottleneck — measured under 2 ms at 1000 entries, against the ~100-300 ms embedding call every lookup makes first. Entries expire on their own TTL while set members do not, so stale members are pruned as they are noticed. `bestSimilarity` is recorded on misses too — otherwise a threshold that never fires is indistinguishable from a cold cache.
+Answers are cached in Redis keyed by report hash, matched by **cosine similarity ≥ 0.95** rather than by exact string. The match runs against the guard's **resolved** question, not the raw one — that is what stops two identical-looking follow-ups from colliding on one key. Cache hits are re-emitted in the AI SDK data-stream protocol so the client parses them identically to a live generation. The report hash keying those namespaces is **SHA-256** (truncated to 128 bits), not the 32-bit string hash it started as: that one folded `+n` and `-n` onto the same key through `Math.abs`, and searching random inputs turned up a mirror pair after ~19k samples and a true collision after ~119k. Well beyond this app's traffic, but a collision means one report's cached answers served under another's namespace, and document identity was already hashed properly five lines away. `bestSimilarity` is recorded on misses too — otherwise a threshold that never fires is indistinguishable from a cold cache.
+
+### 🖼️ Figures in born-digital reports
+
+The text-layer path reads a page's words exactly and its pictures not at all - and it is
+chosen precisely **because** the PDF has text, so an ECG trace or an echo sitting in a
+text-bearing report was dropped with nothing recorded to say so. `charsPerPage` looks
+healthy either way.
+
+Three local, free steps decide whether a paid one is warranted:
+
+| Step | Cost | Purpose |
+|---|---|---|
+| `getImage()` | free, local | which pages carry an image, and how big |
+| size filter (≥150px per edge, ≥40k px²) | free | drop letterhead logos, signatures, rules |
+| `getScreenshot({ partial })` | free, local | render only the surviving pages |
+| one batched Gemini call | **the only paid step** | describe every figure page at once |
+
+A report with no figures never reaches the vision model at all. Whole pages are rendered
+rather than the extracted image bytes, because a chart stripped of its caption and axis
+labels is materially harder to read.
+
+**The text layer stays authoritative.** Figures are added to it, never substituted for it -
+routing a whole document to vision because a chart appeared would trade exact lab values for
+a model's re-reading of them, which is the regression the text-layer-first design exists to
+prevent. Descriptions are appended under an explicit `--- FIGURES (described from page
+images, not transcribed text) ---` heading, and that label travels into the chunks and the
+answer prompt: a described figure is the model's reading of a picture, and if it arrived
+looking like transcribed text neither the grader nor the generator could tell evidence from
+inference.
+
+Two ordering decisions carry the design:
+
+- Descriptions are appended **after** `analyzeText`, so the summary every prompt carries and
+  the graph triples stay derived from the report's own words. The descriptions still reach
+  the index, which is what makes a question about a chart answerable.
+- `documentId` hashes the text **before** the figure block. Descriptions are model output, so
+  the same file uploaded twice can produce differently worded text - hashing that would give
+  one document two ids and defeat the dedup it exists to provide.
+
+Failures degrade rather than block: detection or description throwing leaves the text-layer
+result intact, and `figuresDescribed`, `figuresSkipped` and `figuresFailed` are returned to
+the client as well as traced, so a figure the pipeline saw and could not read is reported
+rather than swallowed.
 
 ### 📄 Two extraction paths
 
@@ -260,7 +461,7 @@ LANGSMITH_ENDPOINT=https://api.smith.langchain.com
 | Namespace | Contents |
 |---|---|
 | `diagnosis2` | Redacted report chunks |
-| `conversation-history` | Per-document chat memory |
+
 
 Then:
 
@@ -319,6 +520,9 @@ MediFlow-Assistant/
 - Redaction is **rule-based**, so a name written in free prose (`"my name is Rahul, is my LDL high?"`) has no label to anchor on and survives. This is why nothing downstream treats post-redaction text as safe by default.
 - The query guard and the retrieval grader are **model judgment, not deterministic rules**. Both can misclassify — a legitimate question refused, or irrelevant chunks kept — and both deliberately fail open, so an outage degrades to the older, less careful behaviour rather than blocking the chat. Their spans record `intent`, `verdict` and `ungraded` precisely so drift is measurable rather than anecdotal.
 - Answering a question now costs **three sequential Gemini calls** rather than one. Refusals and clarifications short-circuit before retrieval and grading, so the cheap paths stayed cheap, but the common case pays roughly two extra Flash round trips for the grounding.
+- An indexing failure still returns a usable summary rather than failing the upload, but the response now says so (`searchable: false`) and the UI stops reporting success. Before that, a Pinecone or HuggingFace outage produced "Report processed!" for a document the chat could not search, and every question about it was answered "this is not in your report".
+- There is still no user account model. A session cookie binds a browser to the document it uploaded, which stops one client naming another's document, but a stolen cookie is a working key until it expires.
+- A guard outage and a quota failure look the same from the user's chair, though they are distinguishable in a trace: the root span records `guardIntent` and `guardFailed`, and a generation failure closes with `outcome: "error"`.
 - Gemini safety filters are disabled — clinical prompts about dosages and treatments get blocked at default thresholds, and a blocked generation returns empty text rather than an error. Report contents are injected verbatim, so uploaded documents should be treated as untrusted input.
 - Uploads are capped at **4MB** and held in request memory for the lifetime of the request, so a large report is rejected rather than queued. Raising that ceiling means uploading to object storage instead — which for this pipeline would mean a durable copy of the *unredacted* document living outside the request, so it is deliberately not done: today the raw file is never persisted anywhere.
 - If a vault expires before its cached answers do, those answers come back with `[NAME_1]` placeholders intact. The pipeline detects and reports this rather than hiding it.

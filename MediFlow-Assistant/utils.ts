@@ -25,64 +25,6 @@ export async function upsertVectors(
     { runType: "chain", tags: ["pinecone", "write"] }
   );
 }
-
-export async function upsertConversationMemory(
-  client: Pinecone,
-  indexName: string,
-  {
-    id,
-    documentId,
-    text,
-  }: {
-    id: string;
-    documentId: string;
-    text: string;
-  }
-) {
-  // Failures are swallowed so chat keeps working when a memory write fails, and the
-  // span records the outcome so a persistently broken write does not stay invisible.
-  // The stored text is post-redaction but PHI-gated anyway - see
-  // queryPineconeVectorStore for why that is not the same as identifier-free.
-  return span(
-    "upsert_conversation_memory",
-    { id, documentId, text },
-    async () => {
-      try {
-        const embedding = await generateEmbedding(text);
-        await upsertVectors(
-          client,
-          indexName,
-          [
-            {
-              id,
-              values: embedding,
-              metadata: {
-                documentId,
-                chunk: text,
-                type: "chat-memory",
-                source: "conversation",
-              },
-            },
-          ],
-          "conversation-history"
-        );
-        setSpanMetadata({ stored: true });
-        return { stored: true as boolean, error: null as string | null };
-      } catch (error) {
-        console.error("Failed to upsert conversation memory:", error);
-        const message = error instanceof Error ? error.message : String(error);
-        setSpanMetadata({ stored: false, swallowedError: message });
-        return { stored: false as boolean, error: message };
-      }
-    },
-    {
-      runType: "chain",
-      tags: ["pinecone", "memory", "write"],
-      safeInputs: { id, documentId, ...textShape("text", text) },
-    }
-  );
-}
-
 export function generateDocumentId(content: string): string {
   return createHash("sha256").update(content).digest("hex");
 }
