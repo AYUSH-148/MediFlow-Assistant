@@ -1,6 +1,5 @@
 import { generateObject } from "ai";
 import { z } from "zod";
-import { PDFParse } from "pdf-parse";
 import { geminiModel, GEMINI_MODEL_ID } from "@/lib/gemini";
 import {
   span,
@@ -75,6 +74,17 @@ export const NO_FIGURES: FigureExtraction = {
   failed: false,
 };
 
+// pdf-parse is loaded here rather than imported at module scope. Its bundle constructs a
+// DOMMatrix as it loads and relies on @napi-rs/canvas to polyfill that under Node, and it
+// reaches for the package through a guarded runtime require that bundlers cannot trace. A
+// deployment that ships without the binary would take the whole ingest route down before
+// any handler ran - a 500 on every request - because a module-scope throw happens outside
+// the degrade-to-no-figures handling below. Loaded on demand, it costs the figures only.
+async function loadPdfParse() {
+  const { PDFParse } = await import("pdf-parse");
+  return PDFParse;
+}
+
 /**
  * Find, render and describe the figures in a born-digital PDF.
  *
@@ -106,6 +116,7 @@ export async function describePdfFigures(buffer: Buffer): Promise<FigureExtracti
       // Detection is local and cheap, but a malformed image dictionary should not cost the
       // upload its text - which extracted fine - so it degrades to "no figures".
       try {
+        const PDFParse = await loadPdfParse();
         const parser = new PDFParse({ data: new Uint8Array(buffer) });
         try {
           const result = await parser.getImage();
@@ -144,6 +155,7 @@ export async function describePdfFigures(buffer: Buffer): Promise<FigureExtracti
       const skipped = figurePages.length - selected.length;
 
       try {
+        const PDFParse = await loadPdfParse();
         const parser = new PDFParse({ data: new Uint8Array(buffer) });
         let shots;
         try {

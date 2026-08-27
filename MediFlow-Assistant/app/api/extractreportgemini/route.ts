@@ -154,24 +154,17 @@ function asExtractionFailure(error: unknown): never {
   throw error;
 }
 
-// unpdf joins pages with a blank line, and a page break landing mid-paragraph can leave
-// a longer run of them. Collapsed here so an empty stretch cannot survive as its own
-// near-empty chunk after splitting and get retrieved as if it were content.
-function normalizeExtractedText(text: string): string {
-  return text.replace(/\n{3,}/g, "\n\n").trim();
+// pdf-parse inserts a "-- N of M --" marker between pages. Left in, it can survive as
+// its own near-empty chunk after splitting and gets retrieved as if it were content.
+function stripPdfParseArtifacts(text: string): string {
+  return text
+    .replace(/^--\s*\d+\s*of\s*\d+\s*--\s*$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 // Extract the text layer of a born-digital PDF. Returns null when the PDF has no usable
 // text layer (scanned/image-only), signalling the caller to fall back to Gemini OCR.
-//
-// unpdf rather than pdf-parse: pdf-parse's bundle constructs a DOMMatrix at module scope
-// and needs @napi-rs/canvas to polyfill it under Node. It reaches for that package
-// through a guarded runtime require, which Next's file tracing cannot see, so the binary
-// never reached the deployed function. Worse, the platform loads the module during init
-// rather than through the dynamic import below, so the resulting ReferenceError escaped
-// this try/catch and took the whole route down - a 500 on every request, GET included.
-// unpdf ships a pdfjs build with the canvas layer removed: no native dependency, so
-// there is nothing for tracing to miss.
 async function extractPdfTextLayer(buffer: Buffer): Promise<string | null> {
   // The output is the raw text layer, identifiers included, so it is PHI-gated. The
   // metadata answers "how often do uploads fall back to OCR, and why".
@@ -180,32 +173,29 @@ async function extractPdfTextLayer(buffer: Buffer): Promise<string | null> {
     { bytes: buffer.byteLength },
     async () => {
       try {
-        const { extractText } = await import("unpdf");
-        // mergePages concatenates the per-page strings; the line breaks within a page
-        // are preserved either way, which the label-anchored PII rules in
-        // @/lib/pii-redaction depend on to match.
-        const { totalPages, text } = await extractText(new Uint8Array(buffer), {
-          mergePages: true,
-        });
-        const extracted = normalizeExtractedText(text);
-        const pageCount = totalPages || 1;
-        const charsPerPage = extracted.length / pageCount;
-        setSpanMetadata({ pageCount, chars: extracted.length, charsPerPage });
+        const { PDFParse } = await import("pdf-parse");
+        const parser = new PDFParse({ data: new Uint8Array(buffer) });
+        try {
+          const result = await parser.getText();
+          const text = stripPdfParseArtifacts(result.text ?? "");
+          const pageCount = result.total || result.pages?.length || 1;
+          const charsPerPage = text.length / pageCount;
+          setSpanMetadata({ pageCount, chars: text.length, charsPerPage });
 
-        if (extracted.length < MIN_TEXT_LAYER_CHARS || charsPerPage < MIN_CHARS_PER_PAGE) {
-          setSpanMetadata({
-            usable: false,
-            reason:
-              extracted.length < MIN_TEXT_LAYER_CHARS ? "too-few-chars" : "too-few-chars-per-page",
-          });
-          return null;
+          if (text.length < MIN_TEXT_LAYER_CHARS || charsPerPage < MIN_CHARS_PER_PAGE) {
+            setSpanMetadata({
+              usable: false,
+              reason:
+                text.length < MIN_TEXT_LAYER_CHARS ? "too-few-chars" : "too-few-chars-per-page",
+            });
+            return null;
+          }
+          setSpanMetadata({ usable: true });
+          return text;
+        } finally {
+          await parser.destroy();
         }
-        setSpanMetadata({ usable: true });
-        return extracted;
       } catch (error) {
-        // A corrupt or password-protected PDF throws (pdfjs's InvalidPDFException and
-        // friends); an image-only one returns no text and is rejected by the thresholds
-        // above instead. Both mean the same thing to the caller: fall back to OCR.
         console.error("PDF text-layer extraction failed, will fall back to OCR:", error);
         setSpanMetadata({
           usable: false,
@@ -217,7 +207,7 @@ async function extractPdfTextLayer(buffer: Buffer): Promise<string | null> {
     },
     {
       runType: "parser",
-      tags: ["unpdf", "pii-boundary"],
+      tags: ["pdf-parse", "pii-boundary"],
       safeOutputs: (text) => ({ usable: text !== null, ...textShape("text", text) }),
       recordOutputs: (text) => ({ usable: text !== null, text }),
     }
