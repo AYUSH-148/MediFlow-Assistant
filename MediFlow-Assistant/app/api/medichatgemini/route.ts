@@ -10,7 +10,11 @@ import {
     appendSessionTurns,
     type StoredTurn,
 } from "@/lib/session";
-import { gradeRetrieval, buildGroundingInstruction } from "@/lib/retrieval-grader";
+import {
+    gradeRetrieval,
+    buildGroundingInstruction,
+    type GradedRetrieval,
+} from "@/lib/retrieval-grader";
 import {
     getCachedResponse,
     cacheResponse,
@@ -49,6 +53,31 @@ import {
 } from "@/lib/tracing";
 
 export const maxDuration = 60;
+
+// Stand-ins for the retrieval and grading a conversational turn skips. Shaped like the
+// real results so the prompt-building below stays one path rather than two: "" reads as
+// "no excerpts", which is exactly true here.
+const EMPTY_RETRIEVAL = { text: "", chunks: [] };
+const NOTHING_GRADED: GradedRetrieval = {
+    verdict: "none",
+    text: "",
+    chunks: [],
+    missing: "",
+    // Nothing was retrieved, so nothing was graded. Recorded honestly: a turn counted as
+    // a grader failure would make the grader look broken in the traces.
+    ungraded: true,
+};
+
+// buildGroundingInstruction's "none" branch tells the model to say the report does not
+// contain the information - a true statement and the wrong answer, because the question
+// was never about the report. This replaces it for conversational turns.
+const CONVERSATIONAL_GROUNDING =
+    "This question is about the conversation itself, not about the report. Answer it " +
+    "from the conversation history below: say what was actually asked or answered, " +
+    "quoting the user's own wording where it helps. If the history holds nothing yet, " +
+    "say this is the first question of the conversation. Do not retrieve, infer or " +
+    "volunteer clinical findings to answer it, and do not tell the user their report " +
+    "lacks the information - it was never the place to look.";
 
 // Emit a ready-made answer in the AI SDK data-stream protocol so useChat (default
 // streamProtocol: "data") can parse it - the same framing toDataStreamResponse()
@@ -446,7 +475,18 @@ async function handleChat({
     // "is that bad?" being written to memory as a dangling pronoun.
     const effectiveQuestion = guard.resolvedQuestion;
 
-    const cachedAnswer = await getCachedResponse(effectiveQuestion, reportData, 0.95);
+    // "What did I ask before?" is answered from the transcript, so it skips the report
+    // pipeline entirely: no cache, no retrieval, no grading.
+    //
+    // The cache is the part that would be actively wrong rather than merely wasteful. Its
+    // key is the report hash plus the question hash, with nothing in it identifying the
+    // conversation - so one session's "what was my first question" would be replayed to
+    // every other session holding the same report, for 24h.
+    const conversational = guard.conversational;
+
+    const cachedAnswer = conversational
+        ? null
+        : await getCachedResponse(effectiveQuestion, reportData, 0.95);
 
     if (cachedAnswer) {
         const vault = await getVault(vaultId);
@@ -510,13 +550,15 @@ async function handleChat({
     // topK 500 corpus pull, every turn, to fetch turns the request body already carried.
     // It also returned them ranked by similarity rather than in order, which made "what did
     // I ask before that?" unanswerable however good the recall was.
-    const reportRetrieval = await queryPineconeVectorStoreDetailed(
-        pinecone,
-        'medic',
-        "diagnosis2",
-        query,
-        reportFilter
-    );
+    const reportRetrieval = conversational
+        ? EMPTY_RETRIEVAL
+        : await queryPineconeVectorStoreDetailed(
+              pinecone,
+              'medic',
+              "diagnosis2",
+              query,
+              reportFilter
+          );
 
     // Corrective-RAG grading. Retrieval hands back its top 10 chunks whether or not they
     // bear on the question, so without this the generator receives padding labelled as
@@ -525,11 +567,13 @@ async function handleChat({
     // makes, since its query has the whole report prepended - filters the chunks and,
     // when nothing survives, switches the prompt to "say this is not in your report"
     // instead of letting the model reach for general knowledge.
-    const graded = await gradeRetrieval({
-        question: effectiveQuestion,
-        retrievalText: reportRetrieval.text,
-        chunks: reportRetrieval.chunks,
-    });
+    const graded = conversational
+        ? NOTHING_GRADED
+        : await gradeRetrieval({
+              question: effectiveQuestion,
+              retrievalText: reportRetrieval.text,
+              chunks: reportRetrieval.chunks,
+          });
     const retrievals = graded.text;
 
     root?.setMetadata({
@@ -545,7 +589,7 @@ async function handleChat({
   The retrieved excerpts are passages from THIS patient's own report, already checked for relevance to the query - treat them as evidence about this patient, not as generic background.
 
   \n\n**Grounding rule (follow this exactly):**
-  \n${buildGroundingInstruction(graded)}
+  \n${conversational ? CONVERSATIONAL_GROUNDING : buildGroundingInstruction(graded)}
 
   \n\n**Today's date:** ${new Date().toISOString().slice(0, 10)}
 
@@ -634,7 +678,7 @@ async function handleChat({
                 };
                 data.close();
                 // Cache the redacted text, without tool-call noise.
-                if (event.text) {
+                if (event.text && !conversational) {
                     cacheResponse(effectiveQuestion, event.text, reportData);
                 }
             }
