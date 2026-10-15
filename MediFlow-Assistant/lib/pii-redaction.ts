@@ -152,7 +152,7 @@ function escapeRegExp(literal: string): string {
   return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-interface TokenVault {
+export interface TokenVault {
   [token: string]: string; // token -> original value
 }
 
@@ -176,11 +176,26 @@ function generateVaultId(): string {
  *      even across chunks and the summary).
  *   2. Replace each discovered value with its token in every text, longest value
  *      first so shorter values can't partially clobber a longer one.
+ *
+ * `existing` extends a vault from an earlier pass instead of starting a fresh one. Ingest
+ * redacts the text layer before Gemini summarises it, then redacts again once the summary
+ * and figure descriptions exist. A fresh vault on that second pass would number from 1
+ * again, so a new [NAME_1] would collide with the [NAME_1] the summary already carries.
  */
-export function redactDocument(texts: string[]): { redactedTexts: string[]; vault: TokenVault } {
-  const vault: TokenVault = {};
+export function redactDocument(
+  texts: string[],
+  existing: TokenVault = {}
+): { redactedTexts: string[]; vault: TokenVault } {
+  const vault: TokenVault = { ...existing };
   const valueToToken = new Map<string, string>();
   const typeCounters: Record<string, number> = {};
+  for (const [token, value] of Object.entries(existing)) {
+    valueToToken.set(value, token);
+    const parsed = token.match(/^\[([A-Z]+)_(\d+)\]$/);
+    if (parsed) {
+      typeCounters[parsed[1]] = Math.max(typeCounters[parsed[1]] ?? 0, Number(parsed[2]));
+    }
+  }
 
   for (const text of texts) {
     for (const { type, regex } of PII_RULES) {

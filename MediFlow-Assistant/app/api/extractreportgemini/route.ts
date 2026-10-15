@@ -1,7 +1,7 @@
 import { generateObject, NoObjectGeneratedError, TypeValidationError } from "ai";
 import { z } from "zod";
 import { chunkWithContext } from "@/lib/chunking";
-import { redactDocument, redactTriples, storeVault, storeTriplesInNeo4j, getVault } from "@/lib/pii-redaction";
+import { redactDocument, redactTriples, storeVault, storeTriplesInNeo4j, getVault, type TokenVault } from "@/lib/pii-redaction";
 import { geminiModel, GEMINI_MODEL_ID } from "@/lib/gemini";
 import { generateEmbeddings } from "@/lib/embeddings";
 import { describePdfFigures, NO_FIGURES, type FigureExtraction } from "@/lib/pdf-figures";
@@ -65,6 +65,8 @@ const TEXT_ANALYSIS_PROMPT = `Below is the extracted text of a clinical report.
 Go over it and identify biomarkers that show slight or large abnormalities, then summarize in about 100 words (you may exceed this for multi-page reports). Include numerical values, key details, and the report title.
 
 Additionally, extract entity relationships as triples. Focus on medical entities like drugs, conditions, symptoms, and treatments.
+
+Identifiers in the text have been replaced with placeholders such as [NAME_1] or [MRN_1]. If you mention one, copy the placeholder exactly as written, brackets included.
 
 ## Clinical report text:
 `;
@@ -214,9 +216,10 @@ async function extractPdfTextLayer(buffer: Buffer): Promise<string | null> {
   );
 }
 
-// Both extraction paths are `llm` spans so token usage rolls up into cost. Their inputs
-// are raw report text and a triple can name the patient before redactTriples runs, so
-// both sides are PHI-gated.
+// Both extraction paths are `llm` spans so token usage rolls up into cost. The vision
+// path's inputs are raw report pixels; the text path's are redacted, but the rules only
+// catch labelled identifiers, so a name in free prose can still be there. Both sides are
+// PHI-gated.
 async function analyzeText(fullText: string): Promise<{ summary: string; triples: Triple[] }> {
   const result = await span(
     "extract_from_text_layer",
@@ -441,6 +444,8 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
   let figures: FigureExtraction = NO_FIGURES;
   // The document's own text, before any figure description is appended - see documentId.
   let identityText: string | null = null;
+  // Set on the text-layer path, where redaction runs before the model sees the text.
+  let textLayerVault: TokenVault | undefined;
 
   try {
     if (mimeType === "application/pdf") {
@@ -463,6 +468,15 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
         const shortCircuit = await reuseIngestedReport(knownId);
         if (shortCircuit) return shortCircuit;
 
+        // Redacted BEFORE the model sees it. Redaction used to run only after analyzeText,
+        // so every text-layer upload sent the patient's name, MRN and DOB to Gemini to be
+        // summarised. The vision paths cannot do this - the model has to read the pixels -
+        // but here the text exists locally, so nothing forces it out unredacted. The vault
+        // is carried into the redaction pass below so its tokens keep their meaning.
+        const preRedaction = redactDocument([textLayer]);
+        textLayerVault = preRedaction.vault;
+        fullText = preRedaction.redactedTexts[0];
+
         ({ summary, triples } = await analyzeText(fullText));
 
         // Deliberately after analyzeText, so the summary and the graph triples are derived
@@ -472,7 +486,8 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
         // descriptions still reach the index below, which is what makes a question about a
         // chart answerable at all.
         figures = await describePdfFigures(buffer);
-        identityText = fullText;
+        // The RAW text layer, not the redacted one - see documentId.
+        identityText = textLayer;
         fullText += figures.text;
       } else {
         setSpanMetadata({ extractionPath: "pdf-ocr-fallback" });
@@ -507,7 +522,9 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
   }
 
   // The document text and the summary are redacted together so they share one coherent
-  // vault: a given name or number maps to the same token in both.
+  // vault: a given name or number maps to the same token in both. On the text-layer path
+  // the text is already redacted; this pass extends that vault with anything the summary
+  // or the figure descriptions (read from raw page images) still carry.
   //
   // Every field on both sides of this span is PHI, so with capture off it records only
   // lengths and which token types fired - still enough to catch the failure that
@@ -516,7 +533,7 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
     "redact_document",
     { fullText, summary },
     async () => {
-      const result = redactDocument([fullText, summary]);
+      const result = redactDocument([fullText, summary], textLayerVault);
       const tokens = Object.keys(result.vault);
       setSpanMetadata({
         piiCount: tokens.length,
