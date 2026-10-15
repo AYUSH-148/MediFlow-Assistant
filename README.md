@@ -85,7 +85,15 @@ Most RAG demos stop at "chunk a PDF, embed it, stuff it in a prompt." The hard p
           Gemini 2.5 Flash + full transcript + queryKnowledgeGraph tool
                           (agentic, up to 5 steps → Neo4j)
                                           ▼
-              buffer ─▶ cache ─▶ append turn to the session transcript
+          hallucination check against excerpts + summary + graph lookups
+             (skipped for conversational turns)
+             grounded ──────────────────────────────────────▶ send
+             partial ──▶ revise, dropping the named claims ─┐
+             unsupported ─▶ regenerate with the critique ───┴▶ check again
+                                                 grounded ─▶ send
+                                                 still not ─▶ safe fallback
+                                          ▼
+          verified: cache + append turn to the session transcript
                                           ▼
                        rehydrate from vault ─▶ client
 ```
@@ -137,7 +145,7 @@ Redaction runs over the **entire document** before chunking, not just the summar
 - Rules are **label-anchored** (`Patient:`, `DOB:`, `MRN:`) rather than broad. A naive "two capitalised words = a name" rule tokenises half a clinical report and destroys retrieval quality.
 - Replacement is case-insensitive and whitespace-tolerant, because OCR reads a header as `PATIENT RAHUL MEHTA` while the model's summary says `Rahul Mehta` — an exact-match replace leaves the second spelling on screen.
 - The vault lives in Redis with a 24-hour TTL and is **never** sent to the trace backend; shipping it alongside the redacted text would hand over both the ciphertext and the key.
-- Rehydration is verified: the pipeline counts tokens that survive, including ones split across streaming chunk boundaries, and records that as an alertable metric.
+- Rehydration is verified: the pipeline counts tokens that survive and records that as an alertable metric. The answer is rehydrated as one finished string, so a token can no longer be split across stream chunks.
 
 ### ✂️ Chunking that keeps its headings
 
@@ -234,6 +242,28 @@ Grading against the bare question is the one comparison the retrieval pipeline n
 
 Both non-relevant instructions send the model back to the report summary before declaring anything absent. The grader only saw the excerpts, but the summary is also in the prompt, so an unqualified *"not in your report"* would contradict something the model can plainly see.
 
+### 🛡️ Hallucination check — verifying the answer, not just the evidence
+
+The grader decides what the model reads; nothing checked what it then wrote. The grounding rule asks the model not to answer from general knowledge, but a prompt line is a request, not a filter. `lib/answer-checker.ts` is the filter on the output side: one temperature-0 pass judges the finished answer against the question and the evidence the generator was given — graded excerpts, report summary, and the knowledge-graph lookups the model made itself, without which a correct graph-based answer would read as invented.
+
+| Verdict | Meaning | What happens |
+|---|---|---|
+| `grounded` | answers the question; every claim about this patient is supported | sent, cached, recorded |
+| `partial` | answers it, but some patient-specific claims are unsupported | one revision that removes or corrects only the named claims |
+| `unsupported` | off the question, or its central claim is unsupported | one regeneration with the critique, without the draft in view |
+
+A retried answer is checked again. If it still fails, the user gets a fixed *"I couldn't verify an answer to that against your report"* instead of either draft. One retry is the cap: each round is a generation plus a check inside a 60-second function budget.
+
+Design choices:
+
+- **Scope is patient-specific claims.** General medical explanation ("ferritin reflects iron stores") is allowed, since the generator is told to justify its answers and most justification is background. A value, finding, diagnosis, medication or date attributed to *this* patient must be in the evidence.
+- **Partial answers are revised, not re-asked.** The guard already rewrote the question to stand alone; rewording it again risks answering something the user did not ask. Naming the unsupported claims is cheaper and more targeted.
+- **Numbers get a deterministic pointer.** Every number in the answer that appears nowhere in the evidence is listed for the checker. It is not a verdict on its own — a reference range or a computed age legitimately produces some — but a wrong lab value is the costliest mistake this app can make, and one digit in a long answer is easy to read past.
+- **Only verified answers are cached.** A cache entry is replayed to every session holding the report for 24 hours, through a path that never checks again.
+- **It fails open**, like the guard and grader: on a Gemini error the answer is sent unchecked, flagged `checkFailed` in the trace, and not cached.
+
+Because the answer must pass this check before the client sees it, generation uses `generateText` rather than `streamText`. Nothing streamed before either — the response was always buffered whole to cache and rehydrate it.
+
 ### 🕸️ GraphRAG as an agentic tool, not a prefetch
 
 Extracted `(subject, predicate, object)` triples land in Neo4j. Rather than prefetching graph context for a fixed entity list on every request, the model gets a `queryKnowledgeGraph` tool and decides when to reach for it — following chains across up to 5 steps (e.g. *drug → interacting drug → contraindication*).
@@ -243,7 +273,7 @@ The subtle part is **scoping the neighbour, not just the queried node**. Generic
 ### 🚨 Failing visibly on the generation path
 
 The guard fails open and the cache degrades quietly, but generation had no equivalent. A
-`streamText` rejection - quota, auth, a network blip - was re-thrown, so Next returned a
+generation rejection - quota, auth, a network blip - was re-thrown, so Next returned a
 bare 500 with no body. On the client that was worse than it sounds: `useChat` throws
 `new Error(await response.text())` on a non-ok response, so an empty body meant an empty
 message, and `keepLastMessageOnError` defaults to `false` in this version of the SDK, so
@@ -505,7 +535,7 @@ MediFlow-Assistant/
 ├── app/
 │   ├── api/extractreportgemini/route.ts   # ingest: extract → redact → chunk → index → graph → session
 │   ├── api/session/report/route.ts        # binds the reviewed summary to the session
-│   ├── api/medichatgemini/route.ts        # chat: redact → guard → cache → retrieve → grade → generate → rehydrate
+│   ├── api/medichatgemini/route.ts        # chat: redact → guard → cache → retrieve → grade → generate → check → rehydrate
 │   ├── about/page.tsx
 │   └── page.tsx
 ├── lib/
@@ -513,6 +543,7 @@ MediFlow-Assistant/
 │   ├── session.ts          # mf_sid cookie → {documentId, summary, transcript} in Redis
 │   ├── query-guard.ts      # refuse / clarify / answer routing + question rewriting
 │   ├── retrieval-grader.ts # corrective-RAG chunk grading + grounding instructions
+│   ├── answer-checker.ts   # hallucination check on the generated answer + retry instruction
 │   ├── cache.ts            # semantic response cache + stored ingest results
 │   ├── chunking.ts         # splitting with section / table-header prefixes
 │   ├── pdf-figures.ts      # figure detection and batched description
@@ -542,8 +573,9 @@ MediFlow-Assistant/
 | Cache, vault and ingest-result TTL | 24 hours | `lib/cache.ts`, `lib/pii-redaction.ts` |
 | Session cookie lifetime | 24 hours from upload | `lib/session.ts` |
 | Stored transcript cap | 200 turns, 8k chars each | `lib/session.ts` |
-| Guard / grader temperature | 0 | `lib/query-guard.ts`, `lib/retrieval-grader.ts` |
-| Gemini calls per answered question | 3 (guard → grader → generation), plus one per knowledge-graph tool step | `app/api/medichatgemini/route.ts` |
+| Guard / grader / answer-check temperature | 0 | `lib/query-guard.ts`, `lib/retrieval-grader.ts`, `lib/answer-checker.ts` |
+| Gemini calls per answered question | 4 (guard → grader → generation → check), plus one per knowledge-graph tool step, plus 2 when the check fails | `app/api/medichatgemini/route.ts` |
+| Hallucination retries | 1 | `app/api/medichatgemini/route.ts` |
 | Max tool-calling steps | 5 | `app/api/medichatgemini/route.ts` |
 
 ---
@@ -552,8 +584,8 @@ MediFlow-Assistant/
 
 - **Vision inputs reach Gemini unredacted.** A text-layer PDF is redacted before any model call, but scanned PDFs, photos and figure pages are sent as raw images, because the model has to read the pixels before there is any text to redact. Everything the model returns is redacted before it is stored, indexed or shown.
 - Redaction is **rule-based**, so a name written in free prose (`"my name is Rahul, is my LDL high?"`) has no label to anchor on and survives. This is why nothing downstream treats post-redaction text as safe by default.
-- The query guard and the retrieval grader are **model judgment, not deterministic rules**. Both can misclassify — a legitimate question refused, or irrelevant chunks kept — and both deliberately fail open, so an outage degrades to the older, less careful behaviour rather than blocking the chat. Their spans record `intent`, `verdict` and `ungraded` precisely so drift is measurable rather than anecdotal.
-- Answering a question now costs **three sequential Gemini calls** rather than one. Refusals and clarifications short-circuit before retrieval and grading, so the cheap paths stayed cheap, but the common case pays roughly two extra Flash round trips for the grounding.
+- The query guard, the retrieval grader and the answer check are **model judgment, not deterministic rules**. Each can misclassify — a legitimate question refused, irrelevant chunks kept, a correct answer replaced by the fallback — and all three deliberately fail open, so an outage degrades to the older, less careful behaviour rather than blocking the chat. Their spans record `intent`, `verdict`, `ungraded` and `checkFailed` precisely so drift is measurable rather than anecdotal. The checker is the same model as the generator, so it can share its blind spots. The eval harness does not measure it yet.
+- Answering a question now costs **four sequential Gemini calls** rather than one, and six when the answer check fails. Refusals and clarifications short-circuit before retrieval and grading, so the cheap paths stayed cheap, but the common case pays roughly three extra Flash round trips for the grounding.
 - An indexing failure still returns a usable summary rather than failing the upload, but the response now says so (`searchable: false`) and the UI stops reporting success. Before that, a Pinecone or HuggingFace outage produced "Report processed!" for a document the chat could not search, and every question about it was answered "this is not in your report".
 - There is still no user account model. A session cookie binds a browser to the document it uploaded, which stops one client naming another's document, but a stolen cookie is a working key until it expires.
 - A guard outage and a quota failure look the same from the user's chair, though they are distinguishable in a trace: the root span records `guardIntent` and `guardFailed`, and a generation failure closes with `outcome: "error"`.
