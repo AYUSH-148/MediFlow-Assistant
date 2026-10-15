@@ -111,8 +111,11 @@ export async function appendSessionTurns(
     }));
     const transcript = [...(session.transcript ?? []), ...trimmed].slice(-MAX_STORED_TURNS);
 
-    // The TTL is refreshed rather than preserved: an active conversation should not expire
-    // out from under itself 24h after the upload that started it.
+    // setex has to be given a TTL when it rewrites the value, so this pushes the record's
+    // expiry out again. That does NOT extend the conversation: the cookie's Max-Age is fixed
+    // at upload and never re-sent, so the browser stops presenting this session 24h after
+    // upload - the same moment the vault expires. Past that the record is unreachable and
+    // simply ages out on its own TTL.
     await redis.setex(
       sessionKey(sessionId),
       SESSION_TTL_SECONDS,

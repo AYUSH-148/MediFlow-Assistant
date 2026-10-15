@@ -31,26 +31,34 @@ Most RAG demos stop at "chunk a PDF, embed it, stuff it in a prompt." The hard p
 ## Architecture
 
 ```
-                          ┌──────────────────────────────┐
-   PDF / image  ─────────▶│  POST /api/extractreportgemini│
-                          └───────────────┬──────────────┘
-                                          │
-              ┌───────────────────────────┼───────────────────────────┐
-              ▼                           ▼                           ▼
-     text layer (pdf-parse)      Gemini structured output      redaction rules
-     └─ empty? ─▶ Gemini OCR     ├─ summary                    ├─ [NAME_1] …
-                                 └─ entity triples             └─ vault ──▶ Redis (24h)
-                                          │
-              ┌───────────────────────────┼───────────────────────────┐
-              ▼                           ▼                           ▼
-      chunk 1200/150             redacted triples            redacted summary
-      embed (mxbai 1024d)        Neo4j :Entity graph          ──▶ browser
-      Pinecone ns: diagnosis2    (document-scoped)
+   PDF / image ──▶ POST /api/extractreportgemini
+                          │
+          PDF with a usable text layer?
+          ├─ yes ─▶ pdf-parse text ─▶ same SHA-256 seen in last 24h? ── yes ──▶ stored result,
+          │                               │ no                                  0 model calls
+          │                               ▼
+          │                  Gemini structured output: summary + triples
+          │                  figure pages ─▶ one batched description call
+          │
+          └─ no (scan / image) ─▶ Gemini vision OCR: text + summary + triples
+                          │
+                          ▼
+          redaction rules ─▶ [NAME_1] …   vault ──▶ Redis (24h)
+                          │
+     ┌────────────────────┼─────────────────────────┐
+     ▼                    ▼                         ▼
+ chunk 1200/150       redacted triples         session ──▶ Redis (24h)
+ + section headings   Neo4j :Entity graph      HttpOnly mf_sid cookie
+ embed (mxbai 1024d)  (document-scoped)        redacted summary ──▶ browser
+ Pinecone diagnosis2                                     │
+                                                         ▼
+                                      user reviews / edits the summary
+                                      POST /api/session/report ──▶ bound to session
 
 
-                          ┌──────────────────────────────┐
-   question    ─────────▶ │   POST /api/medichatgemini    │
-                          └───────────────┬──────────────┘
+   question + mf_sid cookie ──▶ POST /api/medichatgemini
+                                          ▼
+                 session ─▶ documentId, summary, stored transcript
                                           ▼
                               redact question (no vault)
                                           ▼
@@ -58,27 +66,27 @@ Most RAG demos stop at "chunk a PDF, embed it, stuff it in a prompt." The hard p
                     (intent + rewrite) ─ clarify ──▶ ask ──▶ stream
                                           │ answer
                                           ▼  question now stands alone
-                       semantic cache lookup (Redis, cos ≥ 0.95)
-                                   hit ──▶ rehydrate ──▶ stream
-                                   miss
-                                          ▼
-                    ┌─────────── Promise.all ───────────┐
-                    ▼                                   ▼
-        hybrid retrieval (report)         conversation memory (skipped
-        vector top-12 ┐                   when the namespace is empty)
-        TF-IDF top-500┴─ RRF ─▶ top-10
-                    └─────────────┬─────────────────────┘
-                                  ▼
-                  grade chunks against the question (corrective RAG)
-                  relevant / partial ─▶ keep survivors
-                  none ─────────────▶ drop context, require
-                                       "this is not in your report"
-                                  ▼
-                    Gemini 2.5 Flash + queryKnowledgeGraph tool
+               about the conversation itself? ── yes ──▶ skip cache, retrieval, grading ─┐
+                                          │ no                                            │
+                                          ▼                                               │
+                       semantic cache lookup (Redis, cos ≥ 0.95)                          │
+                                   hit ──▶ rehydrate ──▶ stream                           │
+                                   miss                                                   │
+                                          ▼                                               │
+                        hybrid retrieval (report only)                                    │
+                        vector top-12 ┐                                                   │
+                        TF-IDF top-500┴─ RRF ─▶ top-10                                    │
+                                          ▼                                               │
+                  grade chunks against the question (corrective RAG)                      │
+                  relevant / partial ─▶ keep survivors                                    │
+                  none ─────────────▶ drop context, require                               │
+                                       "this is not in your report"                       │
+                                          ▼ ◀─────────────────────────────────────────────┘
+          Gemini 2.5 Flash + full transcript + queryKnowledgeGraph tool
                           (agentic, up to 5 steps → Neo4j)
-                                  ▼
-                    stream ─▶ buffer ─▶ cache ─▶ write memory
-                                  ▼
+                                          ▼
+              buffer ─▶ cache ─▶ append turn to the session transcript
+                                          ▼
                        rehydrate from vault ─▶ client
 ```
 
@@ -201,6 +209,8 @@ The rewrite is the subtle half. *"Is that bad?"* means nothing on its own. The g
 
 Resolving the question first makes the key self-describing, fixing the collision without hashing conversation history into it. Stored memory stops preserving a pronoun whose referent is gone, too.
 
+Questions about the conversation itself (*"what did I ask before?"*) are routed to `answer` with a `conversational` flag. They skip the cache, retrieval and grading, and are answered from the transcript. The cache is the part that would be actively wrong: its key names the report and the question but not the conversation, so one session's *"what was my first question"* would be replayed to every other session holding the same report.
+
 The guard is pinned to `temperature: 0` — routing should not be a coin flip — and **fails open**: an outage degrades to the previous behaviour rather than to a chat that refuses everything.
 
 ### ✅ Corrective RAG — grading retrieval before trusting it
@@ -263,7 +273,7 @@ and a duplicate upload returns them unchanged:
 
 | | Cold upload | Duplicate |
 |---|---|---|
-| Gemini calls | 2 | **0** |
+| Gemini calls | 1, plus 1 if the report has figures | **0** |
 | Embedding calls | 1 per chunk | **0** |
 | Pinecone writes | yes | **0** |
 | Summary | freshly generated | **byte-identical to the first** |
@@ -315,8 +325,7 @@ compactions — real costs against a threshold this app will not reach.
 
 ### ⚡ Semantic caching
 
-Answers are cached in Redis keyed by report hash, matched by **cosine similarity ≥ 0.95** rather than by exact string. The match runs against the guard's **resolved** question, not the raw one — that is what stops two identical-looking follow-ups from colliding on one key. Cache hits are re-emitted in the AI SDK data-stream protocol so the client parses them identically to a live generation. Entries for a report are enumerated through a **per-report index set** (`SMEMBERS`), not `KEYS`. `KEYS` reads as one call and is not: it walks the *entire* keyspace — every report, vault and flag for every user — and filters by prefix afterwards, so its cost grows with traffic unrelated to the request making it. The similarity scan that follows is O(N) and was never the bottleneck — measured under 2 ms at 1000 entries, against the ~100-300 ms embedding call every lookup makes first. Entries expire on their own TTL while set members do not, so stale members are pruned as they are noticed. `bestSimilarity` is recorded on misses too — otherwise a threshold that never fires is indistinguishable from a cold cache.
-Answers are cached in Redis keyed by report hash, matched by **cosine similarity ≥ 0.95** rather than by exact string. The match runs against the guard's **resolved** question, not the raw one — that is what stops two identical-looking follow-ups from colliding on one key. Cache hits are re-emitted in the AI SDK data-stream protocol so the client parses them identically to a live generation. The report hash keying those namespaces is **SHA-256** (truncated to 128 bits), not the 32-bit string hash it started as: that one folded `+n` and `-n` onto the same key through `Math.abs`, and searching random inputs turned up a mirror pair after ~19k samples and a true collision after ~119k. Well beyond this app's traffic, but a collision means one report's cached answers served under another's namespace, and document identity was already hashed properly five lines away. `bestSimilarity` is recorded on misses too — otherwise a threshold that never fires is indistinguishable from a cold cache.
+Answers are cached in Redis keyed by report hash, matched by **cosine similarity ≥ 0.95** rather than by exact string. The match runs against the guard's **resolved** question, not the raw one — that is what stops two identical-looking follow-ups from colliding on one key. Cache hits are re-emitted in the AI SDK data-stream protocol so the client parses them identically to a live generation. The report hash keying those namespaces is **SHA-256** (truncated to 128 bits), not the 32-bit string hash it started as: that one folded `+n` and `-n` onto the same key through `Math.abs`, and searching random inputs turned up a mirror pair after ~19k samples and a true collision after ~119k. Well beyond this app's traffic, but a collision means one report's cached answers served under another's namespace, and document identity was already hashed properly five lines away. Entries for a report are enumerated through a **per-report index set** (`SMEMBERS`), not `KEYS`. `KEYS` reads as one call and is not: it walks the *entire* keyspace — every report, vault and session for every user — and filters by prefix afterwards, so its cost grows with traffic unrelated to the request making it. The similarity scan that follows is O(N) and was never the bottleneck — measured under 2 ms at 1000 entries, against the ~100-300 ms embedding call every lookup makes first. Entries expire on their own TTL while set members do not, so stale members are pruned as they are noticed. `bestSimilarity` is recorded on misses too — otherwise a threshold that never fires is indistinguishable from a cold cache.
 
 ### 🖼️ Figures in born-digital reports
 
@@ -403,8 +412,9 @@ born-digital PDF now travels as raw bytes end to end.
 
 ### 🏎️ Latency work
 
-- Report retrieval and conversation-memory retrieval run **concurrently** instead of sequentially.
-- The conversation-memory search is **skipped entirely** when a Redis flag shows the namespace is empty for that document — turning an embedding call plus two Pinecone queries into a single `EXISTS`.
+- Refusals, clarifications and questions about the conversation return **before retrieval**, so they cost one Flash call rather than an embedding call, two Pinecone queries and a grading pass.
+- Conversation history is read from the session rather than searched, so each turn makes **no memory lookup** at all (see *Conversation memory is the transcript*).
+- A re-uploaded text-layer report is recognised by its hash **before any model call** (see *Re-uploading the same report*).
 - Chunks are embedded in bounded batches of 8, since the HuggingFace inference API is the slowest dependency in ingest.
 
 ---
@@ -456,11 +466,12 @@ LANGSMITH_ENDPOINT=https://api.smith.langchain.com
 # LANGSMITH_TRACE_PHI=true   # records raw pre-redaction text — leave unset
 ```
 
-**Pinecone setup.** Create an index named `medic` with **dimension 1024** and the **cosine** metric. The app uses two namespaces, created automatically on first write:
+**Pinecone setup.** Create an index named `medic` with **dimension 1024** and the **cosine** metric. Namespaces are created automatically on first write:
 
 | Namespace | Contents |
 |---|---|
 | `diagnosis2` | Redacted report chunks |
+| `eval-diagnosis2` | Synthetic eval fixtures, written only by `npm run eval:build` |
 
 
 Then:
@@ -473,24 +484,43 @@ npm run lint
 
 ---
 
+## Evaluation
+
+The guard, retrieval, grading and cache are measured against a fixed synthetic corpus of five reports, in its own Pinecone namespace (`eval-diagnosis2`), so runs are comparable and never touch production data.
+
+```bash
+npm run eval:build      # ingest the fixtures; run first and after any fixture edit
+npm run eval            # all suites
+npm run eval:retrieval  # or one at a time: retrieval | guard | cache
+```
+
+Results are written to `eval/results/<timestamp>.json`. The suites hit the real Gemini, Pinecone and Redis APIs. Read [`eval/README.md`](MediFlow-Assistant/eval/README.md) before quoting a number: in particular, a non-zero guard outage or `ungraded` count means the run's metrics reflect an unavailable API rather than a judgement.
+
+---
+
 ## Project structure
 
 ```
 MediFlow-Assistant/
 ├── app/
-│   ├── api/extractreportgemini/route.ts   # ingest: extract → redact → chunk → index → graph
+│   ├── api/extractreportgemini/route.ts   # ingest: extract → redact → chunk → index → graph → session
+│   ├── api/session/report/route.ts        # binds the reviewed summary to the session
 │   ├── api/medichatgemini/route.ts        # chat: redact → guard → cache → retrieve → grade → generate → rehydrate
 │   ├── about/page.tsx
 │   └── page.tsx
 ├── lib/
 │   ├── pii-redaction.ts    # redaction rules, token vault, Neo4j read/write
+│   ├── session.ts          # mf_sid cookie → {documentId, summary, transcript} in Redis
 │   ├── query-guard.ts      # refuse / clarify / answer routing + question rewriting
 │   ├── retrieval-grader.ts # corrective-RAG chunk grading + grounding instructions
-│   ├── cache.ts            # semantic response cache + conversation-memory flag
+│   ├── cache.ts            # semantic response cache + stored ingest results
+│   ├── chunking.ts         # splitting with section / table-header prefixes
+│   ├── pdf-figures.ts      # figure detection and batched description
 │   ├── embeddings.ts       # HuggingFace client, single source of truth for the model id
 │   ├── gemini.ts           # shared Gemini config + safety settings
 │   └── tracing.ts          # LangSmith spans, PHI gating
-├── components/             # chat UI, upload/preview, shadcn primitives
+├── components/             # chat UI, upload/review, shadcn primitives
+├── eval/                   # evaluation harness: fixtures, gold sets, suites
 ├── utils.ts                # Pinecone client, hybrid retrieval, TF-IDF, RRF
 └── docs/e2e_flow.md        # end-to-end flow notes
 ```
@@ -501,16 +531,19 @@ MediFlow-Assistant/
 
 | Setting | Value | Where |
 |---|---|---|
-| Chunk size / overlap | 1200 / 150 chars | `app/api/extractreportgemini/route.ts` |
+| Upload size cap | 4 MB | `app/api/extractreportgemini/route.ts` |
+| OCR fallback threshold | < 100 chars, or < 20 chars/page | `app/api/extractreportgemini/route.ts` |
+| Chunk size / overlap | 1200 / 150 chars | `app/api/extractreportgemini/route.ts` (splitting in `lib/chunking.ts`) |
 | Embedding batch size | 8 | `lib/embeddings.ts` |
 | Vector search `topK` | 12 | `utils.ts` |
 | Keyword corpus `topK` | 500 | `utils.ts` |
 | RRF constant / final `topK` | 60 / 10 | `utils.ts` |
 | Cache similarity threshold | 0.95 | `app/api/medichatgemini/route.ts` |
-| Cache + vault TTL | 24 hours | `lib/cache.ts`, `lib/pii-redaction.ts` |
-| Conversation-memory flag TTL | none — mirrors non-expiring vectors | `lib/cache.ts` |
+| Cache, vault and ingest-result TTL | 24 hours | `lib/cache.ts`, `lib/pii-redaction.ts` |
+| Session cookie lifetime | 24 hours from upload | `lib/session.ts` |
+| Stored transcript cap | 200 turns, 8k chars each | `lib/session.ts` |
 | Guard / grader temperature | 0 | `lib/query-guard.ts`, `lib/retrieval-grader.ts` |
-| Gemini calls per answered question | 3 (guard → grader → generation) | `app/api/medichatgemini/route.ts` |
+| Gemini calls per answered question | 3 (guard → grader → generation), plus one per knowledge-graph tool step | `app/api/medichatgemini/route.ts` |
 | Max tool-calling steps | 5 | `app/api/medichatgemini/route.ts` |
 
 ---

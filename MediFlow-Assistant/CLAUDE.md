@@ -6,6 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 MediFlow Assistant: a Next.js 14 (App Router) conversational RAG app over uploaded medical reports. Gemini (`gemini-2.5-flash` via the Vercel AI SDK, `lib/gemini.ts`) for extraction/guarding/grading/answers, Hugging Face `mxbai-embed-large-v1` embeddings (1024-dim), Pinecone for vectors, Upstash Redis for cache/vault/sessions, Neo4j for Graph-RAG triples, LangSmith for tracing.
 
+## Repo layout
+
+The git root is the parent directory (`MedicalRAG/`), not this app directory. It holds the main `README.md` (design rationale per feature, config reference, known limitations) and `Patient2.pdf`, a sample report for manual upload tests. All code, `npm` commands and this file live in `MediFlow-Assistant/`. Git paths are prefixed `MediFlow-Assistant/`.
+
+Other notes in this directory: `graph-rag-neo4j-cypher.md` (Cypher for the graph), `pii-setup-guide.md` (redaction setup), `note` (a sample assembled prompt, not code).
+
 ## Commands
 
 ```bash
@@ -25,7 +31,7 @@ Env: copy `.env.local.example`. Required: `GEMINI_API_KEY`, `HF_TOKEN`, `PINECON
 
 ## Architecture
 
-Full walkthrough with examples: `docs/e2e_flow.md` (note: its "conversation-memory namespace" is outdated — transcripts now live in the Redis session, see below).
+Full walkthrough with examples: `docs/e2e_flow.md`. The root `README.md` has the design rationale. Conversation history is the transcript in the Redis session (capped at 200 turns of 8k chars each); there is no conversation-memory Pinecone namespace any more, so ignore any mention of one.
 
 Three API routes:
 
@@ -42,6 +48,6 @@ Key invariants:
 - **Tracing:** wrap stages with `span(...)` from `lib/tracing.ts`; routes call `flushTraces()` on every exit path because serverless hosts freeze after the response.
 - Server-only PDF deps (`pdf-parse`, `pdfjs-dist`, `@napi-rs/canvas`) are externalized and force-included via `outputFileTracingIncludes` in `next.config.mjs`; removing those entries breaks ingest in standalone builds.
 
-Path alias `@/*` maps to repo root (`@/utils` is root `utils.ts`, distinct from `lib/utils.ts` which only holds `cn`). UI is shadcn/ui (`components/ui/`); main client flow in `components/ReportComponent.tsx` (upload/review) and `components/chatcomponent.tsx` (`useChat`).
+Path alias `@/*` maps to this app directory (`@/utils` is root `utils.ts`, distinct from `lib/utils.ts` which only holds `cn`). UI is shadcn/ui (`components/ui/`); main client flow in `components/ReportComponent.tsx` (upload/review) and `components/chatcomponent.tsx` (`useChat`).
 
 Code comments in this repo explain *why* at length (past bugs, trade-offs); preserve that context when editing.
