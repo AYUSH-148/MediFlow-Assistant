@@ -36,7 +36,7 @@ Three API routes:
 Key invariants:
 
 - **Session, not client ids.** `lib/session.ts` maps an HttpOnly `mf_sid` cookie to `{documentId, summary, transcript}` in Redis. The client never sees or sends `documentId`/`vaultId`; don't reintroduce them in request bodies or responses.
-- **PII boundary.** `lib/pii-redaction.ts` replaces PII with `[TYPE_N]` tokens; the token→value vault is in Redis keyed by `documentId`. Everything sent to Gemini, Pinecone, Neo4j and the cache is redacted; rehydration happens only at the response edge. Trace spans use `safeInputs`/`phiGated`/`textShape` so raw text is recorded only when `LANGSMITH_TRACE_PHI=true`.
+- **PII boundary.** `lib/pii-redaction.ts` replaces PII with `[TYPE_N]` tokens; the token→value vault is in Redis keyed by `documentId`. Everything sent to Gemini, Pinecone, Neo4j and the cache is redacted; rehydration happens only at the response edge. The one exception is vision input (scans, photos, figure pages), which Gemini must see raw. Text-layer PDFs are redacted before `analyzeText`, and that vault is passed into the later `redactDocument` pass so token numbers don't collide. Trace spans use `safeInputs`/`phiGated`/`textShape` so raw text is recorded only when `LANGSMITH_TRACE_PHI=true`.
 - **24h TTLs are aligned** across vault, response cache, ingest result and session — change them together.
 - **Guard and grader fail open** on Gemini errors (`guardFailed`, ungraded pass-through) instead of throwing.
 - **Tracing:** wrap stages with `span(...)` from `lib/tracing.ts`; routes call `flushTraces()` on every exit path because serverless hosts freeze after the response.

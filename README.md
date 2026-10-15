@@ -517,6 +517,7 @@ MediFlow-Assistant/
 
 ## Known limitations
 
+- **Vision inputs reach Gemini unredacted.** A text-layer PDF is redacted before any model call, but scanned PDFs, photos and figure pages are sent as raw images, because the model has to read the pixels before there is any text to redact. Everything the model returns is redacted before it is stored, indexed or shown.
 - Redaction is **rule-based**, so a name written in free prose (`"my name is Rahul, is my LDL high?"`) has no label to anchor on and survives. This is why nothing downstream treats post-redaction text as safe by default.
 - The query guard and the retrieval grader are **model judgment, not deterministic rules**. Both can misclassify — a legitimate question refused, or irrelevant chunks kept — and both deliberately fail open, so an outage degrades to the older, less careful behaviour rather than blocking the chat. Their spans record `intent`, `verdict` and `ungraded` precisely so drift is measurable rather than anecdotal.
 - Answering a question now costs **three sequential Gemini calls** rather than one. Refusals and clarifications short-circuit before retrieval and grading, so the cheap paths stayed cheap, but the common case pays roughly two extra Flash round trips for the grounding.
