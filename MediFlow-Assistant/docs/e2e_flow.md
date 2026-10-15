@@ -15,7 +15,9 @@ High-level flow
 11. Query Guard (`lib/query-guard.ts`): One classification pass returns `refuse` (not health-related; returns a redirect and stops), `clarify` (ambiguous, or needs a report that was never uploaded; returns one question and stops), or `answer`. On `answer` it also rewrites the question to stand alone, resolving pronouns from the conversation history. The rewritten question is what every later stage uses: cache key, retrieval query, prompt, and stored transcript. A question about the conversation itself ("what did I ask before?") is flagged `conversational` and skips the cache, retrieval and grading.
 12. Retrieval: Redis semantic cache lookup (`lib/cache.ts`) on the resolved question; on a hit the answer is rehydrated and returned. On a miss, hybrid retrieval from Pinecone (dense + TF-IDF fused with RRF, filtered to the session's `documentId`).
 13. Retrieval Grading: `lib/retrieval-grader.ts` grades the retrieved chunks against the bare question and returns `relevant`, `partial`, or `none`. Chunks that do not bear on the question are dropped; on `none` the excerpt section is emptied and the generator is instructed to say the report does not contain the information rather than answering from general medical knowledge.
-14. Model Generation: Assemble the prompt (grounding rule + today's date + redacted report summary + resolved question + graded excerpts + full conversation transcript). Gemini generates with the `queryKnowledgeGraph` tool available for Neo4j lookups (up to 5 steps). The response is buffered, cached in Redis, appended to the session transcript, then rehydrated from the vault before it is sent to the client.
+14. Model Generation: Assemble the prompt (grounding rule + today's date + redacted report summary + resolved question + graded excerpts + full conversation transcript). Gemini generates with the `queryKnowledgeGraph` tool available for Neo4j lookups (up to 5 steps). The answer is generated whole (`generateText`), not streamed.
+15. Hallucination Check (`lib/answer-checker.ts`): One temperature-0 pass judges the answer against the question and the evidence the generator had: graded excerpts, report summary, today's date and the knowledge-graph lookups it made. Numbers in the answer that appear nowhere in the evidence are pointed out to the checker. Only claims about this patient must be supported; general medical explanation is allowed. `grounded` answers are sent. A `partial` answer gets one revision that removes or corrects the named claims; an `unsupported` one is regenerated with the critique. The retry is checked again, and if it still fails the user gets a fixed "couldn't verify" message. Conversational turns skip the check. On a checker error the answer is sent unchecked (fail open).
+16. Delivery: Verified answers are cached in Redis and appended to the session transcript; fallbacks are neither. The answer is rehydrated from the vault and sent to the client in the AI SDK data-stream format, with the excerpts as an annotation.
 
 Concrete example
 - Uploaded file: `report-123.png` (photo of a radiology report), so the OCR path runs.
@@ -23,7 +25,7 @@ Concrete example
 - Redacted summary: "Patient [NAME_1], DOB [DOB_1]. Findings: left lower lobe consolidation consistent with pneumonia." Vault stores `{ "[NAME_1]": "John Doe", "[DOB_1]": "1970-01-01" }` under `vault:<documentId>` in Redis.
 - Triples inserted in Neo4j: (Pneumonia)-[:LOCATION]->(Left lower lobe).
 - Embeddings stored in Pinecone for retrieval; the browser receives the redacted summary and the `mf_sid` cookie.
-- User asks: "Could this be aspiration pneumonia?" → chat route redacts the question → guard returns `answer` (health-related, already self-contained) → cache miss → Pinecone returns the consolidation passage → grader returns `relevant` and keeps it → Neo4j returns aspiration risk relations → prompt assembled and Gemini responds with a reasoned answer. The route caches the redacted response, appends the turn to the session transcript, and rehydrates PII before returning.
+- User asks: "Could this be aspiration pneumonia?" → chat route redacts the question → guard returns `answer` (health-related, already self-contained) → cache miss → Pinecone returns the consolidation passage → grader returns `relevant` and keeps it → Neo4j returns aspiration risk relations → prompt assembled and Gemini responds with a reasoned answer → checker returns `grounded`. The route caches the redacted response, appends the turn to the session transcript, and rehydrates PII before returning.
 - Follow-up: "is that bad?" → guard returns `answer` with `resolvedQuestion: "Is left lower lobe consolidation consistent with pneumonia serious?"`. That resolved form, not the two-word original, becomes the cache key, the retrieval query, and the stored transcript entry.
 - Conversation question: "what did I ask first?" → guard returns `answer` with `conversational: true` → no cache, retrieval or grading; the answer comes from the transcript.
 - Out of scope: "what is the capital of India" → guard returns `refuse`, a redirect is streamed, and nothing is retrieved, cached, or written to the transcript.
@@ -40,6 +42,7 @@ Files referenced
 - Query guard: lib/query-guard.ts
 - Retrieval grading: lib/retrieval-grader.ts
 - Semantic cache: lib/cache.ts
+- Hallucination check: lib/answer-checker.ts
 - Chat/QA: app/api/medichatgemini/route.ts
 
 Notes

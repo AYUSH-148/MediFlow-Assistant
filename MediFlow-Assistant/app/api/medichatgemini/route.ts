@@ -31,14 +31,14 @@ import {
     APICallError,
     Message,
     RetryError,
-    StreamData,
-    streamText,
+    generateText,
     tool,
     formatStreamPart,
     type JSONValue,
 } from "ai";
 import { z } from "zod";
 import { guardQuestion } from "@/lib/query-guard";
+import { checkAnswer, buildRevisionInstruction, type AnswerCheck } from "@/lib/answer-checker";
 import {
     span,
     setSpanMetadata,
@@ -79,13 +79,24 @@ const CONVERSATIONAL_GROUNDING =
     "volunteer clinical findings to answer it, and do not tell the user their report " +
     "lacks the information - it was never the place to look.";
 
+// Shown when an answer failed the hallucination check twice. Deliberately says nothing
+// about the content of either rejected draft.
+const UNVERIFIED_FALLBACK =
+    "I couldn't verify an answer to that against your report, so I'd rather not guess. " +
+    "Try asking about a specific finding (a medication, biomarker, or diagnosis), or check " +
+    "with the clinician who ordered the report.";
+
+const EMPTY_GENERATION_FALLBACK =
+    "I couldn't generate an answer for that one. Please try rephrasing your question, or " +
+    "ask about a specific finding in the report (a medication, biomarker, or diagnosis).";
+
 // Emit a ready-made answer in the AI SDK data-stream protocol so useChat (default
 // streamProtocol: "data") can parse it - the same framing toDataStreamResponse()
 // produces on the generation path. Returning raw text here makes the client silently
 // drop the response.
 //
-// Shared by the cache-hit path and the query guard: both have their answer in hand and
-// nothing to stream from a model.
+// Shared by every exit path: the cache hit, the query guard, and generation, whose answer
+// is only sent once it has been checked and rehydrated.
 function streamStaticAnswer(
     text: string,
     options: { annotation?: JSONValue; headers?: Record<string, string> } = {}
@@ -187,30 +198,6 @@ function createQueryKnowledgeGraphTool(documentId?: string, llmSpan?: ManualSpan
     });
 }
 
-// Concatenates the text parts ("0:" lines) of a data-stream payload back into the string
-// the client renders.
-//
-// Rehydration runs over the framed payload, so a token the model streamed across a chunk
-// boundary is physically split by framing - `0:"Patient [NAME"` / `0:"_1] has..."` - and
-// rehydrateText's literal split/join cannot match it. Reassembling heals the split, so a
-// token found here but not in the raw payload identifies exactly that case.
-function reassembleTextParts(payload: string): string {
-    return payload
-        .split("\n")
-        .filter((line) => line.startsWith("0:"))
-        .map((line) => {
-            try {
-                const decoded: unknown = JSON.parse(line.slice(2));
-                return typeof decoded === "string" ? decoded : "";
-            } catch {
-                // A part split mid-escape leaves unparseable JSON; the raw body still lets
-                // a token spanning the boundary be found.
-                return line.slice(2);
-            }
-        })
-        .join("");
-}
-
 function getMessageText(content: Message["content"]): string {
     const rawContent = content as unknown;
 
@@ -307,10 +294,8 @@ export async function POST(req: Request, res: Response) {
     const reportData: string = session?.summary ?? "";
     const vaultId: string = session?.documentId ?? "";
 
-    // Managed by hand because the request does not finish when the Response is returned:
-    // on a cache miss the remaining work (buffering, memory write, rehydration) runs in a
-    // ReadableStream `start` callback the runtime invokes afterwards. A callback-scoped
-    // root would close too early and orphan every span opened after it.
+    // Managed by hand because each exit path closes it at a different point, and an
+    // unexpected throw is closed by the catch below rather than by the path that threw.
     const root = startSpan({
         name: "chat",
         runType: "chain",
@@ -538,7 +523,6 @@ async function handleChat({
     }
 
     root?.setMetadata({ cacheHit: false });
-    const data = new StreamData();
     // Question only. The report summary used to be prepended here, which drowned the
     // question in the query vector, fed the whole summary to the TF-IDF arm as query
     // terms, and pushed the question past the embedding model's 512-token ceiling on a
@@ -583,7 +567,10 @@ async function handleChat({
         retrievalUngraded: graded.ungraded,
     });
 
-    const finalPrompt = `Here is a summary of a patient's clinical report, and a user query. Excerpts retrieved from that same report are also provided.
+    const today = new Date().toISOString().slice(0, 10);
+    // Everything up to the answer cue, so the hallucination retry can append its own
+    // instruction after the same evidence.
+    const promptBody = `Here is a summary of a patient's clinical report, and a user query. Excerpts retrieved from that same report are also provided.
   Go through the clinical report and answer the user query.
   Ensure the response is factually accurate, and demonstrates a thorough understanding of the query topic and the clinical report.
   The retrieved excerpts are passages from THIS patient's own report, already checked for relevance to the query - treat them as evidence about this patient, not as generic background.
@@ -591,7 +578,7 @@ async function handleChat({
   \n\n**Grounding rule (follow this exactly):**
   \n${conversational ? CONVERSATIONAL_GROUNDING : buildGroundingInstruction(graded)}
 
-  \n\n**Today's date:** ${new Date().toISOString().slice(0, 10)}
+  \n\n**Today's date:** ${today}
 
   \n\n**Patient's Clinical report summary:** \n${reportData}.
   \n**end of patient's clinical report**
@@ -611,19 +598,12 @@ async function handleChat({
 
   \n\n${graded.verdict === "none"
             ? "Keep the answer short and direct - there is nothing here to justify at length."
-            : "Provide thorough justification for your answer."}
-  \n\n**Answer:**
-  `;
+            : "Provide thorough justification for your answer."}`;
+    const finalPrompt = `${promptBody}\n\n**Answer:**\n`;
 
-    data.append({
-        retrievals: retrievals,
-        cacheHit: false,
-    });
-
-    // Opened before streamText and closed in the stream callback below: usage and finish
-    // reason only settle once the stream drains, but the route needs the stream object
-    // back immediately. `parent` is explicit because async context does not survive into
-    // that later callback.
+    // Opened by hand so the knowledge-graph tool spans can attach to it explicitly: the AI
+    // SDK runs tool execution inside its own step loop, where the async context that would
+    // nest them automatically is not guaranteed to survive.
     const llmSpan = startLlmSpan({
         name: "generate_answer",
         model: GEMINI_MODEL_ID,
@@ -634,244 +614,194 @@ async function handleChat({
         metadata: { maxSteps: 5, tools: ["queryKnowledgeGraph"] },
     });
 
-    // Captured in onFinish and applied after buffering, so the span always closes before
-    // the trace is flushed.
-    let generation: {
-        finishReason?: string;
-        usage?: { promptTokens?: number; completionTokens?: number };
-        text?: string;
-        toolCalls?: unknown[];
-        stepCount?: number;
-    } | null = null;
-
-    // The LLM span can be closed from four places (success, streamText rejecting, the
-    // buffering loop failing, the no-body fallback). Closing it twice would patch a
-    // finished run, so the first one wins.
-    let llmSettled = false;
-    const settleLlmSpan = async (close: () => Promise<void>) => {
-        if (llmSettled) return;
-        llmSettled = true;
-        await close();
-    };
-
-    // A closure rather than `let` + try/catch so the tool-typed return of streamText stays
-    // inferred - annotating it widens the tool map and breaks result.toolResults.
-    const startGeneration = async () => {
-      try {
-        return await streamText({
-            model: geminiModel,
-            prompt: finalPrompt,
-            tools: { queryKnowledgeGraph: createQueryKnowledgeGraphTool(vaultId, llmSpan) },
-            maxSteps: 5,
-            onFinish(event) {
-                generation = {
-                    finishReason: event.finishReason,
-                    usage: event.usage,
-                    text: event.text,
-                    // event.toolCalls describes the FINAL step only, so a generation that
-                    // called the knowledge graph and then answered reports zero tool calls.
-                    // Summing across steps is the real count.
-                    toolCalls: event.steps
-                        ? event.steps.flatMap((step) => step.toolCalls ?? [])
-                        : event.toolCalls,
-                    stepCount: event.steps?.length,
-                };
-                data.close();
-                // Cache the redacted text, without tool-call noise.
-                if (event.text && !conversational) {
-                    cacheResponse(effectiveQuestion, event.text, reportData);
-                }
-            }
-        });
-      } catch (error) {
-        // streamText rejects outright on auth, quota (429) and network failures, and the
-        // stream callback that normally closes the LLM span never runs in that case.
-        await settleLlmSpan(async () => {
-          await llmSpan?.fail(error);
-        });
+    // generateText, not streamText. The answer was always buffered whole before the client
+    // saw a byte - it had to be, to cache and rehydrate it - and it now also has to pass the
+    // hallucination check first, so streaming bought nothing but framing to work around: a
+    // vault token split across two stream chunks could not be rehydrated.
+    //
+    // A rejection (auth, quota, network) closes the span and reaches POST's catch, which
+    // turns it into a response the client can show.
+    const generation = await generateText({
+        model: geminiModel,
+        prompt: finalPrompt,
+        tools: { queryKnowledgeGraph: createQueryKnowledgeGraphTool(vaultId, llmSpan) },
+        maxSteps: 5,
+    }).catch(async (error) => {
+        await llmSpan?.fail(error);
         throw error;
-      }
-    };
+    });
 
-    const result = await startGeneration();
+    await endLlmSpan(llmSpan, {
+        finishReason: generation.finishReason,
+        usage: generation.usage,
+        text: generation.text,
+        // generation.toolCalls describes the FINAL step only, so a generation that called
+        // the knowledge graph and then answered reports zero tool calls. Summing across
+        // steps is the real count.
+        toolCalls: generation.steps.flatMap((step) => step.toolCalls),
+        stepCount: generation.steps.length,
+    });
 
-    const originalStream = result.toDataStreamResponse({ data });
+    const firstDraft = generation.text.trim();
+    let answer = firstDraft;
+    // Null when the check did not run: a conversational turn has no report evidence to
+    // check against, and an empty generation has nothing to check.
+    let check: AnswerCheck | null = null;
 
-    // The response is buffered so it can be cached and re-hydrated before it reaches the
-    // client.
-    if (originalStream.body) {
-        const reader = originalStream.body.getReader();
-        const chunks: Uint8Array[] = [];
+    if (firstDraft && !conversational) {
+        // Everything the generator was shown about this patient, including what it looked
+        // up itself: a correct answer drawn from the knowledge graph would otherwise read
+        // as invented.
+        const graphLookups = generation.steps.flatMap((step) =>
+            step.toolResults.map((toolResult) => toolResult.result)
+        );
+        const graphSection = graphLookups.length
+            ? `**Knowledge-graph lookups already made:**\n${JSON.stringify(graphLookups)}`
+            : "";
+        const evidence = [
+            `Today's date: ${today}`,
+            `Report summary:\n${reportData}`,
+            `Report excerpts:\n${retrievals}`,
+            graphSection,
+        ]
+            .filter(Boolean)
+            .join("\n\n");
 
-        const newStream = new ReadableStream({
-            async start(controller) {
-                // The runtime invokes this after POST has returned, so the request's async
-                // context is gone. runInSpan re-establishes the root span as the parent.
-                await runInSpan(root, async () => {
-                    try {
-                        while (true) {
-                            const { done, value } = await reader.read();
-                            if (done) break;
-                            if (value) {
-                                chunks.push(value);
-                            }
-                        }
-
-                        const combined = new Uint8Array(chunks.reduce((acc, chunk) => acc + chunk.length, 0));
-                        let offset = 0;
-                        for (const chunk of chunks) {
-                            combined.set(chunk, offset);
-                            offset += chunk.length;
-                        }
-                        const responseText = new TextDecoder().decode(combined);
-
-                        // The generated text without data-stream framing or tool-call payloads.
-                        const cleanAnswerText = await result.text;
-
-                        // Generation is complete by now, so the LLM span closes with its
-                        // token usage before anything downstream runs.
-                        await settleLlmSpan(() =>
-                            endLlmSpan(llmSpan, generation ?? { text: cleanAnswerText })
-                        );
-
-                        if (cleanAnswerText) {
-                            // Appended only once the answer has finished streaming, so a
-                            // turn the model never completed is not recorded as one that
-                            // happened.
-                            //
-                            // The resolved question is stored rather than the raw one:
-                            // "is that bad?" preserves a pronoun whose referent is gone,
-                            // and a later prompt would inherit the dangling reference.
-                            await appendSessionTurns(sessionId, [
-                                { role: "user", content: effectiveQuestion },
-                                { role: "assistant", content: cleanAnswerText },
-                            ]);
-                        }
-
-                        // With no text (safety block, tool-only turn) the data stream has no
-                        // text part and the UI renders an empty bubble. Inject a fallback
-                        // part just before the finish markers instead.
-                        let streamPayload = responseText;
-                        if (!cleanAnswerText || !cleanAnswerText.trim()) {
-                            console.warn("Model returned empty text; injecting fallback message.");
-                            root?.setMetadata({ emptyGeneration: true });
-                            const fallback =
-                                "I couldn't generate an answer for that one. Please try rephrasing your " +
-                                "question, or ask about a specific finding in the report (a medication, " +
-                                "biomarker, or diagnosis).";
-                            const fallbackPart = `0:${JSON.stringify(fallback)}`;
-                            const lines = responseText.split("\n");
-                            // Text parts must precede the finish-step (e:) / finish-message (d:) parts.
-                            const finishIdx = lines.findIndex((l) => l.startsWith("d:") || l.startsWith("e:"));
-                            if (finishIdx === -1) {
-                                streamPayload = `${fallbackPart}\n${responseText}`;
-                            } else {
-                                lines.splice(finishIdx, 0, fallbackPart);
-                                streamPayload = lines.join("\n");
-                            }
-                        }
-
-                        const vault = await getVault(vaultId);
-                        const finalText = await span(
-                            "rehydrate_answer",
-                            { text: streamPayload, vaultId },
-                            async () => {
-                                const output = vault ? rehydrateText(streamPayload, vault) : streamPayload;
-
-                                // Tokens still intact in the framed payload: the vault did not
-                                // cover them (expired, partial, or never written).
-                                const survivingInPayload = findVaultTokens(output);
-                                // Tokens visible only once framing is removed: a stream chunk
-                                // boundary fell inside the token. Same symptom, different cause.
-                                const survivingInAnswer = findVaultTokens(reassembleTextParts(output));
-                                const splitByFraming = survivingInAnswer.filter(
-                                    (token) => !survivingInPayload.includes(token)
-                                );
-
-                                setSpanMetadata({
-                                    vaultFound: !!vault,
-                                    changed: output !== streamPayload,
-                                    tokensRestored: vault ? Object.keys(vault).length : 0,
-                                    // A vault that exists but changes nothing means the answer
-                                    // had no placeholders in it - which is also how an
-                                    // un-redacted identifier reaching the client would look.
-                                    vaultPresentButUnused: !!vault && output === streamPayload,
-                                    // Labels only, never the values behind them.
-                                    tokensSurvivingRehydration: survivingInPayload.length,
-                                    tokensSurvivingLabels: survivingInPayload,
-                                    tokensSplitByFraming: splitByFraming.length,
-                                    tokensSplitByFramingLabels: splitByFraming,
-                                    // The single field to alert on: by either route, a
-                                    // placeholder reached the client.
-                                    rehydrationIncomplete:
-                                        survivingInPayload.length > 0 || splitByFraming.length > 0,
-                                });
-
-                                if (survivingInPayload.length > 0) {
-                                    console.warn(
-                                        `${survivingInPayload.length} vault token(s) survived rehydration ` +
-                                        `(vault did not cover them): ${survivingInPayload.join(", ")}`
-                                    );
-                                }
-                                if (splitByFraming.length > 0) {
-                                    console.warn(
-                                        `${splitByFraming.length} vault token(s) were split across stream ` +
-                                        `chunks and could not be rehydrated: ${splitByFraming.join(", ")}`
-                                    );
-                                }
-
-                                return output;
-                            },
-                            {
-                                runType: "chain",
-                                tags: ["rehydration", "pii-boundary"],
-                                safeInputs: { ...textShape("text", streamPayload), vaultId },
-                                safeOutputs: (output) => textShape("finalText", output),
-                                recordOutputs: (output) => ({ finalText: output }),
-                            }
-                        );
-
-                        controller.enqueue(new TextEncoder().encode(finalText));
-
-                        root?.setMetadata({ outcome: "ok" });
-                        await root?.succeed(
-                            phiGated(
-                                { answer: cleanAnswerText },
-                                textShape("answer", cleanAnswerText)
-                            )
-                        );
-                    } catch (error) {
-                        console.error("Error rehydrating response:", error);
-                        controller.enqueue(new TextEncoder().encode("An error occurred while generating the response."));
-                        // The buffering loop can fail before the success path settles the
-                        // LLM span; a no-op if it already closed.
-                        await settleLlmSpan(async () => {
-                            await llmSpan?.fail(error);
-                        });
-                        root?.setMetadata({ outcome: "stream-error" });
-                        await root?.fail(error);
-                    } finally {
-                        controller.close();
-                        // Last chance to get this request's spans off the box: nothing runs
-                        // after the stream closes, and a serverless host may freeze the
-                        // function immediately.
-                        await flushTraces();
-                    }
-                });
-            },
+        check = await checkAnswer({ question: effectiveQuestion, evidence, answer: firstDraft });
+        root?.setMetadata({
+            answerCheck: check.verdict,
+            answerCheckFailed: check.checkFailed,
+            unsupportedClaims: check.unsupportedClaims.length,
         });
 
-        return new Response(newStream, {
-            headers: originalStream.headers,
-        });
+        if (check.verdict !== "grounded") {
+            // One retry, no more: each round is a generation plus a check inside a 60s
+            // budget, and an answer that fails twice is better replaced than retried.
+            //
+            // No tools on the retry. The lookups the first pass made are in the prompt, and
+            // a fresh tool loop would repeat the slowest part of the turn.
+            const retryPrompt =
+                `${promptBody}\n\n${graphSection}\n\n**Correction:**\n` +
+                `${buildRevisionInstruction(check, firstDraft)}\n\n**Answer:**\n`;
+            const retrySpan = startLlmSpan({
+                name: "revise_answer",
+                model: GEMINI_MODEL_ID,
+                parent: root,
+                inputs: { prompt: retryPrompt },
+                safeInputs: textShape("prompt", retryPrompt),
+                tags: ["gemini", "generation", "hallucination-retry"],
+                metadata: { firstVerdict: check.verdict },
+            });
+            const retry = await generateText({ model: geminiModel, prompt: retryPrompt }).catch(
+                async (error) => {
+                    await retrySpan?.fail(error);
+                    throw error;
+                }
+            );
+            await endLlmSpan(retrySpan, {
+                finishReason: retry.finishReason,
+                usage: retry.usage,
+                text: retry.text,
+            });
+
+            answer = retry.text.trim();
+            // An empty retry keeps the first verdict, which already failed.
+            if (answer) {
+                check = await checkAnswer({ question: effectiveQuestion, evidence, answer });
+            }
+            root?.setMetadata({
+                answerRecheck: answer ? check.verdict : "empty",
+                answerRecheckFailed: check.checkFailed,
+            });
+        }
     }
 
-    // No response body to buffer, so the stream callback that normally closes the root
-    // span never runs. Closing it here keeps the trace from staying open forever.
-    await settleLlmSpan(() => endLlmSpan(llmSpan, generation ?? {}));
-    root?.setMetadata({ outcome: "no-stream-body" });
-    await root?.succeed({ note: "response had no body to buffer" });
+    // A check that failed open reports "grounded", so its answer is shown - but not cached.
+    const passed = !!answer && (check === null || check.verdict === "grounded");
+    const outcome = !firstDraft
+        ? "empty-generation"
+        : !passed
+          ? "unverified"
+          : answer === firstDraft
+            ? "ok"
+            : "revised";
+    const shownAnswer = !firstDraft
+        ? EMPTY_GENERATION_FALLBACK
+        : passed
+          ? answer
+          : UNVERIFIED_FALLBACK;
+
+    if (passed) {
+        await Promise.all([
+            // The resolved question is stored rather than the raw one: "is that bad?"
+            // preserves a pronoun whose referent is gone, and a later prompt would inherit
+            // the dangling reference. A fallback is not recorded, so a turn the model never
+            // answered is not remembered as one it did.
+            appendSessionTurns(sessionId, [
+                { role: "user", content: effectiveQuestion },
+                { role: "assistant", content: answer },
+            ]),
+            // Only a verified answer is cached: a cache entry is replayed to every session
+            // holding this report for 24h, through a path that never checks again. The
+            // redacted text is cached, never the rehydrated one.
+            check && !check.checkFailed
+                ? cacheResponse(effectiveQuestion, answer, reportData)
+                : undefined,
+        ]);
+    }
+
+    const vault = await getVault(vaultId);
+    const finalText = await span(
+        "rehydrate_answer",
+        { text: shownAnswer, vaultId },
+        async () => {
+            const output = vault ? rehydrateText(shownAnswer, vault) : shownAnswer;
+            // Tokens still intact: the vault did not cover them (expired, partial, or never
+            // written).
+            const surviving = findVaultTokens(output);
+            setSpanMetadata({
+                vaultFound: !!vault,
+                changed: output !== shownAnswer,
+                tokensRestored: vault ? Object.keys(vault).length : 0,
+                // A vault that exists but changes nothing means the answer had no
+                // placeholders in it - which is also how an un-redacted identifier reaching
+                // the client would look.
+                vaultPresentButUnused: !!vault && output === shownAnswer,
+                // Labels only, never the values behind them.
+                tokensSurvivingRehydration: surviving.length,
+                tokensSurvivingLabels: surviving,
+                // The single field to alert on: a placeholder reached the client.
+                rehydrationIncomplete: surviving.length > 0,
+            });
+            if (surviving.length > 0) {
+                console.warn(
+                    `${surviving.length} vault token(s) survived rehydration ` +
+                    `(vault did not cover them): ${surviving.join(", ")}`
+                );
+            }
+            return output;
+        },
+        {
+            runType: "chain",
+            tags: ["rehydration", "pii-boundary"],
+            safeInputs: { ...textShape("text", shownAnswer), vaultId },
+            safeOutputs: (output) => textShape("finalText", output),
+            recordOutputs: (output) => ({ finalText: output }),
+        }
+    );
+
+    if (!firstDraft) console.warn("Model returned empty text; sending fallback message.");
+
+    root?.setMetadata({ outcome });
+    await root?.succeed(phiGated({ answer: finalText }, textShape("answer", finalText)));
     await flushTraces();
 
-    return originalStream;
+    return streamStaticAnswer(finalText, {
+        // The excerpts are shown to the user too, so they are rehydrated like the answer.
+        annotation: {
+            retrievals: vault ? rehydrateText(retrievals, vault) : retrievals,
+            cacheHit: false,
+        },
+        headers: { "X-Answer-Check": outcome },
+    });
 }

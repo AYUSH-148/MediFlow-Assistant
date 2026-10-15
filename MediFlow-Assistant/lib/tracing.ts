@@ -203,10 +203,9 @@ export function phiGated(raw: Meta, safe: Meta): Meta {
  * A span whose lifetime is managed by hand, for steps whose start and end are not the
  * entry and exit of one function. Two cases here:
  *
- *  - `streamText`: the route needs the stream object back immediately, but token usage
- *    and finish reason only settle once the stream drains.
- *  - the chat request as a whole: its remaining work runs in a ReadableStream `start()`
- *    callback the runtime invokes after the Response is returned.
+ *  - generation: tool calls run inside the AI SDK's step loop, where async context is not
+ *    guaranteed to survive, so their spans attach to the LLM span explicitly.
+ *  - the chat request as a whole: each exit path closes it at a different point.
  */
 export interface ManualSpan {
   /** Pass to `runInSpan` so callback-based `span()` calls nest underneath. */
