@@ -21,6 +21,7 @@ import {
 } from "@/lib/cache";
 import {
     redactUserQuestion,
+    redactDocument,
     getVault,
     rehydrateText,
     queryNeo4jRelationships,
@@ -407,9 +408,19 @@ async function handleChat({
     // state, and the client would then post an empty array while the user still sees a
     // report loaded. Comparing lengths keeps whichever side actually has the conversation
     // without needing to merge them.
-    const clientTurns = messages.map((message) => ({
+    //
+    // The client's copy is raw: its user turns are what was typed, and its assistant turns
+    // are the rehydrated answers the user saw. Both are redacted here, against the report's
+    // vault, so a value the report already tokenised gets the same token the summary and
+    // excerpts carry. The stored transcript was redacted on the way in and needs nothing.
+    const vault = vaultId ? await getVault(vaultId) : null;
+    const clientContents = redactDocument(
+        messages.map((message) => getMessageText(message.content)),
+        vault ?? {}
+    ).redactedTexts;
+    const clientTurns = messages.map((message, index) => ({
         role: message.role === "user" ? ("user" as const) : ("assistant" as const),
-        content: getMessageText(message.content),
+        content: clientContents[index],
     }));
     const conversationTurns = storedTurns.length > clientTurns.length ? storedTurns : clientTurns;
 
@@ -485,7 +496,6 @@ async function handleChat({
         : await getCachedResponse(effectiveQuestion, reportData, 0.95);
 
     if (cachedAnswer) {
-        const vault = await getVault(vaultId);
         const rehydratedAnswer = await span(
             "rehydrate_cached_answer",
             { text: cachedAnswer, vaultId },
@@ -797,7 +807,6 @@ async function handleChat({
         ]);
     }
 
-    const vault = await getVault(vaultId);
     const finalText = await span(
         "rehydrate_answer",
         { text: shownAnswer, vaultId },
