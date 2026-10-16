@@ -208,6 +208,13 @@ export function redactDocument(
         const value = (match[1] ?? match[0]).trim();
         if (!value) continue;
 
+        // A capture that runs straight into a token is the leftover of a name an earlier
+        // pass already redacted. "Doctor: Dr. Anil Kumar" becomes "Doctor: Dr. [NAME_3]",
+        // and the label rule then captures the bare title "Dr." as a new NAME - which the
+        // replace below would stamp over every "Dr." in the report, and into "Hydr.".
+        const rest = text.slice(match.index + match[0].length);
+        if (/^[ \t]*\[[A-Z]+_\d+\]/.test(rest)) continue;
+
         if (!valueToToken.has(value)) {
           const next = (typeCounters[type] ?? 0) + 1;
           typeCounters[type] = next;
@@ -224,14 +231,20 @@ export function redactDocument(
   // an exact replace leaves that second spelling in place, so the name reaches the
   // browser and the response cache even though it is sitting in the vault. The values
   // are specific enough (names, emails, phone/MRN digits) that loose matching does not
-  // endanger surrounding clinical text.
+  // endanger surrounding clinical text - as long as a value only matches as a whole word.
+  // Without the edges a short value is replaced inside longer words: "Rao" in "Raoul",
+  // "Dr." in "Hydr.". The edges are per character class, letters against letters and
+  // digits against digits, because labels are glued to their values often enough
+  // ("MRN884213") that a plain alphanumeric edge would leave the identifier in place.
   const orderedValues = Array.from(valueToToken.keys()).sort((a, b) => b.length - a.length);
   const redactedTexts = texts.map((text) => {
     let out = text;
     for (const value of orderedValues) {
       const token = valueToToken.get(value)!;
       const pattern = escapeRegExp(value).replace(/[ \t]+/g, "[ \\t]+");
-      out = out.replace(new RegExp(pattern, "gi"), () => token);
+      const before = /^[A-Za-z]/.test(value) ? "(?<![A-Za-z])" : /^\d/.test(value) ? "(?<!\\d)" : "";
+      const after = /[A-Za-z]$/.test(value) ? "(?![A-Za-z])" : /\d$/.test(value) ? "(?!\\d)" : "";
+      out = out.replace(new RegExp(`${before}${pattern}${after}`, "gi"), () => token);
     }
     return out;
   });
