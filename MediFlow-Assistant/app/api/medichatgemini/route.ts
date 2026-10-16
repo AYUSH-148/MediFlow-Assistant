@@ -480,7 +480,15 @@ async function handleChat({
     // every other session holding the same report, for 24h.
     const conversational = guard.conversational;
 
-    const cachedAnswer = conversational
+    // No session means no report, and no report means nothing to retrieve. Without a
+    // documentId there is no filter, and an unfiltered query searches every patient's
+    // chunks in the namespace: another patient's finding could be graded relevant, pass the
+    // answer check (it is in the excerpts, after all), and be cached. The cache is skipped
+    // for the same reason - every report-less request shares the hash of "" as its key, so
+    // one such answer would be replayed to every other visitor without a report.
+    const skipReport = conversational || !vaultId;
+
+    const cachedAnswer = skipReport
         ? null
         : await getCachedResponse(effectiveQuestion, reportData, 0.95);
 
@@ -545,7 +553,7 @@ async function handleChat({
     // topK 500 corpus pull, every turn, to fetch turns the request body already carried.
     // It also returned them ranked by similarity rather than in order, which made "what did
     // I ask before that?" unanswerable however good the recall was.
-    const reportRetrieval = conversational
+    const reportRetrieval = skipReport
         ? EMPTY_RETRIEVAL
         : await queryPineconeVectorStoreDetailed(
               pinecone,
@@ -562,7 +570,7 @@ async function handleChat({
     // makes, since its query has the whole report prepended - filters the chunks and,
     // when nothing survives, switches the prompt to "say this is not in your report"
     // instead of letting the model reach for general knowledge.
-    const graded = conversational
+    const graded = skipReport
         ? NOTHING_GRADED
         : await gradeRetrieval({
               question: effectiveQuestion,
@@ -791,7 +799,7 @@ async function handleChat({
             // Only a verified answer is cached: a cache entry is replayed to every session
             // holding this report for 24h, through a path that never checks again. The
             // redacted text is cached, never the rehydrated one.
-            check && !check.checkFailed
+            check && !check.checkFailed && vaultId
                 ? cacheResponse(effectiveQuestion, answer, reportData)
                 : undefined,
         ]);
