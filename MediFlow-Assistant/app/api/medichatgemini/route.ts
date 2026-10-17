@@ -54,6 +54,15 @@ import {
 
 export const maxDuration = 60;
 
+// Gemini calls are cut off once a turn has run this long, leaving the rest of maxDuration
+// for the cache write, rehydration and trace flush. Unbounded, a turn that needed the retry
+// could chain six-plus calls (each retried by the SDK on failure) past 60s, and the platform
+// then killed the function: the user got a 504 instead of the fallback text.
+const ANSWER_BUDGET_MS = 50_000;
+// A retry is a generation plus a re-check. With less than this left it cannot finish, so
+// the fallback is sent straight away instead.
+const RETRY_MIN_MS = 15_000;
+
 // Stand-ins for the retrieval and grading a conversational turn skips. Shaped like the
 // real results so the prompt-building below stays one path rather than two: "" reads as
 // "no excerpts", which is exactly true here.
@@ -358,6 +367,8 @@ async function handleChat({
     sessionId: string | null;
     storedTurns: StoredTurn[];
 }): Promise<Response> {
+    const deadline = Date.now() + ANSWER_BUDGET_MS;
+    const budgetSignal = () => AbortSignal.timeout(Math.max(deadline - Date.now(), 0));
     const reportFilter = vaultId ? { documentId: { $eq: vaultId } } : undefined;
 
     // Raw question in, placeholder question out, so both sides of the boundary are gated.
@@ -594,12 +605,13 @@ async function handleChat({
   \n\n${recentConversationHistory}
   \n\n**end of conversation**
 
-  \n\nYou also have a queryKnowledgeGraph tool that looks up known relationships for a medical entity in the patient's knowledge graph. Call it when an entity mentioned in the report or query would benefit from that context, and call it again with a new entity if a result reveals something else worth following (e.g. an interacting drug). Skip it entirely if the question doesn't need graph context.
-
   \n\n${graded.verdict === "none"
             ? "Keep the answer short and direct - there is nothing here to justify at length."
             : "Provide thorough justification for your answer."}`;
-    const finalPrompt = `${promptBody}\n\n**Answer:**\n`;
+    // Kept out of promptBody because the retry has no tools: told it had one, the model
+    // could write "let me look that up" or a mock tool call in place of an answer.
+    const toolInstruction = `You also have a queryKnowledgeGraph tool that looks up known relationships for a medical entity in the patient's knowledge graph. Call it when an entity mentioned in the report or query would benefit from that context, and call it again with a new entity if a result reveals something else worth following (e.g. an interacting drug). Skip it entirely if the question doesn't need graph context.`;
+    const finalPrompt = `${promptBody}\n\n${toolInstruction}\n\n**Answer:**\n`;
 
     // Opened by hand so the knowledge-graph tool spans can attach to it explicitly: the AI
     // SDK runs tool execution inside its own step loop, where the async context that would
@@ -626,6 +638,7 @@ async function handleChat({
         prompt: finalPrompt,
         tools: { queryKnowledgeGraph: createQueryKnowledgeGraphTool(vaultId, llmSpan) },
         maxSteps: 5,
+        abortSignal: budgetSignal(),
     }).catch(async (error) => {
         await llmSpan?.fail(error);
         throw error;
@@ -647,11 +660,15 @@ async function handleChat({
     // Null when the check did not run: a conversational turn has no report evidence to
     // check against, and an empty generation has nothing to check.
     let check: AnswerCheck | null = null;
+    // Whether the shown answer is the retry's rather than the first draft. Tracked, not
+    // inferred from the text: a retry can return the draft word for word.
+    let revised = false;
 
     if (firstDraft && !conversational) {
         // Everything the generator was shown about this patient, including what it looked
         // up itself: a correct answer drawn from the knowledge graph would otherwise read
-        // as invented.
+        // as invented. The conversation too, or a fact the user stated two turns ago and
+        // the answer repeated would be flagged as made up.
         const graphLookups = generation.steps.flatMap((step) =>
             step.toolResults.map((toolResult) => toolResult.result)
         );
@@ -663,11 +680,17 @@ async function handleChat({
             `Report summary:\n${reportData}`,
             `Report excerpts:\n${retrievals}`,
             graphSection,
+            `Conversation so far:\n${recentConversationHistory}`,
         ]
             .filter(Boolean)
             .join("\n\n");
 
-        check = await checkAnswer({ question: effectiveQuestion, evidence, answer: firstDraft });
+        check = await checkAnswer({
+            question: effectiveQuestion,
+            evidence,
+            answer: firstDraft,
+            abortSignal: budgetSignal(),
+        });
         root?.setMetadata({
             answerCheck: check.verdict,
             answerCheckFailed: check.checkFailed,
@@ -680,51 +703,75 @@ async function handleChat({
             //
             // No tools on the retry. The lookups the first pass made are in the prompt, and
             // a fresh tool loop would repeat the slowest part of the turn.
-            const retryPrompt =
-                `${promptBody}\n\n${graphSection}\n\n**Correction:**\n` +
-                `${buildRevisionInstruction(check, firstDraft)}\n\n**Answer:**\n`;
-            const retrySpan = startLlmSpan({
-                name: "revise_answer",
-                model: GEMINI_MODEL_ID,
-                parent: root,
-                inputs: { prompt: retryPrompt },
-                safeInputs: textShape("prompt", retryPrompt),
-                tags: ["gemini", "generation", "hallucination-retry"],
-                metadata: { firstVerdict: check.verdict },
-            });
-            const retry = await generateText({ model: geminiModel, prompt: retryPrompt }).catch(
-                async (error) => {
+            let retryStatus: "skipped" | "failed" | "empty" | "ran" = "skipped";
+            answer = "";
+            if (deadline - Date.now() >= RETRY_MIN_MS) {
+                const retryPrompt =
+                    `${promptBody}\n\n${graphSection}\n\n**Correction:**\n` +
+                    `${buildRevisionInstruction(check, firstDraft)}\n\n**Answer:**\n`;
+                const retrySpan = startLlmSpan({
+                    name: "revise_answer",
+                    model: GEMINI_MODEL_ID,
+                    parent: root,
+                    inputs: { prompt: retryPrompt },
+                    safeInputs: textShape("prompt", retryPrompt),
+                    tags: ["gemini", "generation", "hallucination-retry"],
+                    metadata: { firstVerdict: check.verdict },
+                });
+                // A failed retry sends the fallback rather than failing the turn, as the
+                // guard, grader and checker all fail open. Rethrowing turned a Gemini 429
+                // here into an error, discarding a turn the fallback could still answer.
+                const retry = await generateText({
+                    model: geminiModel,
+                    prompt: retryPrompt,
+                    abortSignal: budgetSignal(),
+                }).catch(async (error) => {
+                    console.error("Answer retry failed; sending fallback:", error);
                     await retrySpan?.fail(error);
-                    throw error;
+                    return null;
+                });
+                if (retry) {
+                    await endLlmSpan(retrySpan, {
+                        finishReason: retry.finishReason,
+                        usage: retry.usage,
+                        text: retry.text,
+                    });
+                    answer = retry.text.trim();
                 }
-            );
-            await endLlmSpan(retrySpan, {
-                finishReason: retry.finishReason,
-                usage: retry.usage,
-                text: retry.text,
-            });
+                retryStatus = !retry ? "failed" : answer ? "ran" : "empty";
+            }
 
-            answer = retry.text.trim();
-            // An empty retry keeps the first verdict, which already failed.
+            // A retry that was skipped, failed or came back empty keeps the first verdict,
+            // which already failed.
             if (answer) {
-                check = await checkAnswer({ question: effectiveQuestion, evidence, answer });
+                revised = true;
+                check = await checkAnswer({
+                    question: effectiveQuestion,
+                    evidence,
+                    answer,
+                    abortSignal: budgetSignal(),
+                });
             }
             root?.setMetadata({
-                answerRecheck: answer ? check.verdict : "empty",
+                answerRetry: retryStatus,
+                answerRecheck: answer ? check.verdict : retryStatus,
                 answerRecheckFailed: check.checkFailed,
             });
         }
     }
 
-    // A check that failed open reports "grounded", so its answer is shown - but not cached.
+    // A check that failed open reports "grounded", so its answer is shown - but not cached,
+    // and labelled "unchecked" rather than "ok" so the header and traces can tell them apart.
     const passed = !!answer && (check === null || check.verdict === "grounded");
     const outcome = !firstDraft
         ? "empty-generation"
         : !passed
           ? "unverified"
-          : answer === firstDraft
-            ? "ok"
-            : "revised";
+          : check?.checkFailed
+            ? "unchecked"
+            : revised
+              ? "revised"
+              : "ok";
     const shownAnswer = !firstDraft
         ? EMPTY_GENERATION_FALLBACK
         : passed

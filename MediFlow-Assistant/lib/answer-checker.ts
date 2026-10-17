@@ -68,9 +68,10 @@ function buildPrompt(question: string, evidence: string, answer: string, unmatch
 
     return `You are checking an answer written for a patient about their own medical report, before it is shown to them.
 
-The evidence below is everything the writer was given: the report summary, excerpts from the report, and knowledge-graph lookups.
+The evidence below is everything the writer was given: the report summary, excerpts from the report, knowledge-graph lookups, and the conversation so far.
 
 - A claim about THIS patient (a value, finding, diagnosis, medication, date, or anything the answer says their report shows) must be supported by the evidence. A claim that contradicts the evidence is unsupported.
+- Something the user told the writer about themselves in the conversation is supported. The assistant's own earlier replies in the conversation are not evidence.
 - General medical explanation that is not presented as a fact about this patient is allowed. Do not flag it.
 - Saying the report does not contain something is supported when the evidence indeed lacks it.
 - Placeholders such as [NAME_1] stand for redacted values. A placeholder in the answer that also appears in the evidence is supported.
@@ -99,10 +100,13 @@ export async function checkAnswer({
     question,
     evidence,
     answer,
+    abortSignal,
 }: {
     question: string;
     evidence: string;
     answer: string;
+    /** An abort fails open like any other error. */
+    abortSignal?: AbortSignal;
 }): Promise<AnswerCheck> {
     return span(
         "check_answer",
@@ -116,6 +120,7 @@ export async function checkAnswer({
                     // A judge, not a writer: the same answer must check the same way twice.
                     temperature: 0,
                     prompt: buildPrompt(question, evidence, answer, unmatched),
+                    abortSignal,
                 });
 
                 const claims = object.unsupportedClaims.filter((claim) => claim.trim());
@@ -173,23 +178,30 @@ export async function checkAnswer({
  * answer is regenerated without the draft in view, so the retry is not anchored on it.
  * Neither rewrites the question - the guard already resolved it, and rewording it again
  * risks answering something the user did not ask.
+ *
+ * The schema lets a failing verdict arrive with no claims named. "Remove only those claims"
+ * over an empty list reads as "change nothing", so the draft came back as it was and failed
+ * again; with nothing named, the retry is told to recheck every patient claim instead.
  */
 export function buildRevisionInstruction(check: AnswerCheck, draft: string): string {
     const claims = check.unsupportedClaims.map((claim) => `- ${claim}`).join("\n");
 
     if (check.verdict === "partial") {
+        const fix = claims
+            ? `:\n${claims}\n\nRewrite the draft below. Remove or correct only those claims, `
+            : `.\n\nRewrite the draft below. Check each statement it makes about the ` +
+              `patient, remove or correct any the evidence does not support, `;
         return (
             `A draft answer to this query made claims about the patient that the report ` +
-            `evidence above does not support:\n${claims}\n\n` +
-            `Rewrite the draft below. Remove or correct only those claims, using the evidence ` +
-            `above, and keep everything else. Where the evidence does not settle a point, say ` +
-            `that the report does not cover it.\n\n` +
+            `evidence above does not support${fix}using the evidence above, and keep ` +
+            `everything else. Where the evidence does not settle a point, say that the ` +
+            `report does not cover it.\n\n` +
             `--- BEGIN DRAFT ---\n${draft}\n--- END DRAFT ---`
         );
     }
     return (
         `A draft answer to this query was rejected because it did not answer the question ` +
-        `from the report evidence:\n${claims}\n\n` +
+        `from the report evidence${claims ? `:\n${claims}` : "."}\n\n` +
         `Write a new answer using only what the evidence above supports. If the report does ` +
         `not contain the information, say so plainly.`
     );
