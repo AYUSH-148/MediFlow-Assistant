@@ -6,6 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 MediFlow Assistant: a Next.js 14 (App Router) conversational RAG app over uploaded medical reports. Gemini (`gemini-2.5-flash` via the Vercel AI SDK, `lib/gemini.ts`) for extraction/guarding/grading/answers, Hugging Face `mxbai-embed-large-v1` embeddings (1024-dim), Pinecone for vectors, Upstash Redis for cache/vault/sessions, Neo4j for Graph-RAG triples, LangSmith for tracing.
 
+## Repo layout
+
+The git root is the parent directory (`MedicalRAG/`), not this app directory. It holds the main `README.md` (design rationale per feature, config reference, known limitations) and `Patient2.pdf`, a sample report for manual upload tests. All code, `npm` commands and this file live in `MediFlow-Assistant/`. Git paths are prefixed `MediFlow-Assistant/`.
+
+Other notes in this directory: `graph-rag-neo4j-cypher.md` (Cypher for the graph), `pii-setup-guide.md` (redaction setup), `note` (a sample assembled prompt, not code).
+
 ## Commands
 
 ```bash
@@ -25,23 +31,23 @@ Env: copy `.env.local.example`. Required: `GEMINI_API_KEY`, `HF_TOKEN`, `PINECON
 
 ## Architecture
 
-Full walkthrough with examples: `docs/e2e_flow.md` (note: its "conversation-memory namespace" is outdated — transcripts now live in the Redis session, see below).
+Full walkthrough with examples: `docs/e2e_flow.md`. The root `README.md` has the design rationale. Conversation history is the transcript in the Redis session (capped at 200 turns of 8k chars each); there is no conversation-memory Pinecone namespace any more, so ignore any mention of one.
 
 Three API routes:
 
 - `app/api/extractreportgemini/route.ts` — ingest. PDFs try the local text layer first (`pdf-parse`); scanned PDFs/images fall back to Gemini vision OCR. `lib/pdf-figures.ts` describes figures. Then PII redaction + vault, triples to Neo4j, `lib/chunking.ts` chunking, embeddings upserted to Pinecone `medic`/`diagnosis2`. `documentId` = SHA-256 of the text; text-layer re-uploads short-circuit via the stored ingest result (`reuseIngestedReport`) before any Gemini call. Sets the session cookie.
 - `app/api/session/report/route.ts` — binds the user-edited summary to the session after the review step.
-- `app/api/medichatgemini/route.ts` — chat. Pipeline: redact question → `lib/query-guard.ts` (`refuse`/`clarify` return early; `answer` also yields a standalone rewritten question used for everything downstream) → semantic cache (`lib/cache.ts`) → hybrid retrieval (`utils.ts`: dense + TF-IDF fused with RRF, filtered by `documentId`) → `lib/retrieval-grader.ts` (drops irrelevant chunks; `none` makes the model say the report lacks the info) → Gemini streams with a `queryKnowledgeGraph` Neo4j tool → cache write, transcript append, rehydrate PII from vault before returning.
+- `app/api/medichatgemini/route.ts` — chat. Pipeline: redact question → `lib/query-guard.ts` (`refuse`/`clarify` return early; `answer` also yields a standalone rewritten question used for everything downstream) → semantic cache (`lib/cache.ts`) → hybrid retrieval (`utils.ts`: dense + TF-IDF fused with RRF, filtered by `documentId`) → `lib/retrieval-grader.ts` (drops irrelevant chunks; `none` makes the model say the report lacks the info) → Gemini generates (`generateText`, not streamed) with a `queryKnowledgeGraph` Neo4j tool → `lib/answer-checker.ts` checks the answer against excerpts + summary + graph lookups (`partial` is revised, `unsupported` regenerated, one retry, then a fixed fallback; skipped for conversational turns) → cache write (verified answers only), transcript append, rehydrate PII from vault before returning.
 
 Key invariants:
 
 - **Session, not client ids.** `lib/session.ts` maps an HttpOnly `mf_sid` cookie to `{documentId, summary, transcript}` in Redis. The client never sees or sends `documentId`/`vaultId`; don't reintroduce them in request bodies or responses.
 - **PII boundary.** `lib/pii-redaction.ts` replaces PII with `[TYPE_N]` tokens; the token→value vault is in Redis keyed by `documentId`. Everything sent to Gemini, Pinecone, Neo4j and the cache is redacted; rehydration happens only at the response edge. Trace spans use `safeInputs`/`phiGated`/`textShape` so raw text is recorded only when `LANGSMITH_TRACE_PHI=true`.
 - **24h TTLs are aligned** across vault, response cache, ingest result and session — change them together.
-- **Guard and grader fail open** on Gemini errors (`guardFailed`, ungraded pass-through) instead of throwing.
+- **Guard, grader and answer check fail open** on Gemini errors (`guardFailed`, ungraded pass-through, `checkFailed`) instead of throwing. An unchecked answer is sent but never cached.
 - **Tracing:** wrap stages with `span(...)` from `lib/tracing.ts`; routes call `flushTraces()` on every exit path because serverless hosts freeze after the response.
 - Server-only PDF deps (`pdf-parse`, `pdfjs-dist`, `@napi-rs/canvas`) are externalized and force-included via `outputFileTracingIncludes` in `next.config.mjs`; removing those entries breaks ingest in standalone builds.
 
-Path alias `@/*` maps to repo root (`@/utils` is root `utils.ts`, distinct from `lib/utils.ts` which only holds `cn`). UI is shadcn/ui (`components/ui/`); main client flow in `components/ReportComponent.tsx` (upload/review) and `components/chatcomponent.tsx` (`useChat`).
+Path alias `@/*` maps to this app directory (`@/utils` is root `utils.ts`, distinct from `lib/utils.ts` which only holds `cn`). UI is shadcn/ui (`components/ui/`); main client flow in `components/ReportComponent.tsx` (upload/review) and `components/chatcomponent.tsx` (`useChat`).
 
 Code comments in this repo explain *why* at length (past bugs, trade-offs); preserve that context when editing.

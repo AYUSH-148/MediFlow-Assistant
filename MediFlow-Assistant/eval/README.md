@@ -135,8 +135,8 @@ Reported:
 - **threshold sweep** — hit rate and false-hit rate at thresholds from 0.80 to 0.99, and
   whether the two populations separate at all. The production threshold of 0.95 was never
   chosen against measured data; this is that data.
-- **lookup scaling** — `getCachedResponse` does `KEYS` + `MGET` over every entry for the
-  report and compares in process, so cost is linear in cached questions. Entries live 24h,
+- **lookup scaling** — `getCachedResponse` reads the report's index set (`SMEMBERS`), then
+  `MGET`s every entry in it and compares in process, so cost is linear in cached questions. Entries live 24h,
   so a busy report accumulates them all day.
 
 A **measurement self-check** recomputes each pair's cosine independently and compares it
@@ -192,10 +192,11 @@ eval/
   lib/                  env loading, corpus build/manifest, metrics, retry, concurrency
 ```
 
-Fixtures carry hand-written summaries rather than generated ones. The chat route prepends
-the summary to every retrieval query, so the corpus builder deliberately skips the ingest
-route's Gemini extraction pass — otherwise the summary, and therefore every retrieval
-query and every number downstream, would differ on each rebuild.
+Fixtures carry hand-written summaries rather than generated ones. Retrieval queries no
+longer include the summary, but the guard still reads it and the cache namespaces on a hash
+of it, so the corpus builder deliberately skips the ingest route's Gemini extraction pass —
+otherwise the summary, and therefore the guard and cache numbers, would differ on each
+rebuild.
 
 `eval/.corpus.json` and `eval/results/` are gitignored. The fixtures and gold sets are
 committed; what one run produced on one machine is a log, not a source of truth.
