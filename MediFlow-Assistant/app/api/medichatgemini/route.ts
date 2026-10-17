@@ -20,7 +20,6 @@ import {
     cacheResponse,
 } from "@/lib/cache";
 import {
-    redactUserQuestion,
     redactDocument,
     getVault,
     rehydrateText,
@@ -372,29 +371,61 @@ async function handleChat({
     const budgetSignal = () => AbortSignal.timeout(Math.max(deadline - Date.now(), 0));
     const reportFilter = vaultId ? { documentId: { $eq: vaultId } } : undefined;
 
+    const reportVault = vaultId ? await getVault(vaultId) : null;
+
     // Raw question in, placeholder question out, so both sides of the boundary are gated.
-    const redactedQuestion = await span(
+    //
+    // The question is the last message, so it is redacted in the same pass as the client's
+    // transcript, against the report's vault. Redacted on its own it started a fresh vault
+    // numbered from 1: "Dr. Kapoor" became [NAME_1], which in the summary is the patient, so
+    // the model answered about the wrong person and rehydration then named the patient. Now
+    // a value the report already tokenised gets the report's token, a new one is numbered
+    // after the report's, and the turns are numbered in order, so a name typed in an earlier
+    // turn keeps its token in this one.
+    //
+    // The client's copy is raw: its user turns are what was typed, and its assistant turns
+    // are the rehydrated answers the user saw. The stored transcript was redacted on the way
+    // in and needs nothing.
+    const redaction = await span(
         "redact_question",
         { question: userQuestion },
         async () => {
-            const redacted = redactUserQuestion(userQuestion);
+            const result = redactDocument(
+                messages.map((message) => getMessageText(message.content)),
+                reportVault ?? {}
+            );
+            const redacted = result.redactedTexts.at(-1) ?? "";
             setSpanMetadata({
                 inputChars: userQuestion.length,
                 redactedChars: redacted.length,
                 // Any change at all means PII reached the endpoint.
                 piiFound: redacted !== userQuestion,
+                // Values the report's vault did not hold, typed by the user.
+                tokensAdded:
+                    Object.keys(result.vault).length - Object.keys(reportVault ?? {}).length,
             });
-            return redacted;
+            return result;
         },
         {
             runType: "chain",
             tags: ["redaction", "pii-boundary"],
             safeInputs: textShape("question", userQuestion),
-            safeOutputs: (redacted) => textShape("redactedQuestion", redacted),
+            safeOutputs: (result) =>
+                textShape("redactedQuestion", result.redactedTexts.at(-1) ?? ""),
             // Names the field the same in both modes, so the gated and raw paths compare.
-            recordOutputs: (redacted) => ({ redactedQuestion: redacted }),
+            recordOutputs: (result) => ({ redactedQuestion: result.redactedTexts.at(-1) ?? "" }),
         }
     );
+    const redactedQuestion = redaction.redactedTexts.at(-1) ?? "";
+
+    // What the answer is rehydrated with: the report's vault plus anything the user typed
+    // that it did not hold. The additions live for this request only - the "Kapoor" behind
+    // a new [NAME_3] belongs to this conversation, not to the report every session shares.
+    // ponytail: a new token in the stored transcript can't be rehydrated after a refresh
+    // (the client then posts nothing to rebuild it from). Keep the additions on the session
+    // if that shows up.
+    const vault =
+        reportVault || Object.keys(redaction.vault).length ? redaction.vault : null;
 
     // The whole conversation, not a four-message tail.
     //
@@ -408,19 +439,9 @@ async function handleChat({
     // state, and the client would then post an empty array while the user still sees a
     // report loaded. Comparing lengths keeps whichever side actually has the conversation
     // without needing to merge them.
-    //
-    // The client's copy is raw: its user turns are what was typed, and its assistant turns
-    // are the rehydrated answers the user saw. Both are redacted here, against the report's
-    // vault, so a value the report already tokenised gets the same token the summary and
-    // excerpts carry. The stored transcript was redacted on the way in and needs nothing.
-    const vault = vaultId ? await getVault(vaultId) : null;
-    const clientContents = redactDocument(
-        messages.map((message) => getMessageText(message.content)),
-        vault ?? {}
-    ).redactedTexts;
     const clientTurns = messages.map((message, index) => ({
         role: message.role === "user" ? ("user" as const) : ("assistant" as const),
-        content: clientContents[index],
+        content: redaction.redactedTexts[index],
     }));
     const conversationTurns = storedTurns.length > clientTurns.length ? storedTurns : clientTurns;
 

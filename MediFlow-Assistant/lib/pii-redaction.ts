@@ -349,15 +349,6 @@ export async function getVault(vaultId: string): Promise<TokenVault | null> {
 }
 
 /**
- * Redact a user question with the same rules. The vault is discarded - questions are
- * never rehydrated - so token numbering here is independent of the document vault. This
- * only keeps PII out of the semantic cache, the retrieval query, and the prompt.
- */
-export function redactUserQuestion(question: string): string {
-  return redactDocument([question]).redactedTexts[0];
-}
-
-/**
  * Redact entity triples using an existing vault: any subject/predicate/object
  * that contains a value already present in the vault is replaced with its token.
  */
