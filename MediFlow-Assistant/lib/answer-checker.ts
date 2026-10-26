@@ -18,7 +18,7 @@ import { span, setSpanMetadata, textShape } from "@/lib/tracing";
  * evidence.
  */
 
-const CheckSchema = z.object({
+export const CheckSchema = z.object({
     verdict: z
         .enum(["grounded", "partial", "unsupported"])
         .describe(
@@ -59,7 +59,19 @@ export function numbersNotInEvidence(answer: string, evidence: string): string[]
     );
 }
 
-function buildPrompt(question: string, evidence: string, answer: string, unmatched: string[]): string {
+export function settleVerdict(object: z.infer<typeof CheckSchema>): {
+    verdict: AnswerCheck["verdict"];
+    unsupportedClaims: string[];
+} {
+    const unsupportedClaims = object.unsupportedClaims.filter((claim) => claim.trim());
+    // "grounded" alongside a list of unsupported claims is self-contradictory. The claims
+    // are the specific half, so they win.
+    const verdict =
+        object.verdict === "grounded" && unsupportedClaims.length > 0 ? "partial" : object.verdict;
+    return { verdict, unsupportedClaims };
+}
+
+export function buildPrompt(question: string, evidence: string, answer: string, unmatched: string[]): string {
     const numberHint = unmatched.length
         ? `\nThese numbers in the answer appear nowhere in the evidence: ${unmatched.join(", ")}. ` +
           `For each, decide whether the answer presents it as this patient's own value ` +
@@ -96,6 +108,94 @@ ${answer}
 --- END ANSWER ---`;
 }
 
+/**
+ * Which model judges. The judge used to share gemini-2.5-flash with the generator, guard
+ * and grader, and on the free tier that model allows 5 requests a minute - a single
+ * question uses four, so the judge was one of the calls that pushed a second question
+ * into a 429. Groq has its own quota, and its gpt-oss-120b is a different model family
+ * from the generator, so it is less inclined to wave through the errors Gemini makes.
+ *
+ * Gemini stays the default: Groq is opt-in with JUDGE_PROVIDER=groq, and the eval
+ * (`npm run eval:judge`) measures whichever provider this selects.
+ */
+export const JUDGE_PROVIDER: "groq" | "gemini" = process.env.JUDGE_PROVIDER === "groq" ? "groq" : "gemini";
+export const GROQ_JUDGE_MODEL = "openai/gpt-oss-120b";
+
+// CheckSchema as JSON Schema, for Groq's strict structured output: every property
+// required, no extras. Written by hand because the only converter available is a
+// transitive dependency of `ai` that could vanish on any upgrade.
+const CHECK_JSON_SCHEMA = {
+    type: "object",
+    properties: {
+        verdict: { type: "string", enum: ["grounded", "partial", "unsupported"] },
+        unsupportedClaims: { type: "array", items: { type: "string" } },
+    },
+    required: ["verdict", "unsupportedClaims"],
+    additionalProperties: false,
+};
+
+export interface JudgeResult {
+    object: z.infer<typeof CheckSchema>;
+    /** Groq only; its free tier is limited by tokens per minute, so this is the cost. */
+    tokens: number | null;
+}
+
+/**
+ * One judge call to Groq, no retries. A 429 here means the per-minute token budget is
+ * spent, and waiting for it would hold the user's answer for seconds when the Gemini
+ * judge can take the call now - so the caller falls back instead of retrying.
+ *
+ * Plain fetch to Groq's OpenAI-compatible endpoint rather than an AI SDK provider: the
+ * provider package would have to match this project's old `ai` major, for one call.
+ */
+export async function judgeWithGroq(prompt: string, abortSignal?: AbortSignal): Promise<JudgeResult> {
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${process.env.GROQ_API_KEY ?? ""}`,
+        },
+        body: JSON.stringify({
+            model: GROQ_JUDGE_MODEL,
+            messages: [{ role: "user", content: prompt }],
+            temperature: 0,
+            // Reasoning tokens count against the tokens-per-minute limit. Low effort still
+            // caught every planted error but one in the eval.
+            reasoning_effort: "low",
+            response_format: {
+                type: "json_schema",
+                json_schema: { name: "answer_check", strict: true, schema: CHECK_JSON_SCHEMA },
+            },
+        }),
+        signal: abortSignal,
+    });
+    if (!response.ok) {
+        // Status first so a retry pattern matching "429" sees it. Groq's error bodies name
+        // the limit or the fault, never the prompt.
+        throw new Error(`Groq ${response.status}: ${(await response.text()).slice(0, 200)}`);
+    }
+    const body = await response.json();
+    return {
+        object: CheckSchema.parse(JSON.parse(body.choices[0].message.content)),
+        tokens: body.usage?.total_tokens ?? null,
+    };
+}
+
+export async function judgeWithGemini(prompt: string, abortSignal?: AbortSignal): Promise<JudgeResult> {
+    const { object } = await generateObject({
+        model: geminiModel,
+        schema: CheckSchema,
+        // A judge, not a writer: the same answer must check the same way twice.
+        temperature: 0,
+        prompt,
+        abortSignal,
+        // The SDK default of 2 retries lands all three attempts inside the same per-minute
+        // window, spending quota the rest of the turn needs. One retry covers a blip.
+        maxRetries: 1,
+    });
+    return { object, tokens: null };
+}
+
 export async function checkAnswer({
     question,
     evidence,
@@ -113,21 +213,27 @@ export async function checkAnswer({
         { question, evidence, answer },
         async () => {
             const unmatched = numbersNotInEvidence(answer, evidence);
+            const prompt = buildPrompt(question, evidence, answer, unmatched);
             try {
-                const { object } = await generateObject({
-                    model: geminiModel,
-                    schema: CheckSchema,
-                    // A judge, not a writer: the same answer must check the same way twice.
-                    temperature: 0,
-                    prompt: buildPrompt(question, evidence, answer, unmatched),
-                    abortSignal,
-                });
+                let judgedBy: "groq" | "gemini" = "gemini";
+                let groqError: string | undefined;
+                let result: JudgeResult | undefined;
+                if (JUDGE_PROVIDER === "groq") {
+                    try {
+                        result = await judgeWithGroq(prompt, abortSignal);
+                        judgedBy = "groq";
+                    } catch (error) {
+                        // Fall back rather than fail open: an unchecked answer is the thing
+                        // this check exists to prevent, and a Groq 429 is routine on the free
+                        // tier, not an outage. Gemini's own failure still fails open below.
+                        groqError = error instanceof Error ? error.message : String(error);
+                        console.error("Groq judge failed; falling back to Gemini:", groqError);
+                    }
+                }
+                result ??= await judgeWithGemini(prompt, abortSignal);
 
-                const claims = object.unsupportedClaims.filter((claim) => claim.trim());
-                // "grounded" alongside a list of unsupported claims is self-contradictory.
-                // The claims are the specific half, so they win.
-                const verdict =
-                    object.verdict === "grounded" && claims.length > 0 ? "partial" : object.verdict;
+                const { object } = result;
+                const { verdict, unsupportedClaims: claims } = settleVerdict(object);
 
                 setSpanMetadata({
                     verdict,
@@ -135,6 +241,9 @@ export async function checkAnswer({
                     unsupportedClaimCount: claims.length,
                     numbersNotInEvidence: unmatched.length,
                     checkFailed: false,
+                    judgedBy,
+                    ...(groqError ? { groqFallback: groqError } : {}),
+                    ...(result.tokens !== null ? { judgeTokens: result.tokens } : {}),
                 });
 
                 return { verdict, unsupportedClaims: claims, checkFailed: false };

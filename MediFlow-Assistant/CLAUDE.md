@@ -22,7 +22,7 @@ npx tsc --noEmit        # type-check (no separate script)
 
 npm run eval:build      # ingest eval fixtures into Pinecone; required first and after any fixture edit
 npm run eval            # all eval suites
-npm run eval:retrieval  # single suite: retrieval | guard | cache
+npm run eval:retrieval  # single suite: retrieval | guard | cache | judge (JUDGE_PROVIDER=groq to judge with Groq)
 ```
 
 There is no unit-test framework; the eval harness (`eval/`, run with `tsx`) is the test suite. It hits real Gemini/Pinecone/Redis, uses Pinecone namespace `eval-diagnosis2` (never production `diagnosis2`), and writes `eval/results/<timestamp>.json`. Read `eval/README.md` before interpreting numbers — notably, a non-zero guard outage / `ungraded` count voids the run's metrics.
@@ -37,7 +37,7 @@ Three API routes:
 
 - `app/api/extractreportgemini/route.ts` — ingest. PDFs try the local text layer first (`pdf-parse`); scanned PDFs/images fall back to Gemini vision OCR. `lib/pdf-figures.ts` describes figures. Then PII redaction + vault, triples to Neo4j, `lib/chunking.ts` chunking, embeddings upserted to Pinecone `medic`/`diagnosis2`. `documentId` = SHA-256 of the text; text-layer re-uploads short-circuit via the stored ingest result (`reuseIngestedReport`) before any Gemini call. Sets the session cookie.
 - `app/api/session/report/route.ts` — binds the user-edited summary to the session after the review step.
-- `app/api/medichatgemini/route.ts` — chat. Pipeline: redact question → `lib/query-guard.ts` (`refuse`/`clarify` return early; `answer` also yields a standalone rewritten question used for everything downstream) → semantic cache (`lib/cache.ts`) → hybrid retrieval (`utils.ts`: dense + TF-IDF fused with RRF, filtered by `documentId`) → `lib/retrieval-grader.ts` (drops irrelevant chunks; `none` makes the model say the report lacks the info) → Gemini generates (`generateText`, not streamed) with a `queryKnowledgeGraph` Neo4j tool → `lib/answer-checker.ts` checks the answer against excerpts + summary + graph lookups (`partial` is revised, `unsupported` regenerated, one retry, then a fixed fallback; skipped for conversational turns) → cache write (verified answers only), transcript append, rehydrate PII from vault before returning.
+- `app/api/medichatgemini/route.ts` — chat. Pipeline: redact question → `lib/query-guard.ts` (`refuse`/`clarify` return early; `answer` also yields a standalone rewritten question used for everything downstream) → semantic cache (`lib/cache.ts`) → hybrid retrieval (`utils.ts`: dense + TF-IDF fused with RRF, filtered by `documentId`) → `lib/retrieval-grader.ts` (drops irrelevant chunks; `none` makes the model say the report lacks the info) → Gemini generates (`generateText`, not streamed) with a `queryKnowledgeGraph` Neo4j tool → `lib/answer-checker.ts` checks the answer against excerpts + summary + graph lookups (Gemini by default; `JUDGE_PROVIDER=groq` uses Groq `openai/gpt-oss-120b`, falling back to Gemini on any Groq error; `partial` is revised, `unsupported` regenerated, one retry, then a fixed fallback; skipped for conversational turns) → cache write (verified answers only), transcript append, rehydrate PII from vault before returning.
 
 Key invariants:
 
