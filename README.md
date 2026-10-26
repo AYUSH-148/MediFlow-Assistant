@@ -49,7 +49,7 @@ Most RAG demos stop at "chunk a PDF, embed it, stuff it in a prompt." The hard p
      ▼                    ▼                         ▼
  chunk 1200/150       redacted triples         session ──▶ Redis (24h)
  + section headings   Neo4j :Entity graph      HttpOnly mf_sid cookie
- embed (mxbai 1024d)  (document-scoped)        redacted summary ──▶ browser
+ embed (Gemini 1024d) (document-scoped)        redacted summary ──▶ browser
  Pinecone diagnosis2                                     │
                                                          ▼
                                       user reviews / edits the summary
@@ -180,13 +180,13 @@ the liver.
 
 Semantic search alone misses exact clinical terms; keyword search alone misses paraphrase. Both arms run over the **same document-filtered corpus** and are fused:
 
-- **Dense:** Pinecone `topK 12`, cosine, 1024-dim `mxbai-embed-large-v1`.
+- **Dense:** Pinecone `topK 12`, cosine, 1024-dim `gemini-embedding-001`.
 - **Sparse:** TF-IDF over a `topK 500` filtered corpus pull, with stop-word filtering.
 - **Fusion:** Reciprocal Rank Fusion (`k = 60`), final `topK 10`.
 
 Both arms reuse a **single embedding call** — the query vector is computed once and passed into the keyword corpus fetch rather than recomputed.
 
-**The query is the question alone**, behind the instruction prefix `mxbai` expects for retrieval queries (it is an asymmetric model — queries take a prefix, documents do not). The whole report summary used to be prepended to it, which cost three things at once:
+**The query is the question alone**, embedded with the `RETRIEVAL_QUERY` task type (chunks use `RETRIEVAL_DOCUMENT`; the earlier `mxbai` model needed a text prefix instead). The whole report summary used to be prepended to it, which cost three things at once:
 
 | Cost | Why |
 |---|---|
@@ -445,7 +445,7 @@ born-digital PDF now travels as raw bytes end to end.
 - Refusals, clarifications and questions about the conversation return **before retrieval**, so they cost one Flash call rather than an embedding call, two Pinecone queries and a grading pass.
 - Conversation history is read from the session rather than searched, so each turn makes **no memory lookup** at all (see *Conversation memory is the transcript*).
 - A re-uploaded text-layer report is recognised by its hash **before any model call** (see *Re-uploading the same report*).
-- Chunks are embedded in bounded batches of 8, since the HuggingFace inference API is the slowest dependency in ingest.
+- Chunks are embedded in one `batchEmbedContents` request per 100 chunks.
 
 ---
 
@@ -456,7 +456,7 @@ born-digital PDF now travels as raw bytes end to end.
 | Framework | Next.js 14 (App Router), TypeScript |
 | UI | Tailwind CSS, shadcn/ui, Radix |
 | LLM | Google Gemini 2.5 Flash via Vercel AI SDK |
-| Embeddings | `mixedbread-ai/mxbai-embed-large-v1` (1024-dim) via HuggingFace Inference |
+| Embeddings | `gemini-embedding-001` (truncated to 1024-dim) via the Gemini API |
 | Vector DB | Pinecone |
 | Knowledge graph | Neo4j |
 | Cache + PII vault | Upstash Redis |
@@ -479,7 +479,6 @@ Create `.env.local` (see `.env.local.example`):
 # Required
 GEMINI_API_KEY=
 PINECONE_API_KEY=
-HF_TOKEN=
 UPSTASH_REDIS_REST_URL=
 UPSTASH_REDIS_REST_TOKEN=
 
@@ -547,7 +546,7 @@ MediFlow-Assistant/
 │   ├── cache.ts            # semantic response cache + stored ingest results
 │   ├── chunking.ts         # splitting with section / table-header prefixes
 │   ├── pdf-figures.ts      # figure detection and batched description
-│   ├── embeddings.ts       # HuggingFace client, single source of truth for the model id
+│   ├── embeddings.ts       # Gemini embedding client, single source of truth for the model id
 │   ├── gemini.ts           # shared Gemini config + safety settings
 │   └── tracing.ts          # LangSmith spans, PHI gating
 ├── components/             # chat UI, upload/review, shadcn primitives

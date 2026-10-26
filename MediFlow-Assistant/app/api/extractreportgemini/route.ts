@@ -48,9 +48,10 @@ const VISION_ANALYSIS_SCHEMA = TEXT_ANALYSIS_SCHEMA.extend({
 
 type Triple = z.infer<typeof TRIPLE_SCHEMA>;
 
-// Tuned for the embedding model in @/lib/embeddings (mxbai-embed-large-v1, 512-token
-// limit): ~1200 chars stays well under that for dense clinical text, with overlap to
-// preserve context across boundaries.
+// Tuned for mxbai-embed-large-v1's 512-token limit: ~1200 chars stayed well under that for
+// dense clinical text, with overlap to preserve context across boundaries. @/lib/embeddings
+// now uses gemini-embedding-001 (2048 tokens), so this is conservative; it is kept because
+// the eval baselines were measured at this size.
 const CHUNK_SIZE = 1200;
 const CHUNK_OVERLAP = 150;
 
@@ -571,7 +572,7 @@ async function ingestReport(mimeType: string, buffer: Buffer): Promise<Response>
     setSpanMetadata({ duplicate: false });
     await storeVault(documentId, vault);
 
-    // Errors here are swallowed so a Pinecone or HuggingFace outage still returns a
+    // Errors here are swallowed so a Pinecone or embedding API outage still returns a
     // usable summary. The cost is a 200 for a document that cannot be searched, so the
     // span records the failure as an error and `vectorStoreFailed` is reported to the
     // client rather than left for it to infer.

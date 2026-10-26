@@ -248,7 +248,7 @@ export async function queryPineconeVectorStoreDetailed(
     async () => {
       // One embedding serves both halves of the hybrid search: it is passed into
       // getKeywordCorpus rather than recomputed there.
-      const queryEmbedding = await generateEmbedding(query);
+      const queryEmbedding = await generateEmbedding(query, "RETRIEVAL_QUERY");
 
       const vectorResults = await span(
         "vector_search",

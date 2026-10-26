@@ -102,7 +102,7 @@ export async function getCachedResponse(
     { question, threshold: similarityThreshold },
     async () => {
       try {
-        const currentEmbedding = await generateEmbedding(question);
+        const currentEmbedding = await generateEmbedding(question, "SEMANTIC_SIMILARITY");
         const reportHash = generateReportHash(reportData);
 
         // Entries written before this index existed are unreachable here and expire with
@@ -207,7 +207,7 @@ export async function cacheResponse(
     { question, answer, ttlSeconds },
     async () => {
       try {
-        const embedding = await generateEmbedding(question);
+        const embedding = await generateEmbedding(question, "SEMANTIC_SIMILARITY");
         const reportHash = generateReportHash(reportData);
         const questionHash = generateReportHash(question);
         const cacheKey = `${getCacheKeyPrefix(reportHash)}:${questionHash}`;

@@ -58,8 +58,8 @@ async function runPair(
 
   // Measured independently of the lookup above so the sweep has a similarity for every
   // pair, including ones the cache reported as a miss.
-  const seedVector = await withRetry(() => generateEmbedding(pair.seed), { onRetry });
-  const probeVector = await withRetry(() => generateEmbedding(pair.probe), { onRetry });
+  const seedVector = await withRetry(() => generateEmbedding(pair.seed, "SEMANTIC_SIMILARITY"), { onRetry });
+  const probeVector = await withRetry(() => generateEmbedding(pair.probe, "SEMANTIC_SIMILARITY"), { onRetry });
   const similarity = cosineSimilarity(seedVector, probeVector);
 
   const hit = cached !== null;
