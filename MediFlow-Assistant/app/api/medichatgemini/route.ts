@@ -75,6 +75,7 @@ const NOTHING_GRADED: GradedRetrieval = {
     // Nothing was retrieved, so nothing was graded. Recorded honestly: a turn counted as
     // a grader failure would make the grader look broken in the traces.
     ungraded: true,
+    gradedBy: null,
 };
 
 // buildGroundingInstruction's "none" branch tells the model to say the report does not

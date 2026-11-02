@@ -46,7 +46,7 @@ uses:
 
 | Suite | Requires |
 |---|---|
-| retrieval | `PINECONE_API_KEY`, `GEMINI_API_KEY` |
+| retrieval | `PINECONE_API_KEY`, `GEMINI_API_KEY`, plus `GROQ_API_KEY` with `GRADER_PROVIDER=groq` |
 | guard | `GEMINI_API_KEY` |
 | cache | `PINECONE_API_KEY`, `GEMINI_API_KEY`, `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` |
 | judge | `GEMINI_API_KEY`, or `GROQ_API_KEY` with `JUDGE_PROVIDER=groq` |
@@ -56,6 +56,7 @@ uses:
 | `EVAL_PINECONE_INDEX` | `medic` | Index to build the corpus in |
 | `EVAL_PINECONE_NAMESPACE` | `eval-diagnosis2` | Namespace, never `diagnosis2` |
 | `JUDGE_PROVIDER` | `gemini` | Which judge the suite measures - the same variable picks the app's judge |
+| `GRADER_PROVIDER` | `gemini` | Which grader the retrieval suite measures - the same variable picks the app's grader. The report counts Groq-to-Gemini fallbacks |
 | `JUDGE_ONLY` | all | Comma-separated case ids, to rerun a few cases |
 | `EVAL_CONCURRENCY` | `1` | Cases in flight. Above 1 the latency figures measure contention, and the report says so |
 

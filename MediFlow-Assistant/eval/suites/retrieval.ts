@@ -1,6 +1,6 @@
 import { queryPineconeVectorStoreDetailed, pinecone } from "@/utils";
 import { buildRetrievalQuery } from "@/lib/embeddings";
-import { gradeRetrieval } from "@/lib/retrieval-grader";
+import { GRADER_PROVIDER, GROQ_GRADER_MODEL, gradeRetrieval } from "@/lib/retrieval-grader";
 import { EVAL_INDEX, EVAL_NAMESPACE, findIngested, loadCorpus } from "../lib/corpus";
 import { getReport } from "../fixtures/reports";
 import { RETRIEVAL_CASES, type RetrievalCase } from "../dataset/retrieval";
@@ -45,6 +45,7 @@ export interface RetrievalCaseResult {
   chunksKept: number;
   chunksDropped: number;
   ungraded: boolean;
+  gradedBy: "groq" | "gemini" | null;
   /** Whether a chunk carrying a gold fact survived grading. Null when there are no facts. */
   goldSurvivedGrading: boolean | null;
   retrieveMs: number;
@@ -121,6 +122,7 @@ async function runCase(
     chunksKept: graded.chunks.length,
     chunksDropped: retrieval.chunks.length - graded.chunks.length,
     ungraded: graded.ungraded,
+    gradedBy: graded.gradedBy,
     goldSurvivedGrading: hasFacts ? graded.chunks.some((chunk) => chunkCarriesFact(chunk.text)) : null,
     retrieveMs,
     gradeMs,
@@ -241,6 +243,13 @@ export async function runRetrievalSuite(
       "ungraded (grader failed open)",
       String(cases.filter((r) => r.ungraded).length),
       "includes transient Gemini failures - gradeRetrieval swallows those",
+    ],
+    [
+      // With GRADER_PROVIDER=groq, any gemini count here is a Groq fallback, and the
+      // figures above mix two models.
+      "graded by groq / gemini",
+      `${cases.filter((r) => r.gradedBy === "groq").length} / ${cases.filter((r) => r.gradedBy === "gemini").length}`,
+      GRADER_PROVIDER === "groq" ? `groq ${GROQ_GRADER_MODEL} selected; gemini = fallbacks` : "gemini selected",
     ],
     ["retries during run", String(retries.count()), "transient retrieval failures re-attempted"],
     [

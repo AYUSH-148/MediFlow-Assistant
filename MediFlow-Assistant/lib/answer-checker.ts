@@ -1,6 +1,7 @@
 import { generateObject } from "ai";
 import { z } from "zod";
 import { geminiModel } from "@/lib/gemini";
+import { groqStructured } from "@/lib/groq";
 import { span, setSpanMetadata, textShape } from "@/lib/tracing";
 
 /**
@@ -121,9 +122,7 @@ ${answer}
 export const JUDGE_PROVIDER: "groq" | "gemini" = process.env.JUDGE_PROVIDER === "groq" ? "groq" : "gemini";
 export const GROQ_JUDGE_MODEL = "openai/gpt-oss-120b";
 
-// CheckSchema as JSON Schema, for Groq's strict structured output: every property
-// required, no extras. Written by hand because the only converter available is a
-// transitive dependency of `ai` that could vanish on any upgrade.
+// CheckSchema as JSON Schema, for Groq's strict structured output (see lib/groq.ts).
 const CHECK_JSON_SCHEMA = {
     type: "object",
     properties: {
@@ -140,45 +139,16 @@ export interface JudgeResult {
     tokens: number | null;
 }
 
-/**
- * One judge call to Groq, no retries. A 429 here means the per-minute token budget is
- * spent, and waiting for it would hold the user's answer for seconds when the Gemini
- * judge can take the call now - so the caller falls back instead of retrying.
- *
- * Plain fetch to Groq's OpenAI-compatible endpoint rather than an AI SDK provider: the
- * provider package would have to match this project's old `ai` major, for one call.
- */
+/** One judge call to Groq, no retries - the caller falls back to Gemini instead. */
 export async function judgeWithGroq(prompt: string, abortSignal?: AbortSignal): Promise<JudgeResult> {
-    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${process.env.GROQ_API_KEY ?? ""}`,
-        },
-        body: JSON.stringify({
-            model: GROQ_JUDGE_MODEL,
-            messages: [{ role: "user", content: prompt }],
-            temperature: 0,
-            // Reasoning tokens count against the tokens-per-minute limit. Low effort still
-            // caught every planted error but one in the eval.
-            reasoning_effort: "low",
-            response_format: {
-                type: "json_schema",
-                json_schema: { name: "answer_check", strict: true, schema: CHECK_JSON_SCHEMA },
-            },
-        }),
-        signal: abortSignal,
-    });
-    if (!response.ok) {
-        // Status first so a retry pattern matching "429" sees it. Groq's error bodies name
-        // the limit or the fault, never the prompt.
-        throw new Error(`Groq ${response.status}: ${(await response.text()).slice(0, 200)}`);
-    }
-    const body = await response.json();
-    return {
-        object: CheckSchema.parse(JSON.parse(body.choices[0].message.content)),
-        tokens: body.usage?.total_tokens ?? null,
-    };
+    const { content, tokens } = await groqStructured(
+        GROQ_JUDGE_MODEL,
+        prompt,
+        "answer_check",
+        CHECK_JSON_SCHEMA,
+        abortSignal
+    );
+    return { object: CheckSchema.parse(content), tokens };
 }
 
 export async function judgeWithGemini(prompt: string, abortSignal?: AbortSignal): Promise<JudgeResult> {
