@@ -11,7 +11,8 @@
     "eval": "tsx eval/run.ts",
     "eval:retrieval": "tsx eval/run.ts retrieval",
     "eval:guard": "tsx eval/run.ts guard",
-    "eval:cache": "tsx eval/run.ts cache"
+    "eval:cache": "tsx eval/run.ts cache",
+    "eval:judge": "tsx eval/run.ts judge"
   },
   "dependencies": {
     "@ai-sdk/google": "^0.0.55",

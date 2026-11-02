@@ -5,15 +5,18 @@ import { loadEnv, requireEnv } from "./lib/env";
 // Same ordering constraint as build.ts: env first, suites by dynamic import after.
 const envFiles = loadEnv();
 
-const SUITES = ["retrieval", "guard", "cache"] as const;
+const SUITES = ["retrieval", "guard", "cache", "judge"] as const;
 type SuiteName = (typeof SUITES)[number];
 
 // Only the keys each suite actually reaches for, so a run of one suite is not blocked by
 // a credential it will never use.
 const REQUIRED_ENV: Record<SuiteName, string[]> = {
-  retrieval: ["PINECONE_API_KEY", "GEMINI_API_KEY"],
+  // GRADER_PROVIDER=groq grades with Groq, as it does in the app; see lib/retrieval-grader.ts.
+  retrieval: ["PINECONE_API_KEY", "GEMINI_API_KEY", ...(process.env.GRADER_PROVIDER === "groq" ? ["GROQ_API_KEY"] : [])],
   guard: ["GEMINI_API_KEY"],
   cache: ["PINECONE_API_KEY", "GEMINI_API_KEY", "UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"],
+  // JUDGE_PROVIDER=groq judges with Groq, as it does in the app; see lib/answer-checker.ts.
+  judge: [process.env.JUDGE_PROVIDER === "groq" ? "GROQ_API_KEY" : "GEMINI_API_KEY"],
 };
 
 function parseSuites(argv: string[]): SuiteName[] {
@@ -63,6 +66,11 @@ async function main(): Promise<void> {
       const { runGuardSuite } = await import("./suites/guard");
       const result = await runGuardSuite();
       results.guard = result;
+      reports.push(result.report);
+    } else if (suite === "judge") {
+      const { runJudgeSuite } = await import("./suites/judge");
+      const result = await runJudgeSuite();
+      results.judge = result;
       reports.push(result.report);
     } else {
       const { runCacheSuite } = await import("./suites/cache");

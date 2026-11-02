@@ -1,6 +1,7 @@
 import { generateObject } from "ai";
 import { z } from "zod";
 import { geminiModel } from "@/lib/gemini";
+import { groqStructured } from "@/lib/groq";
 import { span, setSpanMetadata, textShape } from "@/lib/tracing";
 import { formatChunks, type RetrievedChunk } from "@/utils";
 
@@ -57,6 +58,44 @@ const GradeSchema = z.object({
         ),
 });
 
+/**
+ * Which model grades. The grader shared gemini-2.5-flash with the guard, generator and
+ * judge, and that model's free tier allows 5 requests a minute and 20 a day - the grader
+ * spent one of each on every question.
+ *
+ * Still an LLM rather than a cross-encoder reranker: a reranker returns relevance scores
+ * only, so it cannot produce `partial` or `missing`, which the grounding instruction
+ * depends on, and it would need a per-corpus score cutoff (see the note above). It would
+ * also need hosting this serverless app does not have.
+ *
+ * gpt-oss-20b rather than the judge's gpt-oss-120b: Groq rate-limits per model, so the two
+ * stages do not share a token budget. Opt-in with GRADER_PROVIDER=groq; Gemini stays the
+ * default and the fallback.
+ */
+export const GRADER_PROVIDER: "groq" | "gemini" = process.env.GRADER_PROVIDER === "groq" ? "groq" : "gemini";
+export const GROQ_GRADER_MODEL = "openai/gpt-oss-20b";
+
+// GradeSchema as JSON Schema for Groq's strict mode (see lib/groq.ts). The descriptions
+// are carried over because the 1-based excerpt numbering is stated only there.
+const GRADE_JSON_SCHEMA = {
+    type: "object",
+    properties: {
+        verdict: {
+            type: "string",
+            enum: ["relevant", "partial", "none"],
+            description: GradeSchema.shape.verdict.description,
+        },
+        usefulExcerpts: {
+            type: "array",
+            items: { type: "integer" },
+            description: GradeSchema.shape.usefulExcerpts.description,
+        },
+        missing: { type: "string", description: GradeSchema.shape.missing.description },
+    },
+    required: ["verdict", "usefulExcerpts", "missing"],
+    additionalProperties: false,
+};
+
 export interface GradedRetrieval {
     verdict: "relevant" | "partial" | "none";
     /** Surviving chunks, renumbered contiguously and ready for the prompt. */
@@ -65,6 +104,11 @@ export interface GradedRetrieval {
     missing: string;
     /** True when grading was skipped or failed and the chunks passed through ungraded. */
     ungraded: boolean;
+    /**
+     * The model that made the call; null when no call was made or it failed. Lets the eval
+     * see a Groq-to-Gemini fallback, which would otherwise mix two models into one score.
+     */
+    gradedBy: "groq" | "gemini" | null;
 }
 
 function buildPrompt(question: string, chunkText: string): string {
@@ -114,6 +158,7 @@ export async function gradeRetrieval({
             chunks: [],
             missing: "",
             ungraded: false,
+            gradedBy: null,
         };
     }
 
@@ -122,14 +167,40 @@ export async function gradeRetrieval({
         { question, retrievalText, chunkCount: chunks.length },
         async () => {
             try {
-                const { object } = await generateObject({
-                    model: geminiModel,
-                    schema: GradeSchema,
-                    // A grader, not a writer: the same excerpts must grade the same way
-                    // twice or the feature is noise.
-                    temperature: 0,
-                    prompt: buildPrompt(question, retrievalText),
-                });
+                const prompt = buildPrompt(question, retrievalText);
+                let gradedBy: "groq" | "gemini" = "gemini";
+                let groqError: string | undefined;
+                let groqTokens: number | null = null;
+                let object: z.infer<typeof GradeSchema> | undefined;
+                if (GRADER_PROVIDER === "groq") {
+                    try {
+                        const result = await groqStructured(
+                            GROQ_GRADER_MODEL,
+                            prompt,
+                            "retrieval_grade",
+                            GRADE_JSON_SCHEMA
+                        );
+                        object = GradeSchema.parse(result.content);
+                        groqTokens = result.tokens;
+                        gradedBy = "groq";
+                    } catch (error) {
+                        // Fall back rather than fail open, as the judge does: a Groq 429 is
+                        // routine on the free tier, and ungraded chunks are what this stage
+                        // exists to prevent. Gemini's own failure still fails open below.
+                        groqError = error instanceof Error ? error.message : String(error);
+                        console.error("Groq grader failed; falling back to Gemini:", groqError);
+                    }
+                }
+                object ??= (
+                    await generateObject({
+                        model: geminiModel,
+                        schema: GradeSchema,
+                        // A grader, not a writer: the same excerpts must grade the same way
+                        // twice or the feature is noise.
+                        temperature: 0,
+                        prompt,
+                    })
+                ).object;
 
                 // Indices are 1-based and model-supplied, so all three properties the
                 // lookup depends on are established here rather than assumed:
@@ -173,6 +244,9 @@ export async function gradeRetrieval({
                     chunksDropped: chunks.length - kept.length,
                     ...textShape("missing", object.missing),
                     ungraded: false,
+                    gradedBy,
+                    ...(groqError ? { groqFallback: groqError } : {}),
+                    ...(groqTokens !== null ? { graderTokens: groqTokens } : {}),
                 });
 
                 return {
@@ -181,6 +255,7 @@ export async function gradeRetrieval({
                     chunks: kept,
                     missing: verdict === "relevant" ? "" : object.missing ?? "",
                     ungraded: false,
+                    gradedBy,
                 };
             } catch (error) {
                 // Fail OPEN, as elsewhere in this pipeline: pass the ungraded chunks
@@ -201,6 +276,7 @@ export async function gradeRetrieval({
                     chunks,
                     missing: "",
                     ungraded: true,
+                    gradedBy: null,
                 };
             }
         },

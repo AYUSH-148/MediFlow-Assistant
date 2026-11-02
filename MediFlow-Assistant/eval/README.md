@@ -11,10 +11,12 @@ numbers are comparable between runs and nothing here touches production data.
 
 ```bash
 npm run eval:build      # ingest the fixtures into Pinecone (run once, and after any fixture edit)
-npm run eval            # all three suites
+npm run eval            # all four suites
 npm run eval:retrieval  # one suite at a time
 npm run eval:guard
 npm run eval:cache
+npm run eval:judge                      # answer check, judged by Gemini
+JUDGE_PROVIDER=groq npm run eval:judge  # same prompt and cases, judged by Groq openai/gpt-oss-120b
 ```
 
 `eval:build` must run first. Suites refuse to start against a missing or stale corpus
@@ -44,14 +46,18 @@ uses:
 
 | Suite | Requires |
 |---|---|
-| retrieval | `PINECONE_API_KEY`, `GEMINI_API_KEY` |
+| retrieval | `PINECONE_API_KEY`, `GEMINI_API_KEY`, plus `GROQ_API_KEY` with `GRADER_PROVIDER=groq` |
 | guard | `GEMINI_API_KEY` |
 | cache | `PINECONE_API_KEY`, `GEMINI_API_KEY`, `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` |
+| judge | `GEMINI_API_KEY`, or `GROQ_API_KEY` with `JUDGE_PROVIDER=groq` |
 
 | Variable | Default | Effect |
 |---|---|---|
 | `EVAL_PINECONE_INDEX` | `medic` | Index to build the corpus in |
 | `EVAL_PINECONE_NAMESPACE` | `eval-diagnosis2` | Namespace, never `diagnosis2` |
+| `JUDGE_PROVIDER` | `gemini` | Which judge the suite measures - the same variable picks the app's judge |
+| `GRADER_PROVIDER` | `gemini` | Which grader the retrieval suite measures - the same variable picks the app's grader. The report counts Groq-to-Gemini fallbacks |
+| `JUDGE_ONLY` | all | Comma-separated case ids, to rerun a few cases |
 | `EVAL_CONCURRENCY` | `1` | Cases in flight. Above 1 the latency figures measure contention, and the report says so |
 
 `LANGSMITH_TRACING=true` adds a span upload to every stage and inflates every latency
@@ -145,6 +151,31 @@ and returns `null`, which is indistinguishable from a genuine miss — without t
 run degraded by infrastructure would report a low hit rate as if it were a threshold
 finding.
 
+### Answer check (judge)
+
+Thirty-five hand-written answers to questions about the `metabolic-workup` fixture, each
+labelled `grounded`, `partial` or `unsupported`, with evidence assembled in the chat
+route's own format. Twenty get one or two report sections as evidence; fifteen `h*` cases
+get the whole report (production-sized) and subtler errors - a near-limit flag, a unit,
+a day-first date read month-first, a planned dose stated as current, one wrong digit in a
+long answer. Their pass/fail is reported separately. The bad answers carry planted failures: a transposed lab value, an
+invented medication, a contradicted classification, an answer to a different question, a
+repeat of the assistant's own earlier wrong reply, and an instruction aimed at the judge.
+The good ones include the traps a strict judge falls into: general background with numbers
+not in the evidence, a fact the user stated in conversation, a redaction placeholder.
+
+The headline is **pass/fail**, because the route only branches on grounded vs not.
+**False accepts** (a bad answer passed) reach the user and the 24h cache; **false rejects**
+(a good answer failed) cost a retry. The three-way split is reported second, since
+partial vs unsupported is a judgement call.
+
+The suite calls the production judge function for `JUDGE_PROVIDER` directly
+(`judgeWithGroq` / `judgeWithGemini` in `lib/answer-checker.ts`), with the same prompt and
+schema, so two runs differ only in the model. It bypasses `checkAnswer`'s Groq-to-Gemini
+fallback on purpose: a fallback inside the run would mix two models into one score. Groq runs also report tokens per call: its free tier is limited by tokens per
+minute, not requests. Use the full-report figure for capacity planning; the small-evidence
+cases understate what a production call costs.
+
 ## Known limits
 
 Read these before quoting any number from a run.
@@ -187,7 +218,7 @@ eval/
   build.ts              ingest fixtures into the eval namespace
   run.ts                suite runner; writes eval/results/<timestamp>.json
   fixtures/reports/     5 synthetic reports, each with a hand-written summary
-  dataset/              gold labels: retrieval.ts, guard.ts, cache.ts
+  dataset/              gold labels: retrieval.ts, guard.ts, cache.ts, judge.ts
   suites/               one file per suite
   lib/                  env loading, corpus build/manifest, metrics, retry, concurrency
 ```
