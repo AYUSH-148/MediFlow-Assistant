@@ -44,9 +44,9 @@ uses:
 
 | Suite | Requires |
 |---|---|
-| retrieval | `PINECONE_API_KEY`, `HF_TOKEN`, `GEMINI_API_KEY` |
+| retrieval | `PINECONE_API_KEY`, `GEMINI_API_KEY` |
 | guard | `GEMINI_API_KEY` |
-| cache | `PINECONE_API_KEY`, `HF_TOKEN`, `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` |
+| cache | `PINECONE_API_KEY`, `GEMINI_API_KEY`, `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` |
 
 | Variable | Default | Effect |
 |---|---|---|

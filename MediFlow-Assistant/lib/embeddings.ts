@@ -1,18 +1,31 @@
-import { InferenceClient } from "@huggingface/inference";
 import { span, setSpanMetadata, textShape } from "@/lib/tracing";
 
 // Single source of truth for the embedding model. Ingest and query must embed with the
 // SAME model or the vectors live in different spaces, and a mismatch produces
 // meaningless similarity scores rather than an error.
 //
-// The ingest route's chunk sizing is tuned to this model's 512-token limit, so swapping
-// models means revisiting CHUNK_SIZE there too.
-export const EMBEDDING_MODEL_ID = "mixedbread-ai/mxbai-embed-large-v1";
+// This was mixedbread-ai/mxbai-embed-large-v1 on the HuggingFace Inference API until the
+// account ran out of inference credits, which took ingest, retrieval and the semantic
+// cache down at once. Gemini reuses the key the app already needs for generation, so the
+// embeddings no longer depend on a second paid account.
+//
+// Changing the model (or EMBEDDING_DIMENSIONS) invalidates every stored vector: clear the
+// Pinecone namespaces, re-run `npm run eval:build`, and re-upload reports. The response
+// cache holds vectors too, but expires on its own 24h TTL.
+export const EMBEDDING_MODEL_ID = "gemini-embedding-001";
 
-// mxbai-embed-large-v1 is asymmetric: retrieval queries are embedded with an instruction
-// prefix, documents without one. Dropping it costs real accuracy, so the prefix lives here
-// beside the model id rather than at the call sites - the two have to change together.
-const RETRIEVAL_QUERY_PREFIX = "Represent this for searching relevant passages: ";
+// The Pinecone index `medic` is 1024-dim. gemini-embedding-001 natively returns 3072 and
+// is trained (Matryoshka) to be truncated, so asking for 1024 keeps the existing index.
+// Truncated vectors are not unit length; everything downstream compares by cosine, which
+// does not care.
+const EMBEDDING_DIMENSIONS = 1024;
+
+// Gemini is asymmetric through a task type rather than a text prefix, so the caller says
+// which side of the comparison the text is on:
+//   RETRIEVAL_QUERY      - a question searched against report chunks
+//   RETRIEVAL_DOCUMENT   - a report chunk being indexed
+//   SEMANTIC_SIMILARITY  - question-to-question comparison (the semantic cache)
+export type EmbeddingTaskType = "RETRIEVAL_QUERY" | "RETRIEVAL_DOCUMENT" | "SEMANTIC_SIMILARITY";
 
 /**
  * The single source of truth for a retrieval query.
@@ -26,8 +39,8 @@ const RETRIEVAL_QUERY_PREFIX = "Represent this for searching relevant passages: 
  *   2. `rankWithTfIdf` tokenises this same string, so every word of the summary became a
  *      query term and the sparse arm scored chunks against the report rather than the
  *      question.
- *   3. The summary sat ahead of the question in a string with a 512-token ceiling, so a
- *      long report truncated the question away entirely - silently, and with no error.
+ *   3. The summary sat ahead of the question in a string with a token ceiling, so a long
+ *      report truncated the question away entirely - silently, and with no error.
  *
  * Prepending it was a way to give a context-free follow-up ("is that bad?") something to
  * match on. The query guard now rewrites such questions to stand alone before retrieval
@@ -36,35 +49,63 @@ const RETRIEVAL_QUERY_PREFIX = "Represent this for searching relevant passages: 
  * Note that broad meta-questions ("summarise the findings") have little clinical content
  * to match on either way; the full summary is in the generation prompt regardless, which
  * is what actually answers them.
+ *
+ * mxbai needed an instruction prefix here. Gemini takes the RETRIEVAL_QUERY task type
+ * instead, so the question now goes through unchanged - which also keeps the prefix's
+ * words out of the TF-IDF query terms.
  */
 export function buildRetrievalQuery(question: string): string {
-  return `${RETRIEVAL_QUERY_PREFIX}${question}`;
+  return question;
 }
 
-// mxbai-embed-large-v1 truncates at 512 tokens. Clinical text runs denser than prose
+// gemini-embedding-001 accepts 2048 tokens. Clinical text runs denser than prose
 // (numbers, units, abbreviations), so this budget assumes ~3.5 chars per token and leaves
 // headroom rather than tracking the tokeniser exactly.
 //
-// The point is not the cap itself - the model already truncated silently. It is that
-// exceeding it is now recorded, so a query that lost its tail is visible instead of
-// looking like a retrieval that simply performed badly. Ingest chunks are 1200 chars and
-// sit under this untouched.
-const MAX_EMBED_CHARS = 1600;
+// The point is not the cap itself - the model would truncate silently. It is that
+// exceeding it is recorded, so a query that lost its tail is visible instead of looking
+// like a retrieval that simply performed badly. Ingest chunks are 1200 chars and sit
+// under this untouched.
+const MAX_EMBED_CHARS = 6000;
 
-const hf = new InferenceClient(process.env.HF_TOKEN);
+// batchEmbedContents takes at most 100 texts per request.
+const EMBED_BATCH_SIZE = 100;
 
-// The HF inference API is the slowest dependency in ingest, so chunks are embedded in
-// batches - bounded, to avoid opening unbounded concurrent requests on a large report.
-const EMBED_BATCH_SIZE = 8;
+const EMBED_URL = `https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL_ID}:batchEmbedContents`;
+
+async function embedBatch(texts: string[], taskType: EmbeddingTaskType): Promise<number[][]> {
+  const response = await fetch(EMBED_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": process.env.GEMINI_API_KEY ?? "",
+    },
+    body: JSON.stringify({
+      requests: texts.map((text) => ({
+        model: `models/${EMBEDDING_MODEL_ID}`,
+        content: { parts: [{ text }] },
+        taskType,
+        outputDimensionality: EMBEDDING_DIMENSIONS,
+      })),
+    }),
+  });
+  if (!response.ok) {
+    // Google's error bodies describe the request failure (quota, key, model), never echo
+    // the input text, so they are safe to surface.
+    throw new Error(`Gemini embedding failed (${response.status}): ${(await response.text()).slice(0, 300)}`);
+  }
+  const { embeddings } = (await response.json()) as { embeddings: { values: number[] }[] };
+  return embeddings.map((embedding) => embedding.values);
+}
 
 // Post-redaction text is not the same as identifier-free: the PII rules are
 // label-anchored, so a name in ordinary prose survives into the redacted question and
 // reaches this call. The text is PHI-gated for that reason; the vector is dropped either
 // way, since 1024 floats per span is noise.
-export async function generateEmbedding(text: string): Promise<number[]> {
+export async function generateEmbedding(text: string, taskType: EmbeddingTaskType): Promise<number[]> {
   return span(
     "embed",
-    { text, model: EMBEDDING_MODEL_ID },
+    { text, model: EMBEDDING_MODEL_ID, taskType },
     async ({ text: input }) => {
       // Truncated here rather than left to the model, so the loss is attributable. The
       // caller's own ordering decides what survives - every builder in this codebase puts
@@ -72,11 +113,7 @@ export async function generateEmbedding(text: string): Promise<number[]> {
       const truncated = input.length > MAX_EMBED_CHARS;
       const embedInput = truncated ? input.slice(0, MAX_EMBED_CHARS) : input;
 
-      const apiOutput = await hf.featureExtraction({
-        model: EMBEDDING_MODEL_ID,
-        inputs: embedInput,
-      });
-      const vector: number[] = Array.from(apiOutput as any);
+      const [vector] = await embedBatch([embedInput], taskType);
       setSpanMetadata({
         dimensions: vector.length,
         chars: embedInput.length,
@@ -87,13 +124,15 @@ export async function generateEmbedding(text: string): Promise<number[]> {
     },
     {
       runType: "embedding",
-      tags: ["huggingface"],
-      safeInputs: { model: EMBEDDING_MODEL_ID, ...textShape("text", text) },
+      tags: ["gemini"],
+      safeInputs: { model: EMBEDDING_MODEL_ID, taskType, ...textShape("text", text) },
       recordOutputs: (vector) => ({ dimensions: vector.length }),
     }
   );
 }
 
+// Report chunks for indexing. One request per 100 chunks rather than one per chunk, which
+// matters on the free tier's per-minute request quota.
 export async function generateEmbeddings(texts: string[]): Promise<number[][]> {
   return span(
     "embed_batch",
@@ -101,9 +140,8 @@ export async function generateEmbeddings(texts: string[]): Promise<number[][]> {
     async () => {
       const embeddings: number[][] = [];
       for (let i = 0; i < texts.length; i += EMBED_BATCH_SIZE) {
-        const batch = texts.slice(i, i + EMBED_BATCH_SIZE);
-        const batchEmbeddings = await Promise.all(batch.map((text) => generateEmbedding(text)));
-        embeddings.push(...batchEmbeddings);
+        const batch = texts.slice(i, i + EMBED_BATCH_SIZE).map((text) => text.slice(0, MAX_EMBED_CHARS));
+        embeddings.push(...(await embedBatch(batch, "RETRIEVAL_DOCUMENT")));
       }
       setSpanMetadata({
         embedded: embeddings.length,
@@ -114,7 +152,7 @@ export async function generateEmbeddings(texts: string[]): Promise<number[][]> {
     },
     {
       runType: "embedding",
-      tags: ["huggingface"],
+      tags: ["gemini"],
       recordOutputs: (embeddings) => ({ count: embeddings.length }),
     }
   );

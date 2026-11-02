@@ -11,9 +11,9 @@ type SuiteName = (typeof SUITES)[number];
 // Only the keys each suite actually reaches for, so a run of one suite is not blocked by
 // a credential it will never use.
 const REQUIRED_ENV: Record<SuiteName, string[]> = {
-  retrieval: ["PINECONE_API_KEY", "HF_TOKEN", "GEMINI_API_KEY"],
+  retrieval: ["PINECONE_API_KEY", "GEMINI_API_KEY"],
   guard: ["GEMINI_API_KEY"],
-  cache: ["PINECONE_API_KEY", "HF_TOKEN", "UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"],
+  cache: ["PINECONE_API_KEY", "GEMINI_API_KEY", "UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"],
 };
 
 function parseSuites(argv: string[]): SuiteName[] {

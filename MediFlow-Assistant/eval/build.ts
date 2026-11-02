@@ -5,7 +5,7 @@ import { loadEnv, requireEnv } from "./lib/env";
 const envFiles = loadEnv();
 
 async function main(): Promise<void> {
-  requireEnv(["PINECONE_API_KEY", "HF_TOKEN"]);
+  requireEnv(["PINECONE_API_KEY", "GEMINI_API_KEY"]);
 
   console.log(`Loaded environment from: ${envFiles.length ? envFiles.join(", ") : "(process only)"}`);
 

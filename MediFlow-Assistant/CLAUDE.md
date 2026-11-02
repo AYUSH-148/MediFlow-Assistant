@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-MediFlow Assistant: a Next.js 14 (App Router) conversational RAG app over uploaded medical reports. Gemini (`gemini-2.5-flash` via the Vercel AI SDK, `lib/gemini.ts`) for extraction/guarding/grading/answers, Hugging Face `mxbai-embed-large-v1` embeddings (1024-dim), Pinecone for vectors, Upstash Redis for cache/vault/sessions, Neo4j for Graph-RAG triples, LangSmith for tracing.
+MediFlow Assistant: a Next.js 14 (App Router) conversational RAG app over uploaded medical reports. Gemini (`gemini-2.5-flash` via the Vercel AI SDK, `lib/gemini.ts`) for extraction/guarding/grading/answers, Gemini `gemini-embedding-001` embeddings (truncated to 1024-dim, `lib/embeddings.ts`), Pinecone for vectors, Upstash Redis for cache/vault/sessions, Neo4j for Graph-RAG triples, LangSmith for tracing.
 
 ## Repo layout
 
@@ -27,7 +27,7 @@ npm run eval:retrieval  # single suite: retrieval | guard | cache
 
 There is no unit-test framework; the eval harness (`eval/`, run with `tsx`) is the test suite. It hits real Gemini/Pinecone/Redis, uses Pinecone namespace `eval-diagnosis2` (never production `diagnosis2`), and writes `eval/results/<timestamp>.json`. Read `eval/README.md` before interpreting numbers — notably, a non-zero guard outage / `ungraded` count voids the run's metrics.
 
-Env: copy `.env.local.example`. Required: `GEMINI_API_KEY`, `HF_TOKEN`, `PINECONE_API_KEY` (index `medic`, dim 1024, cosine), `UPSTASH_REDIS_REST_URL`/`_TOKEN`. Neo4j vars optional (graph features skipped without them). Never enable `LANGSMITH_TRACE_PHI` casually — it sends raw pre-redaction text to LangSmith.
+Env: copy `.env.local.example`. Required: `GEMINI_API_KEY` (also used for embeddings), `PINECONE_API_KEY` (index `medic`, dim 1024, cosine), `UPSTASH_REDIS_REST_URL`/`_TOKEN`. Neo4j vars optional (graph features skipped without them). Never enable `LANGSMITH_TRACE_PHI` casually — it sends raw pre-redaction text to LangSmith.
 
 ## Architecture
 

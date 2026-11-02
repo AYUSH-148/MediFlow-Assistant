@@ -7,7 +7,7 @@ High-level flow
 3. Dedup (text-layer path only): `documentId` is a SHA-256 of the text. If a stored ingest result and its vault both exist, they are returned unchanged with no model call.
 4. Analysis: On the text-layer path, one Gemini structured-output call returns the summary and triples. Pages carrying large figures are rendered and described in one batched Gemini call; the descriptions are appended under a labelled heading, after the summary is generated and outside the hash.
 5. PII Redaction & Vaulting: `lib/pii-redaction.ts` replaces PII with `[TYPE_N]` tokens across the text and summary together, and stores the token -> original value vault in Redis (Upstash) under `vault:<documentId>` with a 24h TTL.
-6. Chunking & Embeddings: The redacted text is chunked (1200/150, each chunk prefixed with its section and table header, `lib/chunking.ts`), embedded with `mxbai-embed-large-v1` via Hugging Face, and upserted to Pinecone `medic` / `diagnosis2` with `documentId` metadata.
+6. Chunking & Embeddings: The redacted text is chunked (1200/150, each chunk prefixed with its section and table header, `lib/chunking.ts`), embedded with Gemini `gemini-embedding-001` (1024-dim, `RETRIEVAL_DOCUMENT` task type), and upserted to Pinecone `medic` / `diagnosis2` with `documentId` metadata.
 7. Graph Storage: Redacted triples are stored in Neo4j, scoped by document (`storeTriplesInNeo4j`).
 8. Session: The route creates a Redis session `{documentId, summary, transcript}` (`lib/session.ts`) and sets an HttpOnly `mf_sid` cookie. The response carries the redacted summary but never the `documentId`.
 9. Review: The user can edit the summary; `app/api/session/report/route.ts` binds the edited summary to the session.
