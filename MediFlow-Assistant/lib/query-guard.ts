@@ -1,6 +1,7 @@
 import { generateObject } from "ai";
 import { z } from "zod";
 import { geminiModel } from "@/lib/gemini";
+import { groqStructured } from "@/lib/groq";
 import { span, setSpanMetadata, textShape } from "@/lib/tracing";
 
 /**
@@ -61,6 +62,41 @@ const GuardSchema = z.object({
 
 export type QueryGuard = z.infer<typeof GuardSchema>;
 
+/**
+ * Which model guards. The guard runs on every message - refusals included - and on the
+ * gemini-2.5-flash free tier (5 requests a minute, 20 a day) that was one of every
+ * question's few calls. Opt-in with GUARD_PROVIDER=groq; Gemini stays the default and
+ * the fallback.
+ *
+ * The Groq model is overridable with GROQ_GUARD_MODEL so `npm run eval:guard` can compare
+ * candidates without a code change. Groq rate-limits per model, so the choice also
+ * decides which stage the guard shares a token budget with.
+ *
+ * The guard prompt carries the whole conversation, so a long one outgrows the free
+ * tier's 8K tokens a minute and every call falls back to Gemini. That is left to the
+ * fallback rather than trimmed for Groq: "what was my first question?" needs it all.
+ */
+export const GUARD_PROVIDER: "groq" | "gemini" = process.env.GUARD_PROVIDER === "groq" ? "groq" : "gemini";
+export const GROQ_GUARD_MODEL = process.env.GROQ_GUARD_MODEL || "openai/gpt-oss-120b";
+
+// GuardSchema as JSON Schema for Groq's strict mode (see lib/groq.ts), descriptions
+// carried over because the prompt leans on them.
+const GUARD_JSON_SCHEMA = {
+    type: "object",
+    properties: {
+        intent: {
+            type: "string",
+            enum: ["answer", "clarify", "refuse"],
+            description: GuardSchema.shape.intent.description,
+        },
+        resolvedQuestion: { type: "string", description: GuardSchema.shape.resolvedQuestion.description },
+        reply: { type: "string", description: GuardSchema.shape.reply.description },
+        conversational: { type: "boolean", description: GuardSchema.shape.conversational.description },
+    },
+    required: ["intent", "resolvedQuestion", "reply", "conversational"],
+    additionalProperties: false,
+};
+
 export interface GuardDecision extends QueryGuard {
     /**
      * True when the classification call failed and the question was waved through.
@@ -73,6 +109,11 @@ export interface GuardDecision extends QueryGuard {
      * apart.
      */
     guardFailed: boolean;
+    /**
+     * The model that decided; null when no call was made or it failed. Lets the eval see a
+     * Groq-to-Gemini fallback, which would otherwise mix two models into one score.
+     */
+    guardedBy: "groq" | "gemini" | null;
 }
 
 // Used when the model routes to clarify or refuse but returns nothing to say. Better a
@@ -123,6 +164,13 @@ ${reportSummary}
 "refuse" - not about health, medicine, the user's medical report, how to use this
 assistant, or this conversation. General trivia, the current date or time, coding help,
 small talk. Do not answer the question itself, even if you know the answer.
+
+Refuse on topic only. A health question is never "refuse" because the report summary does
+not mention what it asks about - the full report is read later. A question about the user's
+own medications, allergies or history is a health question even when the summary lists
+none. A question about using
+this assistant (uploading, comparing reports) is never "refuse" even if the answer is that
+it cannot.
 
 Write "reply" as one or two plain sentences that redirect rather than scold: state
 briefly that this is outside what you cover, then name something concrete the user could
@@ -206,6 +254,7 @@ export async function guardQuestion({
             reply: "",
             conversational: false,
             guardFailed: false,
+            guardedBy: null,
         };
     }
 
@@ -214,18 +263,44 @@ export async function guardQuestion({
         { question, history, reportSummary },
         async () => {
             try {
-                const { object } = await generateObject({
-                    model: geminiModel,
-                    schema: GuardSchema,
-                    // This is a classifier, not a writer. At the provider default the
-                    // same question can land on different intents between runs, which
-                    // would show up as a chat that refuses a question it answered a
-                    // minute ago. Pinning to 0 makes routing near-deterministic; the
-                    // small loss in phrasing variety for `reply` is a fair trade for a
-                    // decision the user can rely on.
-                    temperature: 0,
-                    prompt: buildPrompt(question, history, reportSummary),
-                });
+                const prompt = buildPrompt(question, history, reportSummary);
+                let guardedBy: "groq" | "gemini" = "gemini";
+                let groqError: string | undefined;
+                let groqTokens: number | null = null;
+                let object: QueryGuard | undefined;
+                if (GUARD_PROVIDER === "groq") {
+                    try {
+                        const result = await groqStructured(
+                            GROQ_GUARD_MODEL,
+                            prompt,
+                            "query_guard",
+                            GUARD_JSON_SCHEMA
+                        );
+                        object = GuardSchema.parse(result.content);
+                        groqTokens = result.tokens;
+                        guardedBy = "groq";
+                    } catch (error) {
+                        // Fall back rather than fail open, as the grader and judge do: a
+                        // failed-open guard answers off-topic questions and caches them.
+                        // Gemini's own failure still fails open below.
+                        groqError = error instanceof Error ? error.message : String(error);
+                        console.error("Groq guard failed; falling back to Gemini:", groqError);
+                    }
+                }
+                object ??= (
+                    await generateObject({
+                        model: geminiModel,
+                        schema: GuardSchema,
+                        // This is a classifier, not a writer. At the provider default the
+                        // same question can land on different intents between runs, which
+                        // would show up as a chat that refuses a question it answered a
+                        // minute ago. Pinning to 0 makes routing near-deterministic; the
+                        // small loss in phrasing variety for `reply` is a fair trade for a
+                        // decision the user can rely on.
+                        temperature: 0,
+                        prompt,
+                    })
+                ).object;
 
                 // The schema constrains shape, not sense. Normalise the two combinations
                 // that would otherwise surface as a broken turn: an "answer" with nothing
@@ -247,6 +322,9 @@ export async function guardQuestion({
                     rewritten: resolvedQuestion !== question,
                     hasReport,
                     guardFailed: false,
+                    guardedBy,
+                    ...(groqError ? { groqFallback: groqError } : {}),
+                    ...(groqTokens !== null ? { guardTokens: groqTokens } : {}),
                 });
 
                 return {
@@ -258,6 +336,7 @@ export async function guardQuestion({
                     // turn that never reaches the generator anyway.
                     conversational: object.intent === "answer" && object.conversational,
                     guardFailed: false,
+                    guardedBy,
                 };
             } catch (error) {
                 // Fail OPEN, matching how this codebase treats Redis and memory
@@ -289,6 +368,7 @@ export async function guardQuestion({
                     // answer without the report.
                     conversational: false,
                     guardFailed: true,
+                    guardedBy: null,
                 };
             }
         },

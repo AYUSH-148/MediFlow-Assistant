@@ -1,4 +1,4 @@
-import { guardQuestion } from "@/lib/query-guard";
+import { GROQ_GUARD_MODEL, GUARD_PROVIDER, guardQuestion } from "@/lib/query-guard";
 import { GUARD_CASES, type GuardCase } from "../dataset/guard";
 import { getReport } from "../fixtures/reports";
 import { EVAL_CONCURRENCY, mapWithConcurrency } from "../lib/concurrency";
@@ -42,6 +42,7 @@ export interface GuardCaseResult {
    * own path because it never throws.
    */
   attempts: number;
+  guardedBy: "groq" | "gemini" | null;
   latencyMs: number;
 }
 
@@ -98,7 +99,12 @@ async function runCase(
     },
     {
       label: `guard ${testCase.id}`,
-      retryResult: (result) => result.guardFailed,
+      // A Groq-to-Gemini fallback is retried too, so a Groq run scores Groq alone. Groq's
+      // limit is tokens per minute, hence the longer backoff - a 1.5s retry lands in the
+      // same window.
+      retryResult: (result) =>
+        result.guardFailed || (GUARD_PROVIDER === "groq" && result.guardedBy !== "groq"),
+      ...(GUARD_PROVIDER === "groq" ? { attempts: 6, baseDelayMs: 5000 } : {}),
       onRetry,
     }
   );
@@ -121,21 +127,28 @@ async function runCase(
     reply: guard.reply,
     guardFailed: guard.guardFailed,
     attempts,
+    guardedBy: guard.guardedBy,
     latencyMs,
   };
 }
 
+// GUARD_ONLY=id1,id2 runs just those cases - a full run is 33 calls and the Gemini free
+// tier allows 20 a day, so the Gemini baseline has to be taken in batches.
+const ONLY = process.env.GUARD_ONLY?.split(",").map((id) => id.trim()).filter(Boolean);
+const SELECTED_CASES = ONLY?.length ? GUARD_CASES.filter((c) => ONLY.includes(c.id)) : GUARD_CASES;
+
 export async function runGuardSuite(
   log: (line: string) => void = console.log
 ): Promise<GuardSuiteResult> {
-  log(`Running ${GUARD_CASES.length} guard cases (concurrency ${EVAL_CONCURRENCY})...`);
+  const guardLabel = GUARD_PROVIDER === "groq" ? `groq ${GROQ_GUARD_MODEL}` : "gemini";
+  log(`Running ${SELECTED_CASES.length} guard cases with ${guardLabel} (concurrency ${EVAL_CONCURRENCY})...`);
 
   const retries = createRetryCounter();
 
-  const cases = await mapWithConcurrency(GUARD_CASES, EVAL_CONCURRENCY, async (testCase, index) => {
+  const cases = await mapWithConcurrency(SELECTED_CASES, EVAL_CONCURRENCY, async (testCase, index) => {
     const result = await runCase(testCase, retries.onRetry);
     log(
-      `  [${String(index + 1).padStart(2)}/${GUARD_CASES.length}] ${testCase.id.padEnd(34)} ` +
+      `  [${String(index + 1).padStart(2)}/${SELECTED_CASES.length}] ${testCase.id.padEnd(34)} ` +
         `${result.actualIntent}` +
         `${result.actualIntent === result.expectedIntent ? "" : ` (expected ${result.expectedIntent})`}` +
         // Called out inline as well as in the report: watching a run scroll past is when
@@ -183,9 +196,9 @@ export async function runGuardSuite(
   ]);
 
   const report = [
-    heading("QUERY GUARD"),
+    heading(`QUERY GUARD - ${guardLabel}`),
     "",
-    `Cases: ${GUARD_CASES.length} ` +
+    `Cases: ${SELECTED_CASES.length} ` +
       `(${cases.filter((c) => c.expectedIntent === "answer").length} answer, ` +
       `${cases.filter((c) => c.expectedIntent === "clarify").length} clarify, ` +
       `${cases.filter((c) => c.expectedIntent === "refuse").length} refuse).`,
@@ -224,6 +237,13 @@ export async function runGuardSuite(
           retries.count()
             ? `${cases.filter((r) => r.attempts > 1).length} case(s) needed a retry - latency figures include them`
             : "none",
+        ],
+        [
+          // With GUARD_PROVIDER=groq, any gemini count is a Groq fallback, and the figures
+          // below mix two models.
+          "decided by groq / gemini",
+          `${cases.filter((r) => r.guardedBy === "groq").length} / ${cases.filter((r) => r.guardedBy === "gemini").length}`,
+          GUARD_PROVIDER === "groq" ? "gemini = fallbacks" : "gemini selected",
         ],
         ["intent accuracy", pct(confusion.accuracy()), `${cases.length} cases`],
         [
@@ -283,7 +303,7 @@ export async function runGuardSuite(
       : "Serial run.",
     formatTable(
       ["stage", "p50", "p95", "max", "mean"],
-      [["query guard (Gemini)", ms(latency.p50), ms(latency.p95), ms(latency.max), ms(latency.mean)]]
+      [[`query guard (${guardLabel})`, ms(latency.p50), ms(latency.p95), ms(latency.max), ms(latency.mean)]]
     ),
     "",
     "The guard runs on EVERY chat turn, before the cache lookup, so this cost is paid",

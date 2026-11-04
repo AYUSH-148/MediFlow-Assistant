@@ -14,6 +14,9 @@ npm run eval:build      # ingest the fixtures into Pinecone (run once, and after
 npm run eval            # all four suites
 npm run eval:retrieval  # one suite at a time
 npm run eval:guard
+# Guard on Groq. A Groq-to-Gemini fallback is retried rather than scored; the invalid
+# Gemini key makes each fallback fail fast instead of spending the 20-a-day Gemini quota.
+GUARD_PROVIDER=groq GEMINI_API_KEY=disabled npm run eval:guard
 npm run eval:cache
 npm run eval:judge                      # answer check, judged by Gemini
 JUDGE_PROVIDER=groq npm run eval:judge  # same prompt and cases, judged by Groq openai/gpt-oss-120b
@@ -47,7 +50,7 @@ uses:
 | Suite | Requires |
 |---|---|
 | retrieval | `PINECONE_API_KEY`, `GEMINI_API_KEY`, plus `GROQ_API_KEY` with `GRADER_PROVIDER=groq` |
-| guard | `GEMINI_API_KEY` |
+| guard | `GEMINI_API_KEY`, plus `GROQ_API_KEY` with `GUARD_PROVIDER=groq` |
 | cache | `PINECONE_API_KEY`, `GEMINI_API_KEY`, `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` |
 | judge | `GEMINI_API_KEY`, or `GROQ_API_KEY` with `JUDGE_PROVIDER=groq` |
 
@@ -56,6 +59,9 @@ uses:
 | `EVAL_PINECONE_INDEX` | `medic` | Index to build the corpus in |
 | `EVAL_PINECONE_NAMESPACE` | `eval-diagnosis2` | Namespace, never `diagnosis2` |
 | `JUDGE_PROVIDER` | `gemini` | Which judge the suite measures - the same variable picks the app's judge |
+| `GUARD_PROVIDER` | `gemini` | Which guard the guard suite measures - the same variable picks the app's guard. The report counts Groq-to-Gemini fallbacks |
+| `GUARD_ONLY` | all | Comma-separated guard case ids - the Gemini free tier's 20 calls a day is fewer than one full run |
+| `GROQ_GUARD_MODEL` | `openai/gpt-oss-120b` | Groq model for the guard, to compare candidates |
 | `GRADER_PROVIDER` | `gemini` | Which grader the retrieval suite measures - the same variable picks the app's grader. The report counts Groq-to-Gemini fallbacks |
 | `JUDGE_ONLY` | all | Comma-separated case ids, to rerun a few cases |
 | `EVAL_CONCURRENCY` | `1` | Cases in flight. Above 1 the latency figures measure contention, and the report says so |
