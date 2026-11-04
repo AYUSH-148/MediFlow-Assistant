@@ -13,7 +13,7 @@ type SuiteName = (typeof SUITES)[number];
 const REQUIRED_ENV: Record<SuiteName, string[]> = {
   // GRADER_PROVIDER=groq grades with Groq, as it does in the app; see lib/retrieval-grader.ts.
   retrieval: ["PINECONE_API_KEY", "GEMINI_API_KEY", ...(process.env.GRADER_PROVIDER === "groq" ? ["GROQ_API_KEY"] : [])],
-  guard: ["GEMINI_API_KEY"],
+  guard: ["GEMINI_API_KEY", ...(process.env.GUARD_PROVIDER === "groq" ? ["GROQ_API_KEY"] : [])],
   cache: ["PINECONE_API_KEY", "GEMINI_API_KEY", "UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN"],
   // JUDGE_PROVIDER=groq judges with Groq, as it does in the app; see lib/answer-checker.ts.
   judge: [process.env.JUDGE_PROVIDER === "groq" ? "GROQ_API_KEY" : "GEMINI_API_KEY"],
