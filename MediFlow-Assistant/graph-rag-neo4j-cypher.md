@@ -53,8 +53,12 @@ The Cypher used is:
 ```cypher
 MERGE (a:Entity {name: $subject})
 MERGE (b:Entity {name: $object})
-MERGE (a)-[:RELATIONSHIP {type: $predicate}]->(b)
+MERGE (a)-[:RELATIONSHIP {type: $predicate, documentId: $documentId}]->(b)
 ```
+
+Nodes carrying patient data are also keyed by `documentId`. Every relationship is: each
+triple comes from one patient's report, so lookups only return relationships from the
+report the chat is about.
 
 `MERGE` ensures duplicate nodes or relationships are not created if the same triple is inserted again.
 
