@@ -449,8 +449,15 @@ function isDocumentPrivate(text: string, vault?: TokenVault): boolean {
  *
  * `documentId` scopes entities carrying patient data (e.g. "[NAME_1]") to the document
  * they came from, so the same token reused across different patients' reports does not
- * merge into one shared node. Generic medical terms ("Aspirin") are left unscoped so the
- * graph still shares that knowledge across documents.
+ * merge into one shared node. Generic medical terms ("Aspirin") stay unscoped NODES, one
+ * per name.
+ *
+ * Every EDGE is scoped to its document, generic-to-generic included. Edges used to be
+ * shared on the theory that "Atorvastatin TREATS Dyslipidemia" is general knowledge, but
+ * every triple here was extracted from one patient's report and says what that report
+ * says: patient A's "Metformin PLANNED_FOR Prediabetes" was returned to patient B, and the
+ * answer check counts graph lookups as evidence, so B's answer could state it as B's own
+ * plan and pass. Scoping nodes alone could not stop that - the nodes involved are generic.
  *
  * Pass `vault` so scoping is decided against what redaction actually found rather than
  * the shape of the string alone - see isDocumentPrivate. Omitting it weakens the decision
@@ -519,10 +526,16 @@ export async function storeTriplesInNeo4j(
             ? `MERGE (b:Entity {name: $object, documentId: $documentId})`
             : `MERGE (b:Entity {name: $object})`;
 
+          // Without a documentId the edge is written unscoped, and queryNeo4jRelationships
+          // never returns it - the same treatment as an unscopeable private node.
+          const edgeMerge = documentId
+            ? `MERGE (a)-[:RELATIONSHIP {type: $predicate, documentId: $documentId}]->(b)`
+            : `MERGE (a)-[:RELATIONSHIP {type: $predicate}]->(b)`;
+
           await session.run(
             `${subjectMerge}
              ${objectMerge}
-             MERGE (a)-[:RELATIONSHIP {type: $predicate}]->(b)`,
+             ${edgeMerge}`,
             { subject, predicate, object, documentId }
           );
         }
@@ -591,9 +604,14 @@ function serializeNeo4jPath(path: any): any {
  *
  * Only the shape can be tested here - the entity name comes from the model, which has
  * only seen redacted text. The vault-value half of the decision belongs on the write
- * path. With no documentId, `b.documentId = null` is UNKNOWN rather than true, so the
- * predicate collapses to the generic-only branch: the right reading of "no report
- * attached".
+ * path.
+ *
+ * The EDGE must belong to this document as well (see storeTriplesInNeo4j): a generic
+ * neighbour passes the node filter, but the relationship to it was extracted from
+ * whichever report created it. Edges written before edges were scoped carry no
+ * documentId and are never returned; re-uploading a report rewrites its edges. With no
+ * documentId, `r.documentId = null` is UNKNOWN rather than true, so nothing is returned:
+ * with no report attached there is no patient graph to read.
  */
 export async function queryNeo4jRelationships(entities: string[], documentId?: string) {
   const driver = getNeo4jDriver();
@@ -616,8 +634,9 @@ export async function queryNeo4jRelationships(entities: string[], documentId?: s
 
       const result = await session.run(
         `${matchClause}
-         WHERE (b.documentId IS NULL AND NOT b.name =~ $tokenPattern)
-            OR b.documentId = $documentId
+         WHERE r.documentId = $documentId
+           AND ((b.documentId IS NULL AND NOT b.name =~ $tokenPattern)
+            OR b.documentId = $documentId)
          RETURN a.name AS source, r.type AS relationship, b.name AS target
          LIMIT 10`,
         {

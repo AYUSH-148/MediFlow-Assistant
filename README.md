@@ -270,6 +270,8 @@ Extracted `(subject, predicate, object)` triples land in Neo4j. Rather than pref
 
 The subtle part is **scoping the neighbour, not just the queried node**. Generic entities like `Atorvastatin` are deliberately unscoped so knowledge is shared across documents — which means traversing out of one would return the `[NAME_n]` nodes of every patient ever prescribed it. The chat route then rehydrates through the *current* document's vault, resolving another patient's token to this patient's name. The model would confidently state a relationship belonging to someone else, and nothing about the output would look wrong. A neighbour is therefore admitted only when it is genuinely generic or explicitly scoped to this document.
 
+Scoping nodes was not enough, because **edges** were still shared. Every triple comes from one patient's report, so patient A's `Metformin -PLANNED_FOR-> Prediabetes` connected two generic nodes and was returned to patient B — and the answer check counts graph lookups as evidence. Each relationship now carries the `documentId` of the report it came from, and lookups return only this report's edges.
+
 ### 🚨 Failing visibly on the generation path
 
 The guard fails open and the cache degrades quietly, but generation had no equivalent. A
