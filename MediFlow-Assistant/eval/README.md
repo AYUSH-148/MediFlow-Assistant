@@ -27,6 +27,13 @@ rather than silently re-ingesting, because a fixture edited without a rebuild pr
 gold labels describing text the index does not contain — which looks exactly like a
 retrieval regression.
 
+The same check covers the embedding model. The manifest records which model embedded the
+corpus, and a suite refuses to start if that differs from `EMBEDDING_MODEL_ID`, since
+query and chunk vectors from two models cannot be compared. A corpus built on mxbai before
+the move to `gemini-embedding-001` went unnoticed this way: the dense arm returned noise,
+TF-IDF carried the ranking alone, and recall@1 read 27.8% instead of 75.9%. A manifest
+without the field counts as a mismatch.
+
 ### Retries
 
 Suites retry transient failures with exponential backoff and report how many they needed,
@@ -38,6 +45,13 @@ so a rate limit resolves as a well-formed `intent: "answer"` carrying `guardFail
 invisible to a retry that watches for exceptions. It therefore retries on that flag via
 `withRetry`'s `retryResult`, and a case that still fails open after its retries is counted
 as an outage that voids the run's metrics rather than scored as a routing decision.
+
+The retrieval suite does the same for the grader: `gradeRetrieval` fails open as
+`ungraded: true`, and that is retried. With either provider set to Groq, a Groq-to-Gemini
+fallback (`guardedBy`/`gradedBy` of `gemini`) is retried too, so a Groq run scores Groq
+alone. Groq runs get 6 attempts from a 5s base delay, because Groq's free tier limits
+tokens per minute and a short retry lands in the same window. Before the grader retry, a
+Groq run hit that limit on back-to-back cases and left 21 of 61 cases ungraded.
 
 Note that the AI SDK already retries a 429 twice inside a single `generateObject` call, so
 `guardFailed` means the failure survived those too.

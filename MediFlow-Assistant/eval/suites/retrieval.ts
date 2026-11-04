@@ -71,11 +71,12 @@ async function runCase(
   // sends.
   const query = buildRetrievalQuery(testCase.question);
 
-  // Retrieval throws on an embedding or Pinecone failure, so it is retried. Grading is
-  // not: gradeRetrieval catches its own errors and fails open, which means a transient
-  // Gemini failure arrives here as `ungraded: true` rather than as an exception. That is
-  // why the ungraded count is reported - it is the only signal separating "the grader
-  // was unavailable" from "the grader made this call".
+  // Retrieval throws on an embedding or Pinecone failure, so it is retried on the error
+  // path. Grading needs `retryResult` instead: gradeRetrieval catches its own errors and
+  // fails open, so a transient failure arrives here as `ungraded: true` rather than as an
+  // exception. The ungraded count is still reported - a case that stays ungraded after
+  // its retries is the only signal separating "the grader was unavailable" from "the
+  // grader made this call".
   const retrieveStart = performance.now();
   const retrieval = await withRetry(
     () =>
@@ -100,11 +101,26 @@ async function runCase(
   // The grader receives the BARE question, not the summary-prefixed query - that
   // asymmetry is the whole design of the corrective step.
   const gradeStart = performance.now();
-  const graded = await gradeRetrieval({
-    question: testCase.question,
-    retrievalText: retrieval.text,
-    chunks: retrieval.chunks,
-  });
+  const graded = await withRetry(
+    () =>
+      gradeRetrieval({
+        question: testCase.question,
+        retrievalText: retrieval.text,
+        chunks: retrieval.chunks,
+      }),
+    {
+      label: `grade ${testCase.id}`,
+      // Same policy as the guard suite: a Groq-to-Gemini fallback is retried too, so a
+      // Groq run scores Groq alone. Groq gpt-oss-20b's limit is 8K tokens per minute and
+      // back-to-back cases blow through it, so the backoff is long enough to leave the
+      // window. `gradedBy === "gemini"` rather than `!== "groq"`: a case with no chunks
+      // is never sent to a model and comes back `gradedBy: null`, which is not a failure.
+      retryResult: (result) =>
+        result.ungraded || (GRADER_PROVIDER === "groq" && result.gradedBy === "gemini"),
+      ...(GRADER_PROVIDER === "groq" ? { attempts: 6, baseDelayMs: 5000 } : {}),
+      onRetry,
+    }
+  );
   const gradeMs = performance.now() - gradeStart;
 
   return {
