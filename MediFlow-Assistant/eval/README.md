@@ -144,16 +144,23 @@ Reported:
 - **false hit rate** — a hit here replays one question's answer for a different question,
   and because it is served through the static-answer path the user sees no indication
   anything was reused.
-- **threshold sweep** — hit rate and false-hit rate at thresholds from 0.80 to 0.99, and
-  whether the two populations separate at all. The production threshold of 0.95 was never
-  chosen against measured data; this is that data.
+- **judge in the grey band** — every pair whose similarity falls between
+  `CACHE_JUDGE_FLOOR` and `CACHE_AUTO_HIT_SIMILARITY` (`lib/cache.ts`), with the judge's
+  verdict and whether it was right. The judge fails closed, so a judge failure is counted
+  on its own row rather than scored as a correct "different"; failures understate the
+  paraphrase hit rate.
+- **threshold sweep** — what a similarity-only cache would do at thresholds from 0.80 to
+  0.99, judge aside, and whether the two populations separate at all. The bands were read
+  from this: on gemini-embedding-001 they overlap (antigen/antibody at 0.985, "free T4" /
+  "FT4 level" at 0.948), so no single threshold is both safe and useful.
 - **lookup scaling** — `getCachedResponse` reads the report's index set (`SMEMBERS`), then
   `MGET`s every entry in it and compares in process, so cost is linear in cached questions. Entries live 24h,
   so a busy report accumulates them all day.
 
 A **measurement self-check** recomputes each pair's cosine independently and compares it
-to what the lookup actually did. `getCachedResponse` swallows Redis and embedding failures
-and returns `null`, which is indistinguishable from a genuine miss — without this check, a
+to what the lookup should have done (hit at auto-hit, miss below the floor, the judge's
+verdict in between). `getCachedResponse` swallows Redis and embedding failures and
+returns a null answer, which is indistinguishable from a genuine miss — without this check, a
 run degraded by infrastructure would report a low hit rate as if it were a threshold
 finding.
 

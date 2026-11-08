@@ -481,9 +481,8 @@ async function handleChat({
     // every other session holding the same report, for 24h.
     const conversational = guard.conversational;
 
-    const cachedAnswer = conversational
-        ? null
-        : await getCachedResponse(effectiveQuestion, reportData, 0.95);
+    const cacheLookup = conversational ? null : await getCachedResponse(effectiveQuestion, reportData);
+    const cachedAnswer = cacheLookup?.answer ?? null;
 
     if (cachedAnswer) {
         const vault = await getVault(vaultId);
@@ -791,9 +790,10 @@ async function handleChat({
             ]),
             // Only a verified answer is cached: a cache entry is replayed to every session
             // holding this report for 24h, through a path that never checks again. The
-            // redacted text is cached, never the rehydrated one.
+            // redacted text is cached, never the rehydrated one. The lookup's embedding is
+            // of this same question, so it is reused rather than computed again.
             check && !check.checkFailed
-                ? cacheResponse(effectiveQuestion, answer, reportData)
+                ? cacheResponse(effectiveQuestion, answer, reportData, cacheLookup?.embedding)
                 : undefined,
         ]);
     }
