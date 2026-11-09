@@ -1,5 +1,6 @@
 import { createHash } from "crypto";
 import { Redis } from "@upstash/redis";
+import { judgeCacheMatch, type CacheJudgeVerdict } from "@/lib/cache-judge";
 import { generateEmbedding } from "@/lib/embeddings";
 import { span, setSpanMetadata, textShape } from "@/lib/tracing";
 
@@ -83,26 +84,58 @@ interface CacheEntry {
 }
 
 /**
- * Return a cached answer for a semantically similar question, or null.
+ * Similarity bands for gemini-embedding-001 with the SEMANTIC_SIMILARITY task type, from
+ * the 44-pair cache eval. At or above AUTO_HIT the answer is reused outright: no
+ * near-miss question reached it. Between JUDGE_FLOOR and AUTO_HIT both kinds land - the
+ * loosest paraphrase scored 0.948, the closest near-miss 0.985 - so an LLM judge decides
+ * (see @/lib/cache-judge). Below JUDGE_FLOOR is a miss without asking.
+ *
+ * Tied to the embedding model: changing it means re-running `npm run eval:cache`.
+ */
+export const CACHE_AUTO_HIT_SIMILARITY = 0.99;
+export const CACHE_JUDGE_FLOOR = 0.94;
+
+export interface CacheLookup {
+  answer: string | null;
+  /**
+   * The question's embedding, so a verified fresh answer can be cached without embedding
+   * the same text a second time. Null when the embedding call itself failed.
+   */
+  embedding: number[] | null;
+  /** Closest cached question's similarity; 0 with nothing to compare against. */
+  bestSimilarity: number;
+  /** The judge's verdict when the best match was in the grey band, otherwise null. */
+  judge: CacheJudgeVerdict | null;
+}
+
+/**
+ * Return a cached answer for a question asking the same thing, or a null answer.
  *
  * The question is post-redaction and the cached answer is pre-rehydration, but neither
  * is guaranteed identifier-free - the PII rules only catch labelled shapes - so both
  * sides are PHI-gated.
  *
+ * Only the CLOSEST entry is considered. Returning the first entry over the threshold, as
+ * this used to, could serve a weaker match while a closer one sat later in the set - and
+ * with a judge in the loop, would spend the judge call on the wrong candidate.
+ *
  * `bestSimilarity` is recorded on misses too: without it, a threshold that never fires
  * is indistinguishable from a cache that is simply cold.
  */
-export async function getCachedResponse(
-  question: string,
-  reportData: string,
-  similarityThreshold: number = 0.95
-): Promise<string | null> {
+export async function getCachedResponse(question: string, reportData: string): Promise<CacheLookup> {
   return span(
     "semantic_cache_lookup",
-    { question, threshold: similarityThreshold },
+    { question, autoHit: CACHE_AUTO_HIT_SIMILARITY, judgeFloor: CACHE_JUDGE_FLOOR },
     async () => {
+      let currentEmbedding: number[] | null = null;
+      const miss = (bestSimilarity = 0): CacheLookup => ({
+        answer: null,
+        embedding: currentEmbedding,
+        bestSimilarity,
+        judge: null,
+      });
       try {
-        const currentEmbedding = await generateEmbedding(question, "SEMANTIC_SIMILARITY");
+        currentEmbedding = await generateEmbedding(question, "SEMANTIC_SIMILARITY");
         const reportHash = generateReportHash(reportData);
 
         // Entries written before this index existed are unreachable here and expire with
@@ -111,7 +144,7 @@ export async function getCachedResponse(
 
         if (keys.length === 0) {
           setSpanMetadata({ cacheHit: false, entriesScanned: 0, reason: "empty-namespace" });
-          return null;
+          return miss();
         }
 
         // One round trip for every entry under this report.
@@ -129,6 +162,8 @@ export async function getCachedResponse(
             .catch((error) => console.error("Error pruning cache index:", error));
         }
 
+        let best: CacheEntry | null = null;
+        let bestKey: string | null = null;
         let bestSimilarity = 0;
         let comparable = 0;
         for (let i = 0; i < keys.length; i++) {
@@ -139,34 +174,35 @@ export async function getCachedResponse(
           }
           comparable++;
 
-          const similarity = cosineSimilarity(
-            currentEmbedding,
-            cachedData.embedding
-          );
-          if (similarity > bestSimilarity) bestSimilarity = similarity;
-
-          if (similarity >= similarityThreshold) {
-            setSpanMetadata({
-              cacheHit: true,
-              similarity,
-              entriesScanned: keys.length,
-              comparableEntries: comparable,
-              matchedKey: keys[i],
-            });
-            return cachedData.answer;
+          const similarity = cosineSimilarity(currentEmbedding, cachedData.embedding);
+          if (similarity > bestSimilarity) {
+            bestSimilarity = similarity;
+            best = cachedData;
+            bestKey = keys[i];
           }
         }
 
-        setSpanMetadata({
-          cacheHit: false,
+        const scan = {
           bestSimilarity,
           entriesScanned: keys.length,
           comparableEntries: comparable,
           // A gap between these two is the index carrying keys whose entries have expired.
           stalePruned: stale.length,
-          reason: "below-threshold",
-        });
-        return null;
+        };
+
+        if (!best || bestSimilarity < CACHE_JUDGE_FLOOR) {
+          setSpanMetadata({ cacheHit: false, ...scan, reason: "below-threshold" });
+          return miss(bestSimilarity);
+        }
+
+        const judge = bestSimilarity >= CACHE_AUTO_HIT_SIMILARITY ? null : await judgeCacheMatch(best.question, question);
+        if (judge !== null && judge !== "same") {
+          setSpanMetadata({ cacheHit: false, ...scan, reason: `judge-${judge}` });
+          return { ...miss(bestSimilarity), judge };
+        }
+
+        setSpanMetadata({ cacheHit: true, ...scan, matchedKey: bestKey, judged: judge !== null });
+        return { answer: best.answer, embedding: currentEmbedding, bestSimilarity, judge };
       } catch (error) {
         console.error("Error in getCachedResponse:", error);
         // Swallowed so a Redis outage degrades to a cache miss rather than a failed
@@ -176,30 +212,45 @@ export async function getCachedResponse(
           reason: "error",
           swallowedError: error instanceof Error ? error.message : String(error),
         });
-        return null;
+        return miss();
       }
     },
     {
       runType: "retriever",
       tags: ["cache", "redis"],
-      safeInputs: { threshold: similarityThreshold, ...textShape("question", question) },
-      safeOutputs: (answer) => ({
-        cacheHit: answer !== null,
-        ...textShape("answer", answer),
+      safeInputs: {
+        autoHit: CACHE_AUTO_HIT_SIMILARITY,
+        judgeFloor: CACHE_JUDGE_FLOOR,
+        ...textShape("question", question),
+      },
+      safeOutputs: (lookup) => ({
+        cacheHit: lookup.answer !== null,
+        bestSimilarity: lookup.bestSimilarity,
+        judge: lookup.judge,
+        ...textShape("answer", lookup.answer),
       }),
-      recordOutputs: (answer) => ({
-        cacheHit: answer !== null,
-        answer: answer ?? null,
+      recordOutputs: (lookup) => ({
+        cacheHit: lookup.answer !== null,
+        bestSimilarity: lookup.bestSimilarity,
+        judge: lookup.judge,
+        answer: lookup.answer,
       }),
     }
   );
 }
 
-/** Cache a question/answer pair, storing the embedding for future similarity checks. */
+/**
+ * Cache a question/answer pair, storing the embedding for future similarity checks.
+ *
+ * Pass the embedding from this question's own lookup when there is one: it is the same
+ * text with the same task type, so embedding it again would spend a call of the
+ * embedding quota for an identical vector.
+ */
 export async function cacheResponse(
   question: string,
   answer: string,
   reportData: string,
+  questionEmbedding?: number[] | null,
   ttlSeconds: number = 86400 // 24 hours default
 ): Promise<void> {
   await span(
@@ -207,7 +258,7 @@ export async function cacheResponse(
     { question, answer, ttlSeconds },
     async () => {
       try {
-        const embedding = await generateEmbedding(question, "SEMANTIC_SIMILARITY");
+        const embedding = questionEmbedding ?? (await generateEmbedding(question, "SEMANTIC_SIMILARITY"));
         const reportHash = generateReportHash(reportData);
         const questionHash = generateReportHash(question);
         const cacheKey = `${getCacheKeyPrefix(reportHash)}:${questionHash}`;

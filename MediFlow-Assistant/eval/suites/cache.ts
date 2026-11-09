@@ -1,9 +1,12 @@
 import {
+  CACHE_AUTO_HIT_SIMILARITY,
+  CACHE_JUDGE_FLOOR,
   cacheResponse,
   clearCacheForReport,
   cosineSimilarity,
   getCachedResponse,
 } from "@/lib/cache";
+import { CACHE_JUDGE_PROVIDER, type CacheJudgeVerdict } from "@/lib/cache-judge";
 import { generateEmbedding } from "@/lib/embeddings";
 import { findIngested, loadCorpus } from "../lib/corpus";
 import { CACHE_PAIRS, type CachePair } from "../dataset/cache";
@@ -11,10 +14,7 @@ import { EVAL_CONCURRENCY, mapWithConcurrency } from "../lib/concurrency";
 import { createRetryCounter, withRetry } from "../lib/retry";
 import { formatTable, heading, mean, ms, pct, subheading, summarizeLatency } from "../lib/metrics";
 
-/** The threshold the chat route passes to getCachedResponse today. */
-const PRODUCTION_THRESHOLD = 0.95;
-
-const SWEEP = [0.8, 0.82, 0.84, 0.86, 0.88, 0.9, 0.91, 0.92, 0.93, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99];
+const SWEEP = [0.8, 0.82, 0.84, 0.86, 0.88, 0.9, 0.91, 0.92, 0.93, 0.94, 0.95, 0.96, 0.97, 0.975, 0.98, 0.985, 0.99];
 
 /** How many entries to preload when measuring how lookup cost scales with cache size. */
 const SCALING_STEPS = [1, 5, 10, 25];
@@ -26,8 +26,10 @@ export interface CachePairResult {
   probe: string;
   relation: "paraphrase" | "distinct";
   similarity: number;
-  /** What getCachedResponse actually did at the production threshold. */
+  /** What getCachedResponse actually did, judge included. */
   hit: boolean;
+  /** The judge's verdict when the lookup's best match was in the grey band. */
+  judge: CacheJudgeVerdict | null;
   correct: boolean;
   lookupMs: number;
 }
@@ -53,7 +55,7 @@ async function runPair(
   await cacheResponse(pair.seed, `Cached answer for: ${pair.seed}`, reportData);
 
   const start = performance.now();
-  const cached = await getCachedResponse(pair.probe, reportData, PRODUCTION_THRESHOLD);
+  const lookup = await getCachedResponse(pair.probe, reportData);
   const lookupMs = performance.now() - start;
 
   // Measured independently of the lookup above so the sweep has a similarity for every
@@ -62,7 +64,7 @@ async function runPair(
   const probeVector = await withRetry(() => generateEmbedding(pair.probe, "SEMANTIC_SIMILARITY"), { onRetry });
   const similarity = cosineSimilarity(seedVector, probeVector);
 
-  const hit = cached !== null;
+  const hit = lookup.answer !== null;
   const shouldHit = pair.relation === "paraphrase";
 
   await clearCacheForReport(reportData);
@@ -75,6 +77,7 @@ async function runPair(
     relation: pair.relation,
     similarity,
     hit,
+    judge: lookup.judge,
     correct: hit === shouldHit,
     lookupMs,
   };
@@ -107,8 +110,7 @@ async function measureScaling(reportData: string, log: (line: string) => void): 
     const start = performance.now();
     await getCachedResponse(
       "What is the collection date printed at the top of this report?",
-      reportData,
-      PRODUCTION_THRESHOLD
+      reportData
     );
     const lookupMs = performance.now() - start;
 
@@ -137,6 +139,7 @@ export async function runCacheSuite(
     log(
       `  [${String(index + 1).padStart(2)}/${CACHE_PAIRS.length}] ${pair.id.padEnd(26)} ` +
         `sim=${result.similarity.toFixed(4)} ${result.hit ? "HIT " : "miss"} ` +
+        `${result.judge ? `judge=${result.judge} ` : ""}` +
         `${result.correct ? "ok" : "WRONG"}`
     );
     return result;
@@ -153,14 +156,14 @@ export async function runCacheSuite(
 
   const latency = summarizeLatency(cases.map((c) => c.lookupMs));
 
-  // Sweep the threshold over the measured similarities. This is the number the current
-  // 0.95 was never chosen against: it shows how much headroom, if any, separates the two
-  // populations.
+  // Sweep the threshold over the measured similarities: what a similarity-only cache
+  // would do at each cut-off, judge aside. It shows how much headroom, if any, separates
+  // the two populations, and is what the auto-hit and judge-floor bands were read from.
   const sweepRows = SWEEP.map((threshold) => {
     const caught = paraphrases.filter((c) => c.similarity >= threshold).length;
     const wrong = distincts.filter((c) => c.similarity >= threshold).length;
     return [
-      threshold === PRODUCTION_THRESHOLD ? `${threshold.toFixed(2)} <- current` : threshold.toFixed(2),
+      threshold === CACHE_AUTO_HIT_SIMILARITY ? `${threshold.toFixed(3)} <- auto-hit` : threshold.toFixed(3),
       `${caught}/${paraphrases.length}`,
       pct(caught / Math.max(paraphrases.length, 1), 0),
       `${wrong}/${distincts.length}`,
@@ -179,12 +182,27 @@ export async function runCacheSuite(
     : 0;
 
   // Self-check on the measurement itself. getCachedResponse swallows Redis and embedding
-  // failures and returns null, which is indistinguishable from a genuine miss - so a run
-  // degraded by infrastructure would quietly report a low paraphrase hit rate as if it
-  // were a threshold finding. Recomputing the similarity here gives an independent
-  // prediction of what the lookup should have done; any disagreement means the observed
-  // hit rate below is not measuring what it claims to.
-  const anomalies = cases.filter((c) => (c.similarity >= PRODUCTION_THRESHOLD) !== c.hit);
+  // failures and returns a null answer, which is indistinguishable from a genuine miss -
+  // so a run degraded by infrastructure would quietly report a low paraphrase hit rate as
+  // if it were a threshold finding. Recomputing the similarity here gives an independent
+  // prediction of what the lookup should have done: hit at auto-hit, miss below the
+  // floor, the judge's verdict in between - and in between, a judge verdict must exist.
+  // Any disagreement means the observed rates below are not measuring what they claim to.
+  const inBand = (c: CachePairResult) =>
+    c.similarity >= CACHE_JUDGE_FLOOR && c.similarity < CACHE_AUTO_HIT_SIMILARITY;
+  const anomalies = cases.filter((c) => {
+    const expectedHit =
+      c.similarity >= CACHE_AUTO_HIT_SIMILARITY || (inBand(c) && c.judge === "same");
+    return expectedHit !== c.hit || inBand(c) !== (c.judge !== null);
+  });
+
+  // The judge measured on its own: only the pairs whose similarity put them in the band.
+  // A judge failure is a miss by design (it fails closed), so it is counted separately
+  // rather than scored as a correct "different" on a distinct pair.
+  const banded = cases.filter((c) => inBand(c) && c.judge !== null);
+  const judgeFailures = banded.filter((c) => c.judge === "failed");
+  const judged = banded.filter((c) => c.judge !== "failed");
+  const judgeCorrect = judged.filter((c) => (c.judge === "same") === (c.relation === "paraphrase"));
 
   const separation = {
     paraphraseMin: paraphrases.length ? Math.min(...paraphrases.map((c) => c.similarity)) : 0,
@@ -197,9 +215,9 @@ export async function runCacheSuite(
     heading("SEMANTIC RESPONSE CACHE"),
     "",
     `Pairs: ${CACHE_PAIRS.length} (${paraphrases.length} paraphrase, ${distincts.length} distinct). ` +
-      `Threshold under test: ${PRODUCTION_THRESHOLD}.`,
+      `Auto-hit at >= ${CACHE_AUTO_HIT_SIMILARITY}, judge (${CACHE_JUDGE_PROVIDER}) from ${CACHE_JUDGE_FLOOR} up to that.`,
     "",
-    subheading("Behaviour at the production threshold"),
+    subheading("Behaviour as configured (auto-hit + judge)"),
     formatTable(
       ["metric", "value", "detail"],
       [
@@ -228,12 +246,37 @@ export async function runCacheSuite(
             : `lookup disagreed with recomputed similarity (swallowed error?): ${anomalies.map((c) => c.id).join(", ")}`,
         ],
         [
+          "judge failures",
+          String(judgeFailures.length),
+          judgeFailures.length
+            ? `failed closed to a miss, so paraphrase hit rate understates: ${judgeFailures.map((c) => c.id).join(", ")}`
+            : "every grey-band lookup got a verdict",
+        ],
+        [
           "retries during run",
           String(retries.count()),
           "transient embedding failures re-attempted",
         ],
       ]
     ),
+    "",
+    subheading("Judge in the grey band"),
+    banded.length
+      ? formatTable(
+          ["pair", "relation", "similarity", "judge", "result"],
+          [...banded]
+            .sort((a, b) => b.similarity - a.similarity)
+            .map((c) => [
+              c.id,
+              c.relation,
+              c.similarity.toFixed(4),
+              c.judge ?? "",
+              c.judge === "failed" ? "failed closed" : c.correct ? "ok" : "WRONG",
+            ])
+        ) +
+        `
+Judge correct on ${judgeCorrect.length}/${judged.length} grey-band pairs.`
+      : "No pair landed in the grey band, so the judge was not exercised.",
     "",
     subheading("Similarity separation"),
     formatTable(
@@ -256,9 +299,9 @@ export async function runCacheSuite(
       sweepRows
     ),
     safest
-      ? `\nMost permissive threshold with zero false hits on this set: ${safest.toFixed(2)} ` +
+      ? `\nMost permissive threshold with zero false hits on this set: ${safest.toFixed(3)} ` +
         `(catches ${caughtAtSafest}/${paraphrases.length} paraphrases, against ` +
-        `${truePositives.length}/${paraphrases.length} at the current ${PRODUCTION_THRESHOLD}).`
+        `${truePositives.length}/${paraphrases.length} served with the judge).`
       : `\nNo swept threshold achieves zero false hits on this set.`,
     "",
     subheading("Lookup latency"),
