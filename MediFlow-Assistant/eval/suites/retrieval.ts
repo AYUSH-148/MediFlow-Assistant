@@ -79,9 +79,14 @@ async function runCase(
   const retrieveStart = performance.now();
   const retrieval = await withRetry(
     () =>
-      queryPineconeVectorStoreDetailed(pinecone, EVAL_INDEX, EVAL_NAMESPACE, query, {
-        documentId: { $eq: ingested.documentId },
-      }),
+      queryPineconeVectorStoreDetailed(
+        pinecone,
+        EVAL_INDEX,
+        EVAL_NAMESPACE,
+        query,
+        { documentId: { $eq: ingested.documentId } },
+        testCase.searchTerms
+      ),
     { label: `retrieve ${testCase.id}`, onRetry }
   );
   const retrieveMs = performance.now() - retrieveStart;

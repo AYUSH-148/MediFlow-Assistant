@@ -17,7 +17,7 @@ Most RAG demos stop at "chunk a PDF, embed it, stuff it in a prompt." The hard p
 | Problem | How it's solved |
 |---|---|
 | PHI must not reach the LLM, the vector DB, the cache, or the trace backend | Rule-based redaction into a Redis **token vault**, with rehydration at the last possible moment |
-| Clinical questions rarely use the report's exact wording | **Hybrid retrieval** — dense vectors + TF-IDF, fused with Reciprocal Rank Fusion |
+| Clinical questions rarely use the report's exact wording | **Hybrid retrieval** — dense vectors + BM25, fused with Reciprocal Rank Fusion; the guard adds aliases (SGPT → ALT) to the keyword query |
 | Nothing in a RAG pipeline naturally refuses, so trivia gets answered, cached, and stored as clinical memory | A **query guard** that routes to refuse / clarify / answer *before* anything expensive runs |
 | A vague follow-up ("is that bad?") means nothing to a cache keyed on question text | The guard **rewrites the question to stand alone**, so the cache key describes what was actually asked |
 | Retrieval always returns its top-k, so irrelevant chunks arrive labelled as evidence | **Corrective-RAG grading** against the bare question, with an explicit "not in your report" verdict |
@@ -74,8 +74,9 @@ Most RAG demos stop at "chunk a PDF, embed it, stuff it in a prompt." The hard p
                                    miss                                                   │
                                           ▼                                               │
                         hybrid retrieval (report only)                                    │
+                        one Pinecone query, topK 500                                      │
                         vector top-12 ┐                                                   │
-                        TF-IDF top-500┴─ RRF ─▶ top-10                                    │
+                        BM25 all      ┴─ RRF ─▶ top-10                                    │
                                           ▼                                               │
                   grade chunks against the question (corrective RAG)                      │
                   relevant / partial ─▶ keep survivors                                    │
@@ -180,11 +181,12 @@ the liver.
 
 Semantic search alone misses exact clinical terms; keyword search alone misses paraphrase. Both arms run over the **same document-filtered corpus** and are fused:
 
-- **Dense:** Pinecone `topK 12`, cosine, 1024-dim `gemini-embedding-001`.
-- **Sparse:** TF-IDF over a `topK 500` filtered corpus pull, with stop-word filtering.
+- **One query:** a single filtered Pinecone query, `topK 500`, cosine, 1024-dim `gemini-embedding-001`. For any report under 500 chunks it returns every chunk of the report, in similarity order.
+- **Dense:** the first 12 of that response. A separate `topK 12` query used to run first with the same vector and filter, so it returned exactly this prefix and cost a round trip per turn.
+- **Sparse:** BM25 (`k1 = 1.2`, `b = 0.75`) over the whole response, with stop-word filtering. Raw TF-IDF let a chunk that repeats a word six times outscore the chunk with the answer; BM25 saturates repeats and normalises for chunk length. The keyword query is the question plus the guard's `searchTerms`, aliases of its clinical terms (`SGPT` → `ALT alanine aminotransferase`, `FT4` → `free T4`), because the tokenizer has no notion of synonyms. The aliases never reach the embedding, so a wrong one can only mislead the keyword arm.
 - **Fusion:** Reciprocal Rank Fusion (`k = 60`), final `topK 10`.
 
-Both arms reuse a **single embedding call** — the query vector is computed once and passed into the keyword corpus fetch rather than recomputed.
+Both arms reuse a **single embedding call and a single Pinecone query**.
 
 **The query is the question alone**, embedded with the `RETRIEVAL_QUERY` task type (chunks use `RETRIEVAL_DOCUMENT`; the earlier `mxbai` model needed a text prefix instead). The whole report summary used to be prepended to it, which cost three things at once:
 

@@ -29,6 +29,10 @@ export function generateDocumentId(content: string): string {
   return createHash("sha256").update(content).digest("hex");
 }
 
+// The second group is the wording of a question rather than of a report. A report rarely
+// says "how" or "there", so idf rated them as rare, informative terms: "How big are my
+// fibroids?" ranked a chunk matching only "how" above the one saying "fibroids", and BM25's
+// length normalisation then favoured it further whenever that chunk was short.
 const STOP_WORDS = new Set([
   "a",
   "an",
@@ -56,33 +60,72 @@ const STOP_WORDS = new Set([
   "was",
   "were",
   "with",
+
+  "am",
+  "any",
+  "can",
+  "could",
+  "did",
+  "do",
+  "does",
+  "how",
+  "i",
+  "many",
+  "me",
+  "much",
+  "my",
+  "our",
+  "should",
+  "there",
+  "we",
+  "what",
+  "when",
+  "where",
+  "which",
+  "who",
+  "why",
+  "will",
+  "would",
+  "you",
+  "your",
 ]);
 
 function tokenizeText(text: string): string[] {
   return (text.toLowerCase().match(/[a-z0-9]+/g) ?? []).filter((token) => !STOP_WORDS.has(token));
 }
 
-async function getKeywordCorpus(
+// How many chunks the vector arm contributes to RRF.
+const VECTOR_TOP_K = 12;
+
+/**
+ * The one Pinecone query behind both arms of the hybrid search.
+ *
+ * There used to be two queries per turn with the same vector and filter: topK 12 for the
+ * vector arm, then topK 500 for the keyword corpus. Pinecone returns matches in
+ * similarity order, so the first 12 of the 500 are exactly the topK 12 result, and the
+ * second round trip bought nothing. The vector arm now takes its prefix of this
+ * response, which is why the corpus keeps Pinecone's order and score.
+ */
+async function getFilteredCorpus(
   client: Pinecone,
   indexName: string,
   namespace: string,
   queryEmbedding: number[],
   filter?: Record<string, any>,
   maxDocuments: number = 500
-): Promise<Array<{ id: string; text: string }>> {
-  // The expensive half of the hybrid retrieval - up to `maxDocuments` chunks, against
-  // topK 12 for the vector side - so it gets its own span for latency attribution.
+): Promise<Array<{ id: string; text: string; score?: number }>> {
   return span(
-    "keyword_corpus_fetch",
+    "pinecone_query",
     { namespace, topK: maxDocuments, filter: filter ?? null },
     async () => {
       const index = client.Index(indexName) as any;
       const namespaceIndex = index.namespace(namespace);
 
-      // Reuses the vector search's filter (e.g. documentId scoping), so the keyword arm
-      // cannot pull in another document's chunks for RRF to blend into the context.
-      // Pinecone's list API has no metadata filter, so a filtered query() with a large
-      // topK stands in for "everything under this filter".
+      // The filter (e.g. documentId scoping) keeps both arms inside one report, so RRF
+      // cannot blend another document's chunks into the context. Pinecone's list API has
+      // no metadata filter, so a filtered query() with a large topK stands in for
+      // "everything under this filter" - for any report under 500 chunks the keyword
+      // arm therefore sees every chunk, whatever the vector.
       const response = await namespaceIndex.query({
         topK: maxDocuments,
         vector: queryEmbedding,
@@ -93,7 +136,11 @@ async function getKeywordCorpus(
 
       const rawMatches = (response.matches ?? []) as Array<any>;
       const corpus = rawMatches
-        .map((match) => ({ id: String(match.id ?? ""), text: String(match.metadata?.chunk ?? "") }))
+        .map((match) => ({
+          id: String(match.id ?? ""),
+          text: String(match.metadata?.chunk ?? ""),
+          score: typeof match.score === "number" ? match.score : undefined,
+        }))
         .filter((doc) => doc.id && doc.text.trim().length > 0);
 
       setSpanMetadata({
@@ -101,20 +148,35 @@ async function getKeywordCorpus(
         corpusSize: corpus.length,
         // A gap here means chunks were stored without usable `chunk` metadata.
         droppedEmptyChunks: rawMatches.length - corpus.length,
+        topScore: corpus[0]?.score,
       });
 
       return corpus;
     },
     {
       runType: "retriever",
-      tags: ["pinecone", "keyword"],
-      // Up to 500 chunks of report text would dominate the trace payload.
-      recordOutputs: (corpus) => ({ corpusSize: corpus.length }),
+      tags: ["pinecone", "vector", "keyword"],
+      // Up to 500 chunks of report text would dominate the trace payload, so only the
+      // vector arm's prefix is listed, by id and score.
+      recordOutputs: (corpus) => ({
+        corpusSize: corpus.length,
+        vectorMatches: corpus
+          .slice(0, VECTOR_TOP_K)
+          .map(({ id, score }, index) => ({ id, rank: index + 1, score })),
+      }),
     }
   );
 }
 
-function rankWithTfIdf(query: string, documents: { id: string; text: string }[]) {
+// Okapi BM25 at its textbook defaults. k1 caps how much repeating a term can add - a
+// chunk that says "cholesterol" six times scores about 1.8x one that says it once, not
+// 6x as raw TF-IDF did, so a chunk that merely repeats a word can no longer outrank the
+// one with the answer. b scales term frequency by chunk length relative to the average,
+// so a long chunk stops winning on the sheer number of words it contains.
+const BM25_K1 = 1.2;
+const BM25_B = 0.75;
+
+function rankWithBm25(query: string, documents: { id: string; text: string }[]) {
   const queryTokens = tokenizeText(query);
   const uniqueQueryTerms = Array.from(new Set(queryTokens));
 
@@ -123,6 +185,8 @@ function rankWithTfIdf(query: string, documents: { id: string; text: string }[])
   }
 
   const documentTokens = documents.map((doc) => tokenizeText(doc.text));
+  const averageLength =
+    documentTokens.reduce((total, tokens) => total + tokens.length, 0) / documents.length;
   const documentFrequency = new Map<string, number>();
 
   uniqueQueryTerms.forEach((term) => {
@@ -141,14 +205,20 @@ function rankWithTfIdf(query: string, documents: { id: string; text: string }[])
         termCounts.set(token, (termCounts.get(token) ?? 0) + 1);
       });
 
+      // NaN for an empty chunk in an all-empty corpus, but such a chunk matches no term,
+      // so it is never read; whenever a term matched, averageLength is non-zero.
+      const lengthNorm = 1 - BM25_B + (BM25_B * tokens.length) / averageLength;
+
       let score = 0;
       uniqueQueryTerms.forEach((term) => {
         const termFrequency = termCounts.get(term) ?? 0;
         if (termFrequency === 0) return;
 
         const df = documentFrequency.get(term) ?? 0;
-        const idf = Math.log((documents.length + 1) / (df + 1)) + 1;
-        score += termFrequency * idf;
+        // The "+1" form of BM25 idf stays positive even for a term in every chunk, so a
+        // common word can only add a little, never subtract.
+        const idf = Math.log(1 + (documents.length - df + 0.5) / (df + 0.5));
+        score += (idf * termFrequency * (BM25_K1 + 1)) / (termFrequency + BM25_K1 * lengthNorm);
       });
 
       return {
@@ -209,7 +279,7 @@ function fuseResultsWithRrf(
 }
 
 /**
- * Hybrid retrieval: dense vector search and TF-IDF keyword search over the same
+ * Hybrid retrieval: dense vector search and BM25 keyword search over the same
  * filtered corpus, fused with Reciprocal Rank Fusion.
  *
  * Post-redaction is not the same as identifier-free - the query is built from the user's
@@ -240,79 +310,49 @@ export async function queryPineconeVectorStoreDetailed(
   indexName: string,
   namespace: string,
   query: string,
-  filter?: Record<string, any>
+  filter?: Record<string, any>,
+  /**
+   * Extra words for the keyword arm only - the query guard's `searchTerms`, aliases of
+   * the question's clinical terms ("SGPT" -> "ALT alanine aminotransferase"). The
+   * tokenizer has no notion of synonyms, so without these a question naming a test by
+   * one name scores zero against a report that uses the other. Kept out of the
+   * embedding: a wrong alias then misleads only the keyword arm, and the vector arm
+   * still ranks on what the user actually asked.
+   */
+  keywordTerms: string = ""
 ): Promise<HybridRetrieval> {
   return span(
     "hybrid_retrieve",
-    { query, namespace, index: indexName, filter: filter ?? null },
+    { query, keywordTerms, namespace, index: indexName, filter: filter ?? null },
     async () => {
-      // One embedding serves both halves of the hybrid search: it is passed into
-      // getKeywordCorpus rather than recomputed there.
+      // One embedding and one Pinecone query serve both halves of the hybrid search.
       const queryEmbedding = await generateEmbedding(query, "RETRIEVAL_QUERY");
 
-      const vectorResults = await span(
-        "vector_search",
-        { namespace, topK: 12, filter: filter ?? null },
-        async () => {
-          const index = client.Index(indexName);
-          const queryResponse = await index.namespace(namespace).query({
-            topK: 12,
-            vector: queryEmbedding,
-            includeMetadata: true,
-            includeValues: false,
-            filter,
-          });
+      const corpus = await getFilteredCorpus(client, indexName, namespace, queryEmbedding, filter);
 
-          const vectorMatches = (queryResponse.matches ?? []) as Array<any>;
-          const results = vectorMatches
-            .map((match, index) => ({
-              id: String(match.id ?? `doc-${index}`),
-              text: String(match.metadata?.chunk ?? ""),
-              rank: index + 1,
-              score: typeof match.score === "number" ? match.score : undefined,
-            }))
-            .filter((match) => match.text.trim().length > 0);
+      // The vector arm is the corpus's similarity-ordered prefix. Empty chunks are already
+      // gone, so this is VECTOR_TOP_K usable chunks where the old separate query could
+      // come back with fewer after dropping them.
+      const vectorResults = corpus
+        .slice(0, VECTOR_TOP_K)
+        .map((doc, index) => ({ ...doc, rank: index + 1 }));
 
-          setSpanMetadata({
-            matchesReturned: vectorMatches.length,
-            usableMatches: results.length,
-            topScore: results[0]?.score,
-          });
-
-          return results;
-        },
-        {
-          runType: "retriever",
-          tags: ["pinecone", "vector"],
-          // The parent span already reports the chunk text once.
-          recordOutputs: (results) => ({
-            matches: results.map(({ id, rank, score }) => ({ id, rank, score })),
-          }),
-        }
-      );
-
-      const keywordCorpus = await getKeywordCorpus(
-        client,
-        indexName,
-        namespace,
-        queryEmbedding,
-        filter
-      );
+      const keywordQuery = keywordTerms.trim() ? `${query} ${keywordTerms}` : query;
 
       // Synchronous, but real CPU work over the whole corpus - worth its own timing so a
       // slow retrieval can be blamed on the right half.
       const keywordResults = await span(
-        "tfidf_rank",
-        { query, corpusSize: keywordCorpus.length },
+        "bm25_rank",
+        { query: keywordQuery, corpusSize: corpus.length },
         async () => {
-          const ranked = rankWithTfIdf(query, keywordCorpus);
+          const ranked = rankWithBm25(keywordQuery, corpus);
           setSpanMetadata({ matched: ranked.length, topScore: ranked[0]?.score });
           return ranked;
         },
         {
           runType: "parser",
           tags: ["keyword"],
-          safeInputs: { corpusSize: keywordCorpus.length, ...textShape("query", query) },
+          safeInputs: { corpusSize: corpus.length, ...textShape("query", keywordQuery) },
           recordOutputs: (ranked) => ({
             matched: ranked.length,
             top: ranked.slice(0, 10).map(({ id, score, rank }) => ({ id, score, rank })),
@@ -380,6 +420,7 @@ export async function queryPineconeVectorStoreDetailed(
         index: indexName,
         filter: filter ?? null,
         ...textShape("query", query),
+        ...textShape("keywordTerms", keywordTerms),
       },
       safeOutputs: (retrieval) => ({
         chunkCount: retrieval.chunks.length,

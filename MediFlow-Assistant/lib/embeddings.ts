@@ -36,7 +36,7 @@ export type EmbeddingTaskType = "RETRIEVAL_QUERY" | "RETRIEVAL_DOCUMENT" | "SEMA
  *   1. The query vector was dominated by the report, so every chunk of it scored highly on
  *      report-to-report similarity no matter what was asked - which is why cosine
  *      similarity was useless as a relevance signal.
- *   2. `rankWithTfIdf` tokenises this same string, so every word of the summary became a
+ *   2. The keyword arm tokenises this same string, so every word of the summary became a
  *      query term and the sparse arm scored chunks against the report rather than the
  *      question.
  *   3. The summary sat ahead of the question in a string with a token ceiling, so a long
@@ -52,7 +52,7 @@ export type EmbeddingTaskType = "RETRIEVAL_QUERY" | "RETRIEVAL_DOCUMENT" | "SEMA
  *
  * mxbai needed an instruction prefix here. Gemini takes the RETRIEVAL_QUERY task type
  * instead, so the question now goes through unchanged - which also keeps the prefix's
- * words out of the TF-IDF query terms.
+ * words out of the keyword query terms.
  */
 export function buildRetrievalQuery(question: string): string {
   return question;
