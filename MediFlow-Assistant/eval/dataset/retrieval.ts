@@ -25,6 +25,12 @@ export interface RetrievalCase {
   expectedVerdict: "relevant" | "partial" | "none";
   /** Why this case is labelled the way it is, where that is not self-evident. */
   note?: string;
+  /**
+   * The aliases the query guard is expected to return as `searchTerms`, fed to the keyword
+   * arm as production does. Written by hand rather than generated, so the case measures
+   * whether retrieval uses an alias, not whether one model call produced it on this run.
+   */
+  searchTerms?: string;
 }
 
 export const RETRIEVAL_CASES: readonly RetrievalCase[] = [
@@ -482,5 +488,35 @@ export const RETRIEVAL_CASES: readonly RetrievalCase[] = [
     question: "What are my thyroid function results?",
     expectedFacts: [],
     expectedVerdict: "none",
+  },
+
+  // ------------------------------------------------------------------ alias mismatch
+  // The question names a test by a form the report never prints, so the question's own
+  // words score zero on the keyword arm and only the guard's aliases can connect them.
+  {
+    id: "met-ft4-alias",
+    reportId: "metabolic-workup",
+    question: "What is my FT4?",
+    searchTerms: "free T4 thyroxine",
+    expectedFacts: ["Free T4 1.2 ng/dL"],
+    expectedVerdict: "relevant",
+    note: "The report prints 'Free T4'; the tokenizer reads 'FT4' as the unrelated token ft4.",
+  },
+  {
+    id: "hep-alp-alias",
+    reportId: "hepatic-panel",
+    question: "What is my ALP?",
+    searchTerms: "alkaline phosphatase",
+    expectedFacts: ["Alkaline Phosphatase 142 U/L"],
+    expectedVerdict: "relevant",
+  },
+  {
+    id: "ren-gfr-alias",
+    reportId: "renal-panel",
+    question: "What is my GFR?",
+    searchTerms: "eGFR glomerular filtration rate kidney function",
+    expectedFacts: ["eGFR (CKD-EPI) 38 mL/min/1.73m2"],
+    expectedVerdict: "relevant",
+    note: "'gfr' and 'egfr' are different tokens.",
   },
 ];

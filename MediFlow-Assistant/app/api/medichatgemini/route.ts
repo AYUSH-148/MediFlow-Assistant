@@ -552,7 +552,9 @@ async function handleChat({
               'medic',
               "diagnosis2",
               query,
-              reportFilter
+              reportFilter,
+              // Guard-supplied aliases, keyword arm only; see queryPineconeVectorStoreDetailed.
+              guard.searchTerms
           );
 
     // Corrective-RAG grading. Retrieval hands back its top 10 chunks whether or not they

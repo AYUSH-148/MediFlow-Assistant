@@ -42,7 +42,7 @@ const STEPS = [
 
 const FEATURES = [
   "PII redaction before storage and inference",
-  "Hybrid retrieval (vector + TF-IDF, fused with RRF)",
+  "Hybrid retrieval (vector + BM25, fused with RRF)",
   "GraphRAG enrichment via a medical knowledge graph",
   "Semantic caching for fast, repeatable answers",
   "Works with PDFs, scans, and photos of reports",
